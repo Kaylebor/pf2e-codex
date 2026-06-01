@@ -1,4 +1,4 @@
-# pf2e-mcp
+# pf2e-codex
 
 PF2E rules knowledge base with MCP, CLI, and SDK interfaces.
 
@@ -14,20 +14,20 @@ uv venv
 uv pip install -e "."
 
 # Download PF2E data and build index
-pf2e-mcp index
+pf2e-codex index
 
 # Search from CLI
-pf2e-mcp search "flat-footed while flanking"
+pf2e-codex search "flat-footed while flanking"
 
 # Run MCP server (stdio for Claude Desktop / Cursor / pi)
-pf2e-mcp serve
+pf2e-codex serve
 ```
 
 ## Architecture
 
 ```
-pf2e-mcp/
-├── src/pf2e_mcp/
+pf2e-codex/
+├── src/pf2e_codex/
 │   ├── __init__.py        # SDK exports
 │   ├── config.py          # Settings (Pydantic + TOML file)
 │   ├── fetcher.py         # Download json-assets.zip from GitHub releases
@@ -37,7 +37,7 @@ pf2e-mcp/
 │   ├── index.py           # sqlite-vec storage + search
 │   ├── pipeline.py        # Orchestration: fetch → chunk → embed → index
 │   ├── mcp_server.py      # FastMCP server
-│   └── cli.py             # pf2e-mcp CLI
+│   └── cli.py             # pf2e-codex CLI
 ├── pyproject.toml         # Package config (uv-compatible)
 └── pf2e_v2.db             # sqlite-vec database (generated)
 ```
@@ -64,27 +64,27 @@ rules explanations are retrievable.
 
 | Command | Description |
 |---|---|
-| `pf2e-mcp fetch` | Download json-assets.zip |
-| `pf2e-mcp build` | Build enriched chunks (JSON output) |
-| `pf2e-mcp index` | Full pipeline: fetch → chunk → embed → index |
-| `pf2e-mcp search "query"` | Semantic search |
-| `pf2e-mcp status` | Show index stats |
-| `pf2e-mcp config` | Show effective configuration |
-| `pf2e-mcp config --file` | Show active config file contents |
-| `pf2e-mcp models` | List embedding models with recommendations |
-| `pf2e-mcp serve` | Start MCP server (stdio or sse) |
+| `pf2e-codex fetch` | Download json-assets.zip |
+| `pf2e-codex build` | Build enriched chunks (JSON output) |
+| `pf2e-codex index` | Full pipeline: fetch → chunk → embed → index |
+| `pf2e-codex search "query"` | Semantic search |
+| `pf2e-codex status` | Show index stats |
+| `pf2e-codex config` | Show effective configuration |
+| `pf2e-codex config --file` | Show active config file contents |
+| `pf2e-codex models` | List embedding models with recommendations |
+| `pf2e-codex serve` | Start MCP server (stdio or sse) |
 
 ## Configuration
 
 Priority (highest wins):
 1. Command-line flags / kwargs
 2. Environment variables (`PF2E_DB`, `PF2E_MODEL`, etc.)
-3. Config file (`~/.config/pf2e-mcp/config.toml` or `./pf2e-mcp.toml`)
+3. Config file (`~/.config/pf2e-codex/config.toml` or `./pf2e-codex.toml`)
 4. Built-in defaults
 
 ### Config file
 
-Create `~/.config/pf2e-mcp/config.toml`:
+Create `~/.config/pf2e-codex/config.toml`:
 
 ```toml
 model = "snowflake-arctic-embed-s"
@@ -92,13 +92,13 @@ db = "~/pf2e/pf2e_v2.db"
 release = "pf2e-8.1.2"
 ```
 
-Or use a project-local `pf2e-mcp.toml` (gitignored by default).
+Or use a project-local `pf2e-codex.toml` (gitignored by default).
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PF2E_CACHE_DIR` | `~/.cache/pf2e-mcp` | Download cache |
+| `PF2E_CACHE_DIR` | `~/.cache/pf2e-codex` | Download cache |
 | `PF2E_DB` | `pf2e_v2.db` | sqlite-vec database |
 | `PF2E_MODEL` | `snowflake-arctic-embed-xs` | Embedding model |
 | `PF2E_RELEASE` | `pf2e-8.1.2` | PF2E system version |
@@ -139,7 +139,7 @@ Tested on AMD Ryzen 7 7800X3D, indexing 28,837 chunks:
 Switch models by setting the environment variable:
 
 ```bash
-PF2E_MODEL="snowflake-arctic-embed-s" pf2e-mcp index --rebuild
+PF2E_MODEL="snowflake-arctic-embed-s" pf2e-codex index --rebuild
 ```
 
 Or in your config file:
@@ -150,8 +150,8 @@ model = "snowflake-arctic-embed-m"
 ## SDK
 
 ```python
-from pf2e_mcp.config import get_settings
-from pf2e_mcp.index import SearchIndex
+from pf2e_codex.config import get_settings
+from pf2e_codex.index import SearchIndex
 
 settings = get_settings(db="pf2e_v2.db")
 search = SearchIndex(settings.db, settings.model)

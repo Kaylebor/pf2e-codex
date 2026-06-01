@@ -3,10 +3,10 @@
 Resolution order (highest priority wins):
 1. Keyword arguments (e.g. `Settings(db="x.db")`)
 2. Environment variables (`PF2E_DB`, `PF2E_MODEL`, etc.)
-3. Config file (`~/.config/pf2e-mcp/config.toml` or `./pf2e-mcp.toml`)
+3. Config file (`~/.config/pf2e-codex/config.toml` or `./pf2e-codex.toml`)
 4. Class defaults
 
-Example `~/.config/pf2e-mcp/config.toml`:
+Example `~/.config/pf2e-codex/config.toml`:
     model = "snowflake-arctic-embed-s"
     db = "~/pf2e/pf2e_v2.db"
     release = "pf2e-8.1.2"
@@ -22,7 +22,7 @@ import tomllib
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pf2e-mcp"
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pf2e-codex"
 DEFAULT_DB = Path("pf2e_v2.db")
 DEFAULT_MODEL = "snowflake-arctic-embed-xs"
 DEFAULT_RELEASE = "pf2e-8.1.2"
@@ -31,9 +31,9 @@ GITHUB_RELEASE_URL = (
 )
 
 _CONFIG_PATHS = [
-    Path.home() / ".config" / "pf2e-mcp" / "config.toml",
-    Path.cwd() / "pf2e-mcp.toml",
-    Path.cwd() / ".pf2e-mcp.toml",
+    Path.home() / ".config" / "pf2e-codex" / "config.toml",
+    Path.cwd() / "pf2e-codex.toml",
+    Path.cwd() / ".pf2e-codex.toml",
 ]
 
 

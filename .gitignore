@@ -15,8 +15,8 @@ build/
 venv/
 
 # Config files (user-specific)
-pf2e-mcp.toml
-.pf2e-mcp.toml
+pf2e-codex.toml
+.pf2e-codex.toml
 
 # IDE
 .vscode/

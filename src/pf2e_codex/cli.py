@@ -1,4 +1,4 @@
-"""CLI entry point: pf2e-mcp index | search | serve | status."""
+"""CLI entry point: pf2e-codex index | search | serve | status."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .index import SearchIndex
 from .models import list_models, recommend
 from .pipeline import build_chunks, embed_and_index, index_all, save_chunks
 
-app = typer.Typer(name="pf2e-mcp", help="PF2E rules knowledge base")
+app = typer.Typer(name="pf2e-codex", help="PF2E rules knowledge base")
 
 
 def _settings(
