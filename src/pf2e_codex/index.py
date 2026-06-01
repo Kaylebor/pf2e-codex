@@ -113,17 +113,6 @@ class SearchIndex:
             for r in results
         ]
 
-    def lookup(self, name: str) -> list[dict]:
-        self._ensure_loaded()
-        results = self._conn.execute("""
-            SELECT id, name, type, pack, text
-            FROM chunks
-            WHERE LOWER(name) = LOWER(?)
-            ORDER BY type, pack
-            LIMIT 20
-        """, (name,)).fetchall()
-        return [{"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4]} for r in results]
-
     def rules_explain(self, topic: str, top_k: int = 3) -> list[dict]:
         self._ensure_loaded()
         emb = self._encode(topic)

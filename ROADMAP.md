@@ -66,6 +66,6 @@ Ordered by impact. Check items off as completed.
 - [x] Config system: env vars + TOML file + Pydantic Settings
 - [x] Pluggable embedding providers with model registry
 - [x] Automatic query/document prefixing for model-specific models
-- [x] MCP server with 4 tools (search, lookup, rules_explain, status)
+- [x] MCP server with 3 tools (search, rules_explain, status)
 - [x] Hardware-aware model recommendations
 - [x] Default model: `snowflake-arctic-embed-xs` (fast, good quality)

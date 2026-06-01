@@ -33,19 +33,6 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()
-    def pf2e_lookup(name: str) -> str:
-        """Look up a PF2E entry by exact or near-exact name.
-
-        Args:
-            name: The exact name of a feat, spell, condition, action, etc.
-
-        Returns:
-            JSON string with matching entries.
-        """
-        results = search.lookup(name)
-        return json.dumps({"name": name, "results": results}, indent=2)
-
-    @mcp.tool()
     def pf2e_rules_explain(topic: str, top_k: int = 3) -> str:
         """Get core rules explanations for a topic (e.g. 'flanking', 'stacking penalties').
 

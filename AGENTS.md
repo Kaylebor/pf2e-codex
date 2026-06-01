@@ -132,7 +132,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 ### Adding a new MCP tool
 1. Add `@mcp.tool()` function in `mcp_server.py`
-2. Use `search.search()` / `search.lookup()` / `search.rules_explain()`
+2. Use `search.search()` / `search.rules_explain()`
 
 ### Adding a new rule flattener
 1. Define function in `chunker.py` taking `rule: dict`

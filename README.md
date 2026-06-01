@@ -108,7 +108,6 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 | Tool | Description |
 |---|---|
 | `pf2e_search(query, top_k)` | Semantic search across all rules entries |
-| `pf2e_lookup(name)` | Exact name lookup (e.g. "Fireball") |
 | `pf2e_rules_explain(topic, top_k)` | Prioritized search favoring journal pages |
 | `pf2e_index_status()` | Show model, chunk count, date |
 
