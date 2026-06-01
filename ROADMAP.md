@@ -25,15 +25,13 @@ Ordered by impact. Check items off as completed.
 
 ## Medium Impact
 
-- [ ] **UUID fetch tool**
-  - Problem: LLM sees "Related: Power Attack" in a result but can't fetch the full entry.
-  - Approach: `pf2e_get_entry(entry_id)` accepts internal IDs, Foundry UUIDs, slugs, or names. Normalize in `index.py` (`fetch_by_id`).
+- [x] **UUID fetch tool**
+  - Done: `pf2e_get_entry` accepts internal IDs (`pack:id`), Foundry UUIDs, bare slugs, or names. Tries exact ID → bare ID suffix → slug → name. `pf2e-codex get` CLI command.
   - Files: `index.py`, `mcp_server.py`, `cli.py`
 
-- [ ] **Cross-reference graph (bidirectional)**
-  - Problem: "What feats reference Dread Striker?" requires manual search.
-  - Approach: Build a `references` table (`source_id → target_id`) from all `@UUID[...]` links in descriptions and rules. Expose via `SearchIndex.related(id)` or new MCP tool.
-  - Files: `chunker.py` (extract refs), `index.py` (store + query)
+- [x] **Cross-reference graph (bidirectional)**
+  - Done: `refs` table stores `source_id → target_uuid` from both description `@UUID[...]` links and rule element UUID fields (GrantItem, EphemeralEffect, Aura effects). Lazy-created for existing DBs. `SearchIndex.related(id, direction, limit)` with `pf2e_related` MCP tool and `pf2e-codex related` CLI command.
+  - Files: `chunker.py`, `index.py`, `pipeline.py`, `mcp_server.py`, `cli.py`
 
 - [ ] **MCP streamable-http transport**
   - Problem: `stdio` is the only reliable transport. SSE is deprecated in MCP spec.
@@ -70,6 +68,9 @@ Ordered by impact. Check items off as completed.
 - [x] Config system: env vars + TOML file + Pydantic Settings
 - [x] Pluggable embedding providers with model registry
 - [x] Automatic query/document prefixing for model-specific models
-- [x] MCP server with 3 tools (search, rules_explain, status)
+- [x] MCP server with 5 tools (search, get_entry, related, rules_explain, status)
 - [x] Hardware-aware model recommendations
 - [x] Default model: `snowflake-arctic-embed-xs` (fast, good quality)
+- [x] Hybrid search: semantic + FTS5 via reciprocal rank fusion
+- [x] UUID fetch tool: `pf2e_get_entry` + `pf2e-codex get`
+- [x] Cross-reference graph: bidirectional outgoing/incoming via `pf2e_related` + `pf2e-codex related`

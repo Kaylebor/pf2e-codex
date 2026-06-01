@@ -496,7 +496,11 @@ class ChunkBuilder:
             plain = resolve_text(plain, self.resolver)
             if not plain.strip():
                 continue
+            refs = self._extract_refs(text_content)
             lines = [f"Journal: {journal_name}", f"Page: {title}", "", plain]
+            if refs:
+                ref_names = sorted({r["name"] for r in refs})
+                lines += ["", f"Related: {', '.join(ref_names)}"]
             chunks.append({
                 "id": f"{pack_name}:{entry['_id']}_page_{i}",
                 "name": f"{journal_name} — {title}",
@@ -508,6 +512,7 @@ class ChunkBuilder:
                 "text": "\n".join(lines),
                 "raw_rules_count": 0,
                 "has_description": bool(plain),
+                "refs": refs,
             })
         return chunks
 
@@ -571,9 +576,12 @@ class ChunkBuilder:
             for rt in rule_texts:
                 lines.append(f"- {rt}")
 
-        refs = self._extract_refs(desc_html)
-        if refs:
-            lines += ["", f"Related: {', '.join(sorted(refs))}"]
+        desc_refs = self._extract_refs(desc_html)
+        rule_refs = self._extract_rule_refs(rules)
+        all_refs = desc_refs + rule_refs
+        if all_refs:
+            ref_names = sorted({r["name"] for r in all_refs})
+            lines += ["", f"Related: {', '.join(ref_names)}"]
 
         pub = system.get("publication", {})
         if pub:
@@ -598,6 +606,7 @@ class ChunkBuilder:
             "text": "\n".join(lines),
             "raw_rules_count": len(rules),
             "has_description": bool(desc_text),
+            "refs": all_refs,
         }
 
     def _add_type_specific_fields(self, lines: list[str], etype: str, system: dict[str, Any]) -> None:
@@ -772,14 +781,43 @@ class ChunkBuilder:
         text = re.sub(r"Compendium\.[^\s]+\.Item\.([A-Za-z0-9]+)", repl_bare, text)
         return text
 
-    def _extract_refs(self, desc_html: str) -> set[str]:
-        refs: set[str] = set()
-        for uuid_full, _explicit in _RE_UUID_LINK.findall(desc_html):
+    def _extract_refs(self, desc_html: str) -> list[dict[str, str]]:
+        """Extract UUID references from HTML description. Returns [{name, uuid, context}]."""
+        refs: list[dict[str, str]] = []
+        for uuid_full, explicit in _RE_UUID_LINK.findall(desc_html):
             if ".Item." in uuid_full:
                 _, item_id = uuid_full.rsplit(".Item.", 1)
             else:
                 item_id = uuid_full
             resolved = self.resolver.resolve(item_id)
-            if resolved:
-                refs.add(resolved)
+            name = resolved or explicit or item_id
+            # Extract surrounding text for context (first 200 chars of plain desc)
+            plain = strip_html(desc_html)[:200]
+            refs.append({"name": name, "uuid": item_id, "context": plain})
+        return refs
+
+    def _extract_rule_refs(self, rules: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """Extract UUID references from rule elements (GrantItem, EphemeralEffect, etc.)."""
+        refs: list[dict[str, str]] = []
+        for rule in rules:
+            # Direct uuid fields
+            for key in ("uuid", "compendiumSource"):
+                val = rule.get(key)
+                if val and isinstance(val, str):
+                    item_id = val
+                    if ".Item." in item_id:
+                        _, item_id = item_id.rsplit(".Item.", 1)
+                    resolved = self.resolver.resolve(item_id)
+                    name = resolved or item_id
+                    refs.append({"name": name, "uuid": item_id, "context": f"rule: {rule.get('key', '')}"})
+            # Nested effect UUIDs (Aura, etc.)
+            for effect in rule.get("effects", []):
+                eff_uuid = effect.get("uuid", "")
+                if eff_uuid:
+                    item_id = eff_uuid
+                    if ".Item." in item_id:
+                        _, item_id = item_id.rsplit(".Item.", 1)
+                    resolved = self.resolver.resolve(item_id)
+                    name = resolved or item_id
+                    refs.append({"name": name, "uuid": item_id, "context": f"aura effect: {rule.get('key', '')}"})
         return refs

@@ -72,6 +72,7 @@ rules explanations are retrievable.
 | `pf2e-codex config` | Show effective configuration |
 | `pf2e-codex config --file` | Show active config file contents |
 | `pf2e-codex get "fireball"` | Fetch a single entry by slug, name, or UUID |
+| `pf2e-codex related "off-guard" --direction incoming` | Cross-reference graph |
 | `pf2e-codex models` | List embedding models with recommendations |
 | `pf2e-codex serve` | Start MCP server (stdio or sse) |
 
@@ -110,6 +111,7 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 |---|---|
 | `pf2e_search(query, top_k)` | Hybrid search (semantic + FTS5 name/text matching) |
 | `pf2e_get_entry(entry_id)` | Fetch full entry by ID, slug, name, or Foundry UUID |
+| `pf2e_related(entry_id, direction, limit)` | Cross-reference graph: outgoing/incoming/both |
 | `pf2e_rules_explain(topic, top_k)` | Prioritized search favoring journal pages |
 | `pf2e_index_status()` | Show model, chunk count, date |
 

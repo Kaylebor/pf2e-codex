@@ -68,6 +68,24 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         return json.dumps({"topic": topic, "results": results}, indent=2)
 
     @mcp.tool()
+    def pf2e_related(entry_id: str, direction: str = "both", limit: int = 10) -> str:
+        """Find entries related by cross-references (e.g., 'what grants Power Attack?').
+
+        Args:
+            entry_id: ID, slug, name, or UUID (e.g., "fury-instinct" or "Power Attack").
+            direction: "outgoing" (what this entry references),
+                       "incoming" (what references this entry),
+                       or "both" (default).
+            limit: Max results per direction (default 10, max 50).
+
+        Returns:
+            JSON with "outgoing" and "incoming" lists of related entries.
+        """
+        limit = max(1, min(limit, 50))
+        results = search.related(entry_id, direction, limit)
+        return json.dumps({"entry_id": entry_id, "direction": direction, "results": results}, indent=2)
+
+    @mcp.tool()
     def pf2e_index_status() -> str:
         """Check the status of the PF2E index (model, chunk count, date)."""
         meta = search.status()

@@ -73,6 +73,7 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
         conn.execute("DROP TABLE IF EXISTS vec_chunks")
         conn.execute("DROP TABLE IF EXISTS fts_chunks")
         conn.execute("DELETE FROM chunks")
+        conn.execute("DELETE FROM refs")
         conn.execute("DELETE FROM _meta")
         conn.execute(f"""
             CREATE VIRTUAL TABLE vec_chunks USING vec0(
@@ -86,6 +87,14 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
                 text,
                 content='chunks',
                 content_rowid='rowid'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS refs (
+                source_id TEXT,
+                target_uuid TEXT,
+                target_name TEXT,
+                context TEXT
             )
         """)
         conn.commit()
@@ -113,8 +122,14 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
             "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",
             (chunk["id"], vec_blob(emb)),
         )
+        # Insert cross-references
+        for ref in chunk.get("refs", []):
+            conn.execute("""
+                INSERT OR IGNORE INTO refs (source_id, target_uuid, target_name, context)
+                VALUES (?, ?, ?, ?)
+            """, (chunk["id"], ref["uuid"], ref["name"], ref.get("context", "")[:200]))
     conn.commit()
-    print(f"Inserted {len(chunks)} chunks in {time.time() - start:.1f}s")
+    print(f"Inserted {len(chunks)} chunks and refs in {time.time() - start:.1f}s")
 
     print("Building FTS5 index...")
     start = time.time()

@@ -99,9 +99,11 @@ chunks*.json       # intermediate chunk files
 Quick smoke test after changes:
 ```bash
 uv pip install -e "."
-pf2e-codex status              # should show 28,837 chunks
-pf2e-codex search "flat-footed" -k 3  # should return Darting Monkey or Flanking rules
-pf2e-codex models              # should list all models
+pf2e-codex status                     # should show 28,837 chunks
+pf2e-codex search "flat-footed" -k 3   # hybrid search, should return Darting Monkey
+pf2e-codex get "fury-instinct"         # should return full Fury Instinct entry
+pf2e-codex related "off-guard" --direction incoming  # should show feats referencing Off-Guard
+pf2e-codex models                      # should list all models
 ```
 
 MCP server test:

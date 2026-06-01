@@ -55,6 +55,20 @@ def init_db(db_path: Path, dim: int) -> None:
             content_rowid='rowid'
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS refs (
+            source_id TEXT,
+            target_uuid TEXT,
+            target_name TEXT,
+            context TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)
+    """)
     conn.commit()
     conn.close()
 
@@ -110,10 +124,10 @@ def _rrf_fuse(
 class SearchIndex:
     """Search index backed by sqlite-vec with optional FTS5 hybrid blending."""
 
-    def __init__(self, db_path: Path, model_name: str):
+    def __init__(self, db_path: Path | str, model_name: str):
         import sqlite3
 
-        self.db_path = db_path
+        self.db_path = Path(db_path)
         self.model_name = model_name
         self._provider: EmbeddingProvider | None = None
         self._dim: int | None = None
@@ -139,6 +153,17 @@ class SearchIndex:
             "SELECT value FROM _meta WHERE key = 'embedding_dim'"
         ).fetchone()
         self._dim = int(row[0]) if row else 384
+        # Lazy-create refs table for DBs built before this feature
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS refs (
+                source_id TEXT,
+                target_uuid TEXT,
+                target_name TEXT,
+                context TEXT
+            )
+        """)
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)")
 
     def _ensure_fts(self) -> None:
         if self._fts_ready:
@@ -289,6 +314,65 @@ class SearchIndex:
             }
 
         return None
+
+    def related(self, entry_id: str, direction: str = "both", limit: int = 20) -> dict:
+        """Find entries related by cross-references.
+
+        Args:
+            entry_id: ID, slug, name, or UUID of the entry.
+            direction: "outgoing" (what X references), "incoming" (what references X),
+                       or "both".
+            limit: Max results per direction.
+
+        Returns:
+            {"outgoing": [...], "incoming": [...]} where each item is
+            {id, name, type, pack, context}.
+        """
+        self._ensure_loaded()
+        normalized = _normalize_id(entry_id)
+
+        result: dict[str, list[dict]] = {"outgoing": [], "incoming": []}
+
+        # Resolve entry_id to an internal chunk ID for outgoing queries
+        chunk = self.fetch_by_id(entry_id)
+        source_id = chunk["id"] if chunk else normalized
+
+        if direction in ("outgoing", "both"):
+            rows = self._conn.execute("""
+                SELECT chunks.id, chunks.name, chunks.type, chunks.pack, refs.context
+                FROM refs
+                JOIN chunks ON refs.target_uuid = chunks.id OR chunks.id LIKE '%:' || refs.target_uuid
+                WHERE refs.source_id = ?
+                GROUP BY chunks.id
+                LIMIT ?
+            """, (source_id, limit)).fetchall()
+            result["outgoing"] = [
+                {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "context": r[4]}
+                for r in rows
+            ]
+
+        if direction in ("incoming", "both"):
+            # Find the bare UUID of this entry for incoming lookups
+            bare_uuid = normalized
+            if chunk:
+                # Extract bare UUID from pack:id format
+                if ":" in chunk["id"]:
+                    bare_uuid = chunk["id"].rsplit(":", 1)[-1]
+                else:
+                    bare_uuid = chunk["id"]
+            rows = self._conn.execute("""
+                SELECT chunks.id, chunks.name, chunks.type, chunks.pack, refs.context
+                FROM refs
+                JOIN chunks ON refs.source_id = chunks.id
+                WHERE refs.target_uuid = ?
+                LIMIT ?
+            """, (bare_uuid, limit)).fetchall()
+            result["incoming"] = [
+                {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "context": r[4]}
+                for r in rows
+            ]
+
+        return result
 
     def status(self) -> dict:
         self._ensure_loaded()

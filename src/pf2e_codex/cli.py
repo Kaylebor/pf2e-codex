@@ -119,6 +119,30 @@ def get(
 
 
 @app.command()
+def related(
+    entry_id: str = typer.Argument(..., help="Entry slug, name, or UUID"),
+    direction: str = typer.Option("both", "--direction", help="outgoing, incoming, or both"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max results per direction"),
+    db: str | None = typer.Option(None, "--db", "-d"),
+    model: str | None = typer.Option(None, "--model", "-m"),
+) -> None:
+    """Find entries related by cross-references."""
+    settings = _settings(db=db, model=model)
+    search_idx = SearchIndex(settings.db, settings.model)
+    results = search_idx.related(entry_id, direction, limit)
+    if results.get("outgoing"):
+        typer.echo(f"\n{entry_id} references:")
+        for r in results["outgoing"]:
+            typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')}")
+    if results.get("incoming"):
+        typer.echo(f"\nEntries referencing {entry_id}:")
+        for r in results["incoming"]:
+            typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')}")
+    if not results.get("outgoing") and not results.get("incoming"):
+        typer.echo("No related entries found.")
+
+
+@app.command()
 def status(
     db: str | None = typer.Option(None, "--db", "-d"),
     model: str | None = typer.Option(None, "--model", "-m"),
