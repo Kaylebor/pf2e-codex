@@ -83,11 +83,39 @@ def search(
     typer.echo(f"Query: '{query}'")
     typer.echo(f"Results ({len(results)}):\n")
     for i, r in enumerate(results, 1):
-        typer.echo(f"--- Result {i} (dist={r['distance']:.4f}) ---")
+        dist = r.get("distance")
+        rrf = r.get("rrf_score")
+        if dist is not None:
+            label = f"dist={dist:.4f}"
+        elif rrf is not None:
+            label = f"rrf={rrf:.4f}"
+        else:
+            label = ""
+        typer.echo(f"--- Result {i} ({label}) ---")
         typer.echo(f"[{r['type']}] {r['name']} ({r['pack']})")
         preview = r["text"][:600] + ("..." if len(r["text"]) > 600 else "")
         typer.echo(preview)
         typer.echo()
+
+
+@app.command()
+def get(
+    entry_id: str = typer.Argument(..., help="Entry ID (e.g. 'feats:Fury-Instinct' or Foundry UUID)"),
+    db: str | None = typer.Option(None, "--db", "-d"),
+    model: str | None = typer.Option(None, "--model", "-m"),
+) -> None:
+    """Fetch a single entry by its ID or Foundry UUID."""
+    settings = _settings(db=db, model=model)
+    search_idx = SearchIndex(settings.db, settings.model)
+    result = search_idx.fetch_by_id(entry_id)
+    if result:
+        typer.echo(f"[{result['type']}] {result['name']} ({result['pack']})")
+        typer.echo(f"ID: {result['id']}")
+        typer.echo()
+        typer.echo(result["text"])
+    else:
+        typer.echo(f"Entry not found: {entry_id}", err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command()

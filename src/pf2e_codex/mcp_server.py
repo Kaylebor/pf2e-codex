@@ -33,6 +33,26 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()
+    def pf2e_get_entry(entry_id: str) -> str:
+        """Fetch the full text of a PF2E entry by its ID or Foundry UUID.
+
+        Accepts:
+            - Internal ID: "feats:Fury-Instinct" or "conditions:blinded"
+            - Foundry UUID: "Compendium.pf2e.feats.Item.Fury-Instinct"
+            - Bare slug: "fury-instinct"
+
+        Args:
+            entry_id: The ID or UUID of the entry to retrieve.
+
+        Returns:
+            JSON string with the entry, or an error if not found.
+        """
+        result = search.fetch_by_id(entry_id)
+        if result:
+            return json.dumps(result, indent=2)
+        return json.dumps({"error": f"Entry not found: {entry_id}"}, indent=2)
+
+    @mcp.tool()
     def pf2e_rules_explain(topic: str, top_k: int = 3) -> str:
         """Get core rules explanations for a topic (e.g. 'flanking', 'stacking penalties').
 

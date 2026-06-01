@@ -67,10 +67,11 @@ rules explanations are retrievable.
 | `pf2e-codex fetch` | Download json-assets.zip |
 | `pf2e-codex build` | Build enriched chunks (JSON output) |
 | `pf2e-codex index` | Full pipeline: fetch → chunk → embed → index |
-| `pf2e-codex search "query"` | Semantic search |
+| `pf2e-codex search "query"` | Hybrid search (semantic + FTS5) |
 | `pf2e-codex status` | Show index stats |
 | `pf2e-codex config` | Show effective configuration |
 | `pf2e-codex config --file` | Show active config file contents |
+| `pf2e-codex get "fireball"` | Fetch a single entry by slug, name, or UUID |
 | `pf2e-codex models` | List embedding models with recommendations |
 | `pf2e-codex serve` | Start MCP server (stdio or sse) |
 
@@ -107,7 +108,8 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 
 | Tool | Description |
 |---|---|
-| `pf2e_search(query, top_k)` | Semantic search across all rules entries |
+| `pf2e_search(query, top_k)` | Hybrid search (semantic + FTS5 name/text matching) |
+| `pf2e_get_entry(entry_id)` | Fetch full entry by ID, slug, name, or Foundry UUID |
 | `pf2e_rules_explain(topic, top_k)` | Prioritized search favoring journal pages |
 | `pf2e_index_status()` | Show model, chunk count, date |
 

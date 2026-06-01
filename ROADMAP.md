@@ -4,9 +4,8 @@ Ordered by impact. Check items off as completed.
 
 ## High Impact
 
-- [ ] **Hybrid search: semantic + FTS5 exact name matching**
-  - Problem: Exact names like "Fireball" or "Flurry of Blows" don't always rank #1 in pure semantic search.
-  - Approach: Add `name_fts` virtual table with `fts5(name, content=chunks, content_rowid=rowid)`. Blend semantic and FTS scores via reciprocal rank fusion.
+- [x] **Hybrid search: semantic + FTS5 exact name matching**
+  - Done: FTS5 external-content table, lazy creation for existing DBs, RRF blending in `SearchIndex.search()`. `distance` for semantic, `rrf_score` for blended results.
   - Files: `index.py`, `cli.py`, `mcp_server.py`
 
 - [ ] **Model benchmarking & selection command**
@@ -25,6 +24,11 @@ Ordered by impact. Check items off as completed.
   - Files: `fetcher.py`, `pipeline.py`, `index.py`
 
 ## Medium Impact
+
+- [ ] **UUID fetch tool**
+  - Problem: LLM sees "Related: Power Attack" in a result but can't fetch the full entry.
+  - Approach: `pf2e_get_entry(entry_id)` accepts internal IDs, Foundry UUIDs, slugs, or names. Normalize in `index.py` (`fetch_by_id`).
+  - Files: `index.py`, `mcp_server.py`, `cli.py`
 
 - [ ] **Cross-reference graph (bidirectional)**
   - Problem: "What feats reference Dread Striker?" requires manual search.

@@ -12,7 +12,7 @@ from .chunker import ChunkBuilder, UUIDResolver
 from .config import Settings
 from .embeddings import get_provider
 from .fetcher import extract_all_packs, extract_lang, get_cached_zip
-from .index import init_db, load_vec_extension, vec_blob
+from .index import init_db, load_vec_extension, rebuild_fts, vec_blob
 
 
 def build_chunks(settings: Settings) -> list[dict[str, Any]]:
@@ -71,12 +71,21 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
 
     if rebuild:
         conn.execute("DROP TABLE IF EXISTS vec_chunks")
+        conn.execute("DROP TABLE IF EXISTS fts_chunks")
         conn.execute("DELETE FROM chunks")
         conn.execute("DELETE FROM _meta")
         conn.execute(f"""
             CREATE VIRTUAL TABLE vec_chunks USING vec0(
                 id TEXT PRIMARY KEY,
                 embedding float[{dim}]
+            )
+        """)
+        conn.execute("""
+            CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                name,
+                text,
+                content='chunks',
+                content_rowid='rowid'
             )
         """)
         conn.commit()
@@ -106,6 +115,12 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
         )
     conn.commit()
     print(f"Inserted {len(chunks)} chunks in {time.time() - start:.1f}s")
+
+    print("Building FTS5 index...")
+    start = time.time()
+    rebuild_fts(conn)
+    conn.commit()
+    print(f"FTS5 index built in {time.time() - start:.1f}s")
 
     for k, v in [
         ("embedding_model", settings.model),

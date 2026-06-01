@@ -47,16 +47,68 @@ def init_db(db_path: Path, dim: int) -> None:
             embedding float[{dim}]
         )
     """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+            name,
+            text,
+            content='chunks',
+            content_rowid='rowid'
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+def rebuild_fts(conn) -> None:
+    """Rebuild the FTS5 index from the chunks table."""
+    conn.execute("INSERT INTO fts_chunks(fts_chunks) VALUES ('rebuild')")
 
 
 def vec_blob(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
+def _normalize_id(raw: str) -> str:
+    """Accept internal 'pack:id', Foundry UUIDs, or bare slugs; return best guess."""
+    if not raw:
+        return raw
+    if ".Item." in raw:
+        return raw.rsplit(".", 1)[-1]
+    return raw
+
+
+def _rrf_fuse(
+    semantic_results: list[tuple[str, dict]],
+    fts_results: list[tuple[str, dict]],
+    k: int = 60,
+    top_k: int = 5,
+) -> list[dict]:
+    """Reciprocal Rank Fusion of semantic and FTS result lists.
+
+    Each result list is [(id, full_result_dict), ...] ordered best→worst.
+    """
+    scores: dict[str, float] = {}
+    details: dict[str, dict] = {}
+
+    for rank, (cid, result) in enumerate(semantic_results, start=1):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        details[cid] = result
+
+    for rank, (cid, result) in enumerate(fts_results, start=1):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        if cid not in details:
+            details[cid] = result
+
+    # Sort by RRF score descending
+    sorted_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)
+    return [
+        {**details[cid], "rrf_score": round(scores[cid], 4)}
+        for cid in sorted_ids[:top_k]
+    ]
+
+
 class SearchIndex:
-    """Search index backed by sqlite-vec."""
+    """Search index backed by sqlite-vec with optional FTS5 hybrid blending."""
 
     def __init__(self, db_path: Path, model_name: str):
         import sqlite3
@@ -66,6 +118,7 @@ class SearchIndex:
         self._provider: EmbeddingProvider | None = None
         self._dim: int | None = None
         self._conn: sqlite3.Connection | None = None
+        self._fts_ready: bool = False
 
     def _ensure_loaded(self) -> None:
         if self._conn is not None:
@@ -87,6 +140,27 @@ class SearchIndex:
         ).fetchone()
         self._dim = int(row[0]) if row else 384
 
+    def _ensure_fts(self) -> None:
+        if self._fts_ready:
+            return
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
+        ).fetchone()
+        if not row:
+            print("Creating FTS5 index...")
+            self._conn.execute("""
+                CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                    name,
+                    text,
+                    content='chunks',
+                    content_rowid='rowid'
+                )
+            """)
+            self._conn.execute("INSERT INTO fts_chunks(fts_chunks) VALUES ('rebuild')")
+            self._conn.commit()
+            print("FTS5 index ready")
+        self._fts_ready = True
+
     @property
     def provider(self) -> EmbeddingProvider:
         if self._provider is None:
@@ -96,24 +170,58 @@ class SearchIndex:
     def _encode(self, text: str) -> list[float]:
         return self.provider.embed_query(text)
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
+    def search(self, query: str, top_k: int = 5, hybrid: bool = True) -> list[dict]:
         self._ensure_loaded()
+
+        # Semantic search
         emb = self._encode(query)
         q_blob = vec_blob(emb)
-        results = self._conn.execute("""
+        semantic_raw = self._conn.execute("""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
               AND k = ?
             ORDER BY distance
-        """, (q_blob, top_k)).fetchall()
-        return [
-            {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4], "distance": r[5]}
-            for r in results
+        """, (q_blob, top_k * 3)).fetchall()
+
+        semantic_results = [
+            (r[0], {
+                "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
+                "text": r[4], "distance": r[5],
+            })
+            for r in semantic_raw
         ]
 
+        if not hybrid:
+            return [r for _, r in semantic_results[:top_k]]
+
+        # FTS5 search
+        self._ensure_fts()
+        try:
+            fts_raw = self._conn.execute("""
+                SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text
+                FROM fts_chunks
+                JOIN chunks ON fts_chunks.rowid = chunks.rowid
+                WHERE fts_chunks MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (query, top_k * 3)).fetchall()
+            fts_results = [
+                (r[0], {
+                    "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
+                    "text": r[4], "distance": None,
+                })
+                for r in fts_raw
+            ]
+        except Exception:
+            # FTS5 unavailable or query syntax error — fall back to pure semantic
+            fts_results = []
+
+        return _rrf_fuse(semantic_results, fts_results, top_k=top_k)
+
     def rules_explain(self, topic: str, top_k: int = 3) -> list[dict]:
+        """Search with boosted journal pages and conditions for core rules."""
         self._ensure_loaded()
         emb = self._encode(topic)
         q_blob = vec_blob(emb)
@@ -140,6 +248,47 @@ class SearchIndex:
             {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4], "distance": r[5]}
             for _, r in scored[:top_k]
         ]
+
+    def fetch_by_id(self, entry_id: str) -> dict | None:
+        """Fetch a single chunk by its internal ID, Foundry UUID, slug, or name."""
+        self._ensure_loaded()
+        normalized = _normalize_id(entry_id)
+
+        # 1. Exact ID match (pack:id or bare Foundry _id)
+        for sql, param in [
+            ("SELECT id, name, type, pack, text FROM chunks WHERE id = ?", (normalized,)),
+            ("SELECT id, name, type, pack, text FROM chunks WHERE id LIKE ?", (f"%:{normalized}",)),
+        ]:
+            row = self._conn.execute(sql, param).fetchone()
+            if row:
+                return {
+                    "id": row[0], "name": row[1], "type": row[2],
+                    "pack": row[3], "text": row[4],
+                }
+
+        # 2. Slug match (e.g. "fury-instinct")
+        row = self._conn.execute(
+            "SELECT id, name, type, pack, text FROM chunks WHERE slug = ?",
+            (normalized,),
+        ).fetchone()
+        if row:
+            return {
+                "id": row[0], "name": row[1], "type": row[2],
+                "pack": row[3], "text": row[4],
+            }
+
+        # 3. Exact name match (case-insensitive)
+        row = self._conn.execute(
+            "SELECT id, name, type, pack, text FROM chunks WHERE LOWER(name) = LOWER(?)",
+            (normalized,),
+        ).fetchone()
+        if row:
+            return {
+                "id": row[0], "name": row[1], "type": row[2],
+                "pack": row[3], "text": row[4],
+            }
+
+        return None
 
     def status(self) -> dict:
         self._ensure_loaded()
