@@ -57,9 +57,14 @@ def index(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     rebuild: bool = typer.Option(False, "--rebuild", help="Replace existing index"),
+    update: bool = typer.Option(False, "--update", "-u", help="Incremental update (diff vs indexed release)"),
 ) -> None:
     """Embed chunks and build sqlite-vec index."""
     settings = _settings(data_dir=data_dir, model=model)
+    if update:
+        from .pipeline import update_index
+        update_index(settings)
+        return
     if chunks_file:
         import json
         chunks: list[dict] = json.loads(chunks_file.read_text())

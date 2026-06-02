@@ -228,7 +228,7 @@ class ONNXProvider(EmbeddingProvider):
     def _tokenize(self, texts: list[str]) -> dict:
         return self._tokenizer(
             texts,
-            padding=True,
+            padding="max_length",
             truncation=True,
             max_length=512,
             return_tensors="np",
@@ -238,17 +238,27 @@ class ONNXProvider(EmbeddingProvider):
         if self._doc_prefix:
             texts = [f"{self._doc_prefix}{t}" for t in texts]
 
-        inputs = self._tokenize(texts)
-        outputs = self._session.run(None, dict(inputs))[0]
-        # Mean pooling
         import numpy as np
-        attention_mask = inputs["attention_mask"]
-        mask_expanded = np.expand_dims(attention_mask, -1).astype(np.float32)
-        sum_embeddings = np.sum(outputs * mask_expanded, axis=1)
-        sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-        embeddings = sum_embeddings / sum_mask
+        # Batch to avoid MIGraphX compiling for enormous shapes
+        batch_size = 32
+        all_embeddings: list[np.ndarray] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = self._tokenize(batch)
+            outputs = self._session.run(None, dict(inputs))[0]
+            # Mean pooling
+            attention_mask = inputs["attention_mask"]
+            mask_expanded = np.expand_dims(attention_mask, -1).astype(np.float32)
+            sum_embeddings = np.sum(outputs * mask_expanded, axis=1)
+            sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+            batch_embeddings = sum_embeddings / sum_mask
+            all_embeddings.append(batch_embeddings)
+
+        embeddings = np.vstack(all_embeddings)
         # Normalize
-        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms = np.clip(norms, a_min=1e-9, a_max=None)
+        embeddings = embeddings / norms
         return embeddings.tolist()
 
     def embed_query(self, text: str) -> list[float]:

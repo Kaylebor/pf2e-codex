@@ -1,9 +1,28 @@
 """Rules-aware chunk builder from PF2E Foundry pack entries."""
 
+import hashlib
 import html
 import json
 import re
 from typing import Any
+
+
+def entry_hash(entry: dict[str, Any]) -> str:
+    """Stable hash of entry content only, excluding metadata that changes every release."""
+    content = {
+        "name": entry.get("name", ""),
+        "type": entry.get("type", ""),
+        "system": entry.get("system", {}),
+    }
+    # Journals store content in pages
+    if "pages" in entry and "system" not in entry:
+        content["pages"] = [
+            {"name": p.get("name", ""), "text": p.get("text", {})}
+            for p in entry.get("pages", [])
+        ]
+    raw = json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
 
 _RE_UUID_LINK = re.compile(r"@UUID\[([^\]]+)\](?:\{([^}]*)\})?")
 _RE_HTML_TAG = re.compile(r"<[^>]+>")
@@ -473,11 +492,16 @@ class ChunkBuilder:
     def build_all(self, entry: dict[str, Any], pack_name: str) -> list[dict[str, Any]]:
         """Build one or more chunks from an entry. Journals produce page chunks."""
         etype = entry.get("type", "")
+        h = entry_hash(entry)
         if not etype and "pages" in entry and "system" not in entry:
-            return self._build_journal_chunks(entry, pack_name)
+            chunks = self._build_journal_chunks(entry, pack_name)
+            for c in chunks:
+                c["source_hash"] = h
+            return chunks
         chunk = self._build_single(entry, pack_name)
         if chunk:
             chunk["id"] = f"{pack_name}:{chunk['id']}"
+            chunk["source_hash"] = h
             return [chunk]
         return []
 
@@ -513,6 +537,7 @@ class ChunkBuilder:
                 "raw_rules_count": 0,
                 "has_description": bool(plain),
                 "refs": refs,
+                "source_hash": None,
             })
         return chunks
 
