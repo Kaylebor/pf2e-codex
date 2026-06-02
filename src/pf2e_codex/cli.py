@@ -251,5 +251,36 @@ def benchmark(
     print_results(data)
 
 
+@app.command()
+def validate(
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+    onnx_provider: str = typer.Option("auto", "--onnx-provider", help="ONNX provider override"),
+) -> None:
+    """Validate retrieval quality against standard query suite."""
+    from .validate import run_validation, load_queries
+    settings = _settings(data_dir=data_dir, model=model)
+    queries = load_queries()
+    typer.echo(f"Model: {settings.model}")
+    typer.echo(f"DB:    {settings.db}")
+    typer.echo(f"Suite: {len(queries)} queries\n")
+
+    result = run_validation(
+        settings.db, settings.model,
+        provider=settings.provider,
+        onnx_provider=onnx_provider,
+    )
+
+    for r in result["results"]:
+        mark = "✓" if r["rank"] == 1 else (f"r{r['rank']}" if r["rank"] else "✗")
+        typer.echo(f"  {mark:>2} {r['query'][:40]:40s} → {r['expected']:28s} at {r['rank'] or '—':>2}")
+
+    typer.echo()
+    typer.echo(f"  MRR:          {result['mrr']:.3f}")
+    typer.echo(f"  Perfect (#1):  {result['perfect']}/{result['n_queries']}")
+    typer.echo(f"  Top 3:         {result['top3']}/{result['n_queries']}")
+    typer.echo(f"  Not found:     {result['not_found']}/{result['n_queries']}")
+
+
 def main() -> None:
     app()
