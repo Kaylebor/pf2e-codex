@@ -17,35 +17,44 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
     mcp = FastMCP("pf2e")
 
     @mcp.tool()
-    def pf2e_search(query: str, top_k: int = 5) -> str:
-        """Search the PF2E rules database for entries matching a natural language query.
+    def pf2e_search(query: str, top_k: int = 5, hybrid: bool = False) -> str:
+        """Search the PF2E rules database for entries matching a query.
+
+        Use this for finding specific feats, spells, conditions, items, or
+        when you need a broad rules search. For deep rules explanations (e.g.
+        "how does flanking work", "do penalties stack"), prefer pf2e_rules_explain.
 
         Args:
-            query: A natural language question or keywords about PF2E rules,
-                   mechanics, feats, spells, conditions, etc.
-            top_k: Number of top results to return (default 5, max 20).
+            query: Natural language question or keywords.
+            top_k: Number of results (default 5, max 20).
+            hybrid: If true, boosts exact name matches. Useful when you
+                    know or half-remember the entry name.
 
         Returns:
-            JSON string with search results containing id, name, type, pack, text, distance.
+            JSON with results containing id, name, type, pack, text, license.
         """
         top_k = max(1, min(top_k, 20))
-        results = search.search(query, top_k)
+        results = search.search(query, top_k, hybrid=hybrid)
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()
     def pf2e_get_entry(entry_id: str) -> str:
-        """Fetch the full text of a PF2E entry by its ID or Foundry UUID.
+        """Fetch the full text of a PF2E entry by ID, slug, name, or UUID.
+
+        Use this when you already know the entry name or have a UUID
+        from a search result (shown as 'id' in results).
 
         Accepts:
             - Internal ID: "feats:Fury-Instinct" or "conditions:blinded"
             - Foundry UUID: "Compendium.pf2e.feats.Item.Fury-Instinct"
             - Bare slug: "fury-instinct"
+            - Exact name: "Fury Instinct"
 
         Args:
-            entry_id: The ID or UUID of the entry to retrieve.
+            entry_id: The ID, slug, name, or UUID of the entry.
 
         Returns:
-            JSON string with the entry, or an error if not found.
+            JSON with the full entry text.
         """
         result = search.fetch_by_id(entry_id)
         if result:
@@ -54,14 +63,18 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
 
     @mcp.tool()
     def pf2e_rules_explain(topic: str, top_k: int = 3) -> str:
-        """Get core rules explanations for a topic (e.g. 'flanking', 'stacking penalties').
+        """Get core rules explanations for a topic using deep semantic search.
+
+        Use this for rules-phrased questions where you want journal pages
+        and condition entries prioritized (e.g. "how does flanking work",
+        "do status and circumstance penalties stack", "what happens when dying").
 
         Args:
             topic: The rules topic to explain.
-            top_k: Number of top results to return (default 3, max 10).
+            top_k: Number of results (default 3, max 10).
 
         Returns:
-            JSON string with prioritized results from journal pages and conditions.
+            JSON with prioritized results from journal pages and conditions.
         """
         top_k = max(1, min(top_k, 10))
         results = search.rules_explain(topic, top_k)

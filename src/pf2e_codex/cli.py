@@ -86,7 +86,7 @@ def search(
     """Search the PF2E index."""
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
-    results = search_idx.search(query, top_k)
+    results = search_idx.search(query, top_k, hybrid=True)
     typer.echo(f"Query: '{query}'")
     typer.echo(f"DB: {settings.db}")
     typer.echo(f"Results ({len(results)}):\n")
