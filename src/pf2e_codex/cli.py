@@ -256,6 +256,7 @@ def validate(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
     onnx_provider: str = typer.Option("auto", "--onnx-provider", help="ONNX provider override"),
+    mode: str = typer.Option("hybrid", "--mode", help="Search mode: hybrid or semantic"),
 ) -> None:
     """Validate retrieval quality against standard query suite."""
     from .validate import run_validation, load_queries
@@ -263,10 +264,12 @@ def validate(
     queries = load_queries()
     typer.echo(f"Model: {settings.model}")
     typer.echo(f"DB:    {settings.db}")
+    typer.echo(f"Mode:  {mode}")
     typer.echo(f"Suite: {len(queries)} queries\n")
 
     result = run_validation(
         settings.db, settings.model,
+        hybrid=(mode == "hybrid"),
         provider=settings.provider,
         onnx_provider=onnx_provider,
     )

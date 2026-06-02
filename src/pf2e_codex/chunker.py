@@ -3,8 +3,35 @@
 import hashlib
 import html
 import json
+import os
 import re
 from typing import Any
+
+# Load aliases (pre-remaster to remaster name mapping)
+_ALIASES: dict[str, str] | None = None
+
+def _load_aliases() -> dict[str, str]:
+    global _ALIASES
+    if _ALIASES is not None:
+        return _ALIASES
+    alias_path = os.path.join(os.path.dirname(__file__), "aliases.json")
+    if os.path.exists(alias_path):
+        pairs = json.loads(open(alias_path).read())
+        _ALIASES = {old.lower().strip(): new for old, new in pairs}
+    else:
+        _ALIASES = {}
+    return _ALIASES
+
+
+def resolve_alias(name: str) -> str | None:
+    """If name has a remaster alias, return the old (pre-remaster) name or None."""
+    aliases = _load_aliases()
+    for old_lower, new_name in aliases.items():
+        if name.lower() == new_name.lower():
+            # Found that this is the remaster name — return original old name
+            # But aliases are stored old→new, so we need to find new→old
+            return next((o for o, n in aliases.items() if n.lower() == name.lower()), None)
+    return None
 
 
 def entry_hash(entry: dict[str, Any]) -> str:
@@ -538,6 +565,7 @@ class ChunkBuilder:
                 "has_description": bool(plain),
                 "refs": refs,
                 "source_hash": None,
+                "license": entry.get("system", {}).get("publication", {}).get("license", "NONE"),
             })
         return chunks
 
@@ -582,7 +610,11 @@ class ChunkBuilder:
                 rule_texts.append(flat)
         rule_texts = self._resolve_rule_texts(rule_texts)
 
-        lines = [f"{etype}: {name}" + (f" ({slug})" if slug else "")]
+        # Include old name as alias if this was renamed in remaster
+        old_name = resolve_alias(name)
+        display_name = f"{name} (formerly {old_name})" if old_name else name
+
+        lines = [f"{etype}: {display_name}" + (f" ({slug})" if slug else "")]
         if level is not None:
             lines.append(f"Level: {level}")
         if action_cost:
@@ -620,6 +652,8 @@ class ChunkBuilder:
             if parts:
                 lines += ["", f"Source: {' '.join(parts)}"]
 
+        license_val = system.get("publication", {}).get("license", "NONE")
+
         return {
             "id": entry.get("_id", ""),
             "name": name,
@@ -632,6 +666,7 @@ class ChunkBuilder:
             "raw_rules_count": len(rules),
             "has_description": bool(desc_text),
             "refs": all_refs,
+            "license": license_val,
         }
 
     def _add_type_specific_fields(self, lines: list[str], etype: str, system: dict[str, Any]) -> None:

@@ -39,7 +39,8 @@ def init_db(db_path: Path, dim: int) -> None:
             traits TEXT,
             text TEXT,
             raw_rules_count INTEGER,
-            source_hash TEXT
+            source_hash TEXT,
+            license TEXT DEFAULT 'NONE'
         )
     """)
     conn.execute(f"""
