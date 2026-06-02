@@ -209,7 +209,7 @@ class SearchIndex:
     def search(self, query: str, top_k: int = 5, hybrid: bool = True) -> list[dict]:
         self._ensure_loaded()
 
-        # Semantic search
+        # 1. Semantic search
         emb = self._encode(query)
         q_blob = vec_blob(emb)
         semantic_raw = self._conn.execute("""
@@ -229,11 +229,7 @@ class SearchIndex:
             for r in semantic_raw
         ]
 
-        if not hybrid:
-            return [r for _, r in semantic_results[:top_k]]
-
-        # Name bag-of-words search — match on content words only, skip
-        # generic type labels like 'spell', 'feat', 'action'.
+        # 2. Name bag-of-words search (for hybrid mode)
         _STOP_WORDS = frozenset({
             'spell', 'feat', 'action', 'effect', 'item', 'weapon', 'armor',
             'equipment', 'condition', 'ability', 'feature', 'class',
@@ -241,39 +237,89 @@ class SearchIndex:
             'vehicle', 'familiar', 'npc', 'creature', 'monster', 'ritual',
         })
         like_results: list[tuple[str, dict]] = []
-        try:
+        if hybrid:
             words = [
                 w.strip().lower() for w in query.split()
                 if len(w.strip()) > 2 and w.strip().lower() not in _STOP_WORDS
             ]
             if words:
-                like_conditions = " OR ".join(["LOWER(name) LIKE ?" for _ in words])
-                like_params = [f"%{w}%" for w in words]
-                like_raw = self._conn.execute(f"""
-                    SELECT id, name, type, pack, text, license
-                    FROM chunks
-                    WHERE {like_conditions}
-                    LIMIT ?
-                """, like_params + [top_k * 3]).fetchall()
-                # Score by number of matching words in name
-                scored: dict[str, tuple[tuple, int]] = {}
-                for r in like_raw:
-                    cid = r[0]
-                    match_count = sum(1 for w in words if w in r[1].lower())
-                    if match_count > 0:
-                        existing = scored.get(cid)
-                        if not existing or existing[1] < match_count:
-                            scored[cid] = (r, match_count)
-                sorted_entries = sorted(scored.values(), key=lambda x: -x[1])
-                for r, _mc in sorted_entries[:top_k * 3]:
-                    like_results.append((r[0], {
-                        "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
-                        "text": r[4], "license": r[5], "distance": None,
-                    }))
-        except Exception:
-            pass
+                try:
+                    like_conditions = " OR ".join(["LOWER(name) LIKE ?" for _ in words])
+                    like_params = [f"%{w}%" for w in words]
+                    like_raw = self._conn.execute(f"""
+                        SELECT id, name, type, pack, text, license
+                        FROM chunks
+                        WHERE {like_conditions}
+                        LIMIT ?
+                    """, like_params + [top_k * 3]).fetchall()
+                    scored: dict[str, tuple[tuple, int]] = {}
+                    for r in like_raw:
+                        cid = r[0]
+                        match_count = sum(1 for w in words if w in r[1].lower())
+                        if match_count > 0:
+                            existing = scored.get(cid)
+                            if not existing or existing[1] < match_count:
+                                scored[cid] = (r, match_count)
+                    sorted_entries = sorted(scored.values(), key=lambda x: -x[1])
+                    for r, _mc in sorted_entries[:top_k * 3]:
+                        like_results.append((r[0], {
+                            "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
+                            "text": r[4], "license": r[5], "distance": None,
+                        }))
+                except Exception:
+                    pass
 
-        return _rrf_fuse(semantic_results, like_results, top_k=top_k)
+        # 3. Build results
+        if not hybrid:
+            results = [r for _, r in semantic_results[:top_k]]
+        else:
+            results = _rrf_fuse(semantic_results, like_results, top_k=top_k)
+
+        # 4. Enrich with refs, legacy names, confidence
+        self._enrich_results(results)
+        return results
+
+    def _enrich_results(self, results: list[dict]) -> None:
+        """Add refs, legacy_name, and confidence to search results in-place."""
+        if not results:
+            return
+
+        # Batch-fetch outgoing refs for all results
+        ids = [r["id"] for r in results]
+        placeholders = ",".join("?" * len(ids))
+        refs_rows = self._conn.execute(f"""
+            SELECT source_id, target_name, target_uuid FROM refs
+            WHERE source_id IN ({placeholders})
+        """, ids).fetchall()
+        refs_by_source: dict[str, list[dict]] = {}
+        for src, name, uuid in refs_rows:
+            refs_by_source.setdefault(src, []).append({"name": name, "id": uuid})
+
+        for r in results:
+            r["refs"] = refs_by_source.get(r["id"], [])
+
+            # Extract legacy name from alias pattern: "X (formerly Y)"
+            name = r.get("name", "")
+            if " (formerly " in name:
+                r["legacy_name"] = name.split(" (formerly ", 1)[1].rstrip(")")
+            else:
+                r["legacy_name"] = None
+
+            # Confidence from score
+            score = r.get("rrf_score") or r.get("distance")
+            if score is None:
+                r["confidence"] = "high"  # exact fetch
+            elif r.get("rrf_score") is not None:
+                # RRF: higher is better
+                if score > 0.015:
+                    r["confidence"] = "high"
+                elif score > 0.008:
+                    r["confidence"] = "medium"
+                else:
+                    r["confidence"] = "low"
+            else:
+                # Semantic: distance is available but we use rrf_score when hybrid
+                r["confidence"] = "medium" if (score or 0) < 0.5 else "low"
 
     def rules_explain(self, topic: str, top_k: int = 3) -> list[dict]:
         """Search with boosted journal pages and conditions for core rules."""

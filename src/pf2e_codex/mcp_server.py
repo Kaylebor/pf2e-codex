@@ -21,17 +21,22 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         """Search the PF2E rules database for entries matching a query.
 
         Use this for finding specific feats, spells, conditions, items, or
-        when you need a broad rules search. For deep rules explanations (e.g.
-        "how does flanking work", "do penalties stack"), prefer pf2e_rules_explain.
+        broad rules searches. Returns results with cross-references (refs),
+        legacy names (for renamed entries), and confidence levels.
 
         Args:
             query: Natural language question or keywords.
             top_k: Number of results (default 5, max 20).
-            hybrid: If true, boosts exact name matches. Useful when you
-                    know or half-remember the entry name.
+            hybrid: If true, boosts exact name matches. Set to true when
+                    you know or half-remember the entry name.
 
         Returns:
-            JSON with results containing id, name, type, pack, text, license.
+            JSON with results: id, name, type, pack, text, license, refs,
+            legacy_name, confidence.
+
+        Tip: Each result's 'refs' field lists entries it references — useful
+        for chaining follow-up queries. 'legacy_name' shows the pre-remaster
+        name for renamed entries (e.g. 'flat-footed' for 'Off-Guard').
         """
         top_k = max(1, min(top_k, 20))
         results = search.search(query, top_k, hybrid=hybrid)
@@ -41,8 +46,9 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
     def pf2e_get_entry(entry_id: str) -> str:
         """Fetch the full text of a PF2E entry by ID, slug, name, or UUID.
 
-        Use this when you already know the entry name or have a UUID
-        from a search result (shown as 'id' in results).
+        Use when you already know the entry name or have a UUID from a
+        search result (shown as 'id' in results). This returns the complete
+        entry text including mechanical effects, which search may truncate.
 
         Accepts:
             - Internal ID: "feats:Fury-Instinct" or "conditions:blinded"
@@ -65,9 +71,15 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
     def pf2e_rules_explain(topic: str, top_k: int = 3) -> str:
         """Get core rules explanations for a topic using deep semantic search.
 
-        Use this for rules-phrased questions where you want journal pages
-        and condition entries prioritized (e.g. "how does flanking work",
-        "do status and circumstance penalties stack", "what happens when dying").
+        Use for rules-phrased questions where journal pages and conditions
+        should be prioritized. Examples:
+          - "how does flanking work"
+          - "do status and circumstance penalties stack"
+          - "what happens when dying"
+          - "cover rules"
+
+        For specific named entries (feats, spells, items), use pf2e_search.
+        For exact entry text, combine search results with pf2e_get_entry.
 
         Args:
             topic: The rules topic to explain.
