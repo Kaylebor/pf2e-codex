@@ -8,12 +8,32 @@ PF2E rules knowledge base with MCP, CLI, and SDK interfaces.
 
 ## Quick Start
 
+### Install
+
+**One-liner (recommended):**
 ```bash
-# Install
+curl -sSL https://raw.githubusercontent.com/Kaylebor/pf2e-codex/main/install.sh | bash
+```
+
+**Arch Linux (AUR):**
+```bash
+git clone https://aur.archlinux.org/pf2e-codex.git
+cd pf2e-codex
+makepkg -si
+```
+
+**Manual (uv):**
+```bash
+git clone https://github.com/Kaylebor/pf2e-codex.git
+cd pf2e-codex
 uv venv
 uv pip install -e "."
+```
 
-# Download PF2E data and build index
+### First run
+
+```bash
+# Download PF2E data and build index (~35s on CPU, ~5s on GPU)
 pf2e-codex index
 
 # Search from CLI
@@ -103,6 +123,7 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 | `PF2E_CACHE_DIR` | `~/.cache/pf2e-codex` | Download cache |
 | `PF2E_DB` | `pf2e_v2.db` | sqlite-vec database |
 | `PF2E_MODEL` | `snowflake-arctic-embed-xs` | Embedding model |
+| `PF2E_PROVIDER` | `auto` | `auto`, `onnx`, `sentence_transformers` |
 | `PF2E_RELEASE` | `pf2e-8.1.2` | PF2E system version |
 
 ## MCP Tools
@@ -114,6 +135,32 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 | `pf2e_related(entry_id, direction, limit)` | Cross-reference graph: outgoing/incoming/both |
 | `pf2e_rules_explain(topic, top_k)` | Prioritized search favoring journal pages |
 | `pf2e_index_status()` | Show model, chunk count, date |
+
+## ONNX Acceleration (automatic)
+
+The tool proactively tries ONNX Runtime for faster inference. It works out of the box on CPU.
+
+**For GPU acceleration, install the matching `onnxruntime` variant:**
+
+| GPU | Install | Detection |
+|-----|---------|-----------|
+| AMD (ROCm) | `uv pip install -e ".[rocm]"` | `rocminfo` or `/opt/rocm` |
+| NVIDIA (CUDA) | `uv pip install -e ".[cuda]"` | `nvidia-smi` |
+| CPU | `uv pip install -e ".[onnx]"` | (always works) |
+
+If ONNX fails for any reason, the tool silently falls back to sentence-transformers.
+
+To force the fallback:
+```bash
+PF2E_PROVIDER=sentence_transformers pf2e-codex index
+```
+
+To force ONNX (fail if unavailable):
+```bash
+PF2E_PROVIDER=onnx pf2e-codex index
+```
+
+**Provider priority:** ROCm → CUDA → CPU. ZLUDA (CUDA-on-AMD emulation) is correctly deprioritized — native ROCm is preferred.
 
 ## Embedding Models
 

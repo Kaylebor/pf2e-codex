@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     cache_dir: Path = Field(default=DEFAULT_CACHE_DIR, description="Cache directory for downloads")
     db: Path = Field(default=DEFAULT_DB, description="Path to sqlite-vec database")
     model: str = Field(default=DEFAULT_MODEL, description="Embedding model name or path")
+    provider: str = Field(default="auto", description="Embedding provider: auto, onnx, sentence_transformers")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     transport: str = Field(default="stdio", description="MCP transport: stdio or sse")
 

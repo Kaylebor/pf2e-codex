@@ -78,7 +78,7 @@ def search(
 ) -> None:
     """Search the PF2E index."""
     settings = _settings(db=db, model=model)
-    search_idx = SearchIndex(settings.db, settings.model)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     results = search_idx.search(query, top_k)
     typer.echo(f"Query: '{query}'")
     typer.echo(f"Results ({len(results)}):\n")
@@ -106,7 +106,7 @@ def get(
 ) -> None:
     """Fetch a single entry by its ID or Foundry UUID."""
     settings = _settings(db=db, model=model)
-    search_idx = SearchIndex(settings.db, settings.model)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     result = search_idx.fetch_by_id(entry_id)
     if result:
         typer.echo(f"[{result['type']}] {result['name']} ({result['pack']})")
@@ -128,7 +128,7 @@ def related(
 ) -> None:
     """Find entries related by cross-references."""
     settings = _settings(db=db, model=model)
-    search_idx = SearchIndex(settings.db, settings.model)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     results = search_idx.related(entry_id, direction, limit)
     if results.get("outgoing"):
         typer.echo(f"\n{entry_id} references:")
@@ -149,7 +149,7 @@ def status(
 ) -> None:
     """Show index status."""
     settings = _settings(db=db, model=model)
-    search_idx = SearchIndex(settings.db, settings.model)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     meta = search_idx.status()
     for k, v in meta.items():
         typer.echo(f"  {k}: {v}")

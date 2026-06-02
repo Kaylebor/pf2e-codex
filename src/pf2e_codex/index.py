@@ -124,11 +124,12 @@ def _rrf_fuse(
 class SearchIndex:
     """Search index backed by sqlite-vec with optional FTS5 hybrid blending."""
 
-    def __init__(self, db_path: Path | str, model_name: str):
+    def __init__(self, db_path: Path | str, model_name: str, provider: str = "auto"):
         import sqlite3
 
         self.db_path = Path(db_path)
         self.model_name = model_name
+        self._provider_type = provider
         self._provider: EmbeddingProvider | None = None
         self._dim: int | None = None
         self._conn: sqlite3.Connection | None = None
@@ -189,7 +190,7 @@ class SearchIndex:
     @property
     def provider(self) -> EmbeddingProvider:
         if self._provider is None:
-            self._provider = get_provider(self.model_name)
+            self._provider = get_provider(self.model_name, provider=self._provider_type)
         return self._provider
 
     def _encode(self, text: str) -> list[float]:

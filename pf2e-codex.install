@@ -1,0 +1,13 @@
+post_install() {
+    echo "=== PF2E Codex installed ==="
+    echo "Run 'pf2e-codex index' to build your rules database."
+    echo "Run 'pf2e-codex serve' to start the MCP server."
+    echo ""
+    echo "GPU acceleration:"
+    echo "  Install 'rocm-hip-sdk' for AMD GPU support"
+    echo "  Install 'cuda' for NVIDIA GPU support"
+}
+
+post_upgrade() {
+    post_install
+}

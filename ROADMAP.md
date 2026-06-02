@@ -13,10 +13,9 @@ Ordered by impact. Check items off as completed.
   - Approach: `pf2e-codex benchmark` downloads 3-4 models, indexes 1000 chunks with each, runs a standard query set, prints quality × speed tradeoffs. Auto-recommend based on measured speed.
   - Files: `cli.py`, `models.py`, new `benchmark.py`
 
-- [ ] **ONNX export for Arctic / Nomic on CPU/GPU**
-  - Problem: `snowflake-arctic-embed-m` (~110M, 768d) and `nomic-embed-text-v1.5` (~137M, 768d) are impractical on CPU (~1h index time).
-  - Approach: Add `optimum[onnxruntime]` provider. Export ONNX once, use `onnxruntime` for 10-20× faster inference. Support ROCm on AMD 7900 XTX via `onnxruntime-rocm`.
-  - Files: `embeddings.py` (new `ONNXProvider`)
+- [x] **ONNX export for Arctic / Nomic on CPU/GPU**
+  - Done: `ONNXProvider` with lazy export via `optimum`, runtime provider auto-detection (ROCm → CUDA → CPU), graceful fallback to `SentenceTransformersProvider`. `PF2E_PROVIDER` env override. `install.sh` and PKGBUILD handle system-level GPU detection.
+  - Files: `embeddings.py`, `config.py`, `pyproject.toml`, `install.sh`, `PKGBUILD`
 
 - [ ] **Incremental updates (diff since last release)**
   - Problem: `pf2e-codex index` re-downloads and re-embeds everything even on patch releases.

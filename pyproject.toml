@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+onnx = ["optimum[onnxruntime]", "onnxruntime"]
+rocm = ["optimum[onnxruntime]", "onnxruntime-rocm"]
+cuda = ["optimum[onnxruntime]", "onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]
 
 [project.scripts]
