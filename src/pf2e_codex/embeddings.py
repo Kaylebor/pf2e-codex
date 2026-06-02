@@ -108,7 +108,7 @@ def _detect_onnx_provider() -> str | None:
 class ONNXProvider(EmbeddingProvider):
     """ONNX Runtime provider with automatic model export."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, force_provider: str | None = None):
         import onnxruntime as ort
         from transformers import AutoTokenizer
 
@@ -122,7 +122,10 @@ class ONNXProvider(EmbeddingProvider):
         # Export or reuse cached ONNX model
         self._export_if_needed(local_path)
 
-        # Create session with best provider
+        model_path = self._cache_dir / "model.onnx"
+        if not model_path.exists():
+            raise RuntimeError("Model not exported yet")
+
         def _make_session(providers: list[str]) -> ort.InferenceSession:
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -130,20 +133,30 @@ class ONNXProvider(EmbeddingProvider):
                 str(model_path), opts, providers=providers
             )
 
-        model_path = self._cache_dir / "model.onnx"
-        if not model_path.exists():
-            raise RuntimeError("Model not exported yet")
-
-        provider = _detect_onnx_provider()
-        if not provider:
-            raise RuntimeError("No ONNX execution provider available")
-
-        try:
-            self._session = _make_session([provider])
-        except Exception:
-            # Provider listed but failed at load time (e.g. ROCm 7 vs onnx 1.22)
-            print(f"{provider} unavailable, falling back to CPU")
-            self._session = _make_session(["CPUExecutionProvider"])
+        # Determine session providers
+        if force_provider and force_provider not in ("auto", ""):
+            # Map short names to ONNX provider names
+            provider_map = {
+                "migraphx": "MIGraphXExecutionProvider",
+                "rocm": "ROCMExecutionProvider",
+                "cuda": "CUDAExecutionProvider",
+                "cpu": "CPUExecutionProvider",
+            }
+            mapped = provider_map.get(force_provider, force_provider)
+            try:
+                self._session = _make_session([mapped])
+            except Exception as e:
+                raise RuntimeError(f"ONNX provider '{force_provider}' unavailable: {e}")
+        else:
+            # Auto-detect best provider
+            provider = _detect_onnx_provider()
+            if not provider:
+                raise RuntimeError("No ONNX execution provider available")
+            try:
+                self._session = _make_session([provider])
+            except Exception:
+                print(f"{provider} unavailable, falling back to CPU")
+                self._session = _make_session(["CPUExecutionProvider"])
 
         # Load tokenizer from local path (avoids Hub auth for short names)
         tokenizer_path = local_path or model_name
@@ -274,7 +287,11 @@ registry.register("sentence_transformers", SentenceTransformersProvider)
 registry.register("onnx", ONNXProvider)
 
 
-def get_provider(model_name: str, provider: str = "auto") -> EmbeddingProvider:
+def get_provider(
+    model_name: str,
+    provider: str = "auto",
+    onnx_provider: str | None = None,
+) -> EmbeddingProvider:
     """Create the best available provider for the given model.
 
     Args:
@@ -282,6 +299,9 @@ def get_provider(model_name: str, provider: str = "auto") -> EmbeddingProvider:
         provider: "auto" (try ONNX, fall back to sentence-transformers),
                   "onnx" (force ONNX, fail if unavailable),
                   "sentence_transformers" (skip ONNX).
+        onnx_provider: Override ONNX execution provider. "auto" (default),
+                       "migraphx", "rocm", "cuda", "cpu", or "none" (skip ONNX).
+                       Falls back to os.environ["PF2E_ONNX_PROVIDER"].
 
     Returns:
         An EmbeddingProvider instance.
@@ -291,11 +311,22 @@ def get_provider(model_name: str, provider: str = "auto") -> EmbeddingProvider:
     if provider == "sentence_transformers":
         return SentenceTransformersProvider(model_name)
 
+    # Check onnx_provider override
+    onnx_provider = (
+        onnx_provider
+        or os.environ.get("PF2E_ONNX_PROVIDER", "")
+        or "auto"
+    ).lower()
+
+    if onnx_provider == "none" or onnx_provider == "skip":
+        return SentenceTransformersProvider(model_name)
+
     if provider in ("auto", "onnx"):
-        if _has_onnx() and _detect_onnx_provider():
+        if _has_onnx():
             try:
-                prov = ONNXProvider(model_name)
-                print(f"Using ONNX with {_detect_onnx_provider()}")
+                prov = ONNXProvider(model_name, force_provider=onnx_provider if onnx_provider != "auto" else None)
+                detected = prov._session.get_providers()[0] if hasattr(prov, '_session') else _detect_onnx_provider()
+                print(f"Using ONNX with {detected}")
                 return prov
             except Exception as e:
                 if provider == "onnx":

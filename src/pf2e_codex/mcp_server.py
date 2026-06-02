@@ -12,7 +12,7 @@ from .index import SearchIndex
 
 def create_mcp_app(settings: Settings | None = None) -> FastMCP:
     settings = settings or get_settings()
-    search = SearchIndex(settings.db, settings.model, settings.provider)
+    search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
 
     mcp = FastMCP("pf2e")
 

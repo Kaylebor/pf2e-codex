@@ -80,7 +80,7 @@ def search(
 ) -> None:
     """Search the PF2E index."""
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.search(query, top_k)
     typer.echo(f"Query: '{query}'")
     typer.echo(f"DB: {settings.db}")
@@ -109,7 +109,7 @@ def get(
 ) -> None:
     """Fetch a single entry by its ID or Foundry UUID."""
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     result = search_idx.fetch_by_id(entry_id)
     if result:
         typer.echo(f"[{result['type']}] {result['name']} ({result['pack']})")
@@ -131,7 +131,7 @@ def related(
 ) -> None:
     """Find entries related by cross-references."""
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.related(entry_id, direction, limit)
     if results.get("outgoing"):
         typer.echo(f"\n{entry_id} references:")
@@ -152,7 +152,7 @@ def status(
 ) -> None:
     """Show index status."""
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     meta = search_idx.status()
     typer.echo(f"Model: {settings.model}")
     typer.echo(f"DB:    {settings.db}")
@@ -172,6 +172,7 @@ def config(
     typer.echo(f"  data_dir: {s.data_dir}")
     typer.echo(f"  db: {s.db}  (derived)")
     typer.echo(f"  provider: {s.provider}")
+    typer.echo(f"  onnx_provider: {s.onnx_provider}")
     typer.echo(f"  release: {s.release}")
     typer.echo(f"  cache_dir: {s.cache_dir}")
     typer.echo(f"  transport: {s.transport}")
@@ -220,6 +221,29 @@ def serve(
     settings.transport = transport
     from .mcp_server import serve as _serve
     _serve(settings)
+
+
+@app.command()
+def benchmark(
+    models: str = typer.Option(
+        "all-MiniLM-L6-v2,snowflake-arctic-embed-xs,snowflake-arctic-embed-s,intfloat/e5-small-v2",
+        "--models", "-m",
+        help="Comma-separated model names to benchmark",
+    ),
+    providers: str = typer.Option(
+        "sentence_transformers,onnx",
+        "--providers", "-p",
+        help="Comma-separated providers: sentence_transformers, onnx",
+    ),
+    chunks: int = typer.Option(200, "--chunks", "-c", help="Number of chunks to benchmark with"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+) -> None:
+    """Benchmark embedding speed across models and providers."""
+    model_list = [m.strip() for m in models.split(",") if m.strip()]
+    prov_list = [p.strip() for p in providers.split(",") if p.strip()]
+    from .benchmark import run_benchmark, print_results
+    data = run_benchmark(models=model_list, providers=prov_list, chunks=chunks)
+    print_results(data)
 
 
 def main() -> None:

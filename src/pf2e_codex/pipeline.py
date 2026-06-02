@@ -49,7 +49,11 @@ def save_chunks(chunks: list[dict[str, Any]], path: Path) -> None:
 
 def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: bool = False) -> None:
     """Embed chunks and store in sqlite-vec."""
-    provider = get_provider(settings.model, provider=settings.provider)
+    provider = get_provider(
+        settings.model,
+        provider=settings.provider,
+        onnx_provider=settings.onnx_provider,
+    )
     dim = provider.dim
     print(f"Embedding model: {settings.model} (dim={dim})")
 
