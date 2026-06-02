@@ -17,29 +17,37 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
     mcp = FastMCP("pf2e")
 
     @mcp.tool()
-    def pf2e_search(query: str, top_k: int = 5, hybrid: bool = False) -> str:
+    def pf2e_search(
+        query: str,
+        top_k: int = 5,
+        hybrid: bool = False,
+        license: str | None = None,
+        content_type: str | None = None,
+        pack: str | None = None,
+    ) -> str:
         """Search the PF2E rules database for entries matching a query.
 
-        Use this for finding specific feats, spells, conditions, items, or
-        broad rules searches. Returns results with cross-references (refs),
-        legacy names (for renamed entries), and confidence levels.
+        Returns results with cross-references (refs), legacy names, confidence,
+        and license. Supports filtering by license, content type, or pack.
 
         Args:
             query: Natural language question or keywords.
             top_k: Number of results (default 5, max 20).
-            hybrid: If true, boosts exact name matches. Set to true when
-                    you know or half-remember the entry name.
+            hybrid: If true, boosts exact name matches.
+            license: Filter by license: 'ORC' (remaster), 'OGL' (legacy), or null.
+            content_type: Filter by type: 'feat', 'spell', 'condition', 'journal_page',
+                          'action', 'equipment', 'class', etc.
+            pack: Filter by pack name: 'spells', 'feats', 'pathfinder-bestiary', etc.
 
         Returns:
             JSON with results: id, name, type, pack, text, license, refs,
             legacy_name, confidence.
 
-        Tip: Each result's 'refs' field lists entries it references — useful
-        for chaining follow-up queries. 'legacy_name' shows the pre-remaster
-        name for renamed entries (e.g. 'flat-footed' for 'Off-Guard').
+        Tip: 'refs' lists entries this result references — useful for chaining.
+        'legacy_name' shows the pre-remaster name (e.g. 'flat-footed' for 'Off-Guard').
         """
         top_k = max(1, min(top_k, 20))
-        results = search.search(query, top_k, hybrid=hybrid)
+        results = search.search(query, top_k, hybrid=hybrid, license=license, content_type=content_type, pack=pack)
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()
@@ -68,7 +76,12 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         return json.dumps({"error": f"Entry not found: {entry_id}"}, indent=2)
 
     @mcp.tool()
-    def pf2e_rules_explain(topic: str, top_k: int = 3) -> str:
+    def pf2e_rules_explain(
+        topic: str,
+        top_k: int = 3,
+        license: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
         """Get core rules explanations for a topic using deep semantic search.
 
         Use for rules-phrased questions where journal pages and conditions
@@ -84,12 +97,14 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         Args:
             topic: The rules topic to explain.
             top_k: Number of results (default 3, max 10).
+            license: Filter by license: 'ORC', 'OGL', or null.
+            content_type: Filter by type: 'condition', 'journal_page', 'feat', etc.
 
         Returns:
             JSON with prioritized results from journal pages and conditions.
         """
         top_k = max(1, min(top_k, 10))
-        results = search.rules_explain(topic, top_k)
+        results = search.rules_explain(topic, top_k, license=license, content_type=content_type)
         return json.dumps({"topic": topic, "results": results}, indent=2)
 
     @mcp.tool()

@@ -206,20 +206,37 @@ class SearchIndex:
     def _encode(self, text: str) -> list[float]:
         return self.provider.embed_query(text)
 
-    def search(self, query: str, top_k: int = 5, hybrid: bool = True) -> list[dict]:
+    def search(
+        self, query: str, top_k: int = 5, hybrid: bool = True,
+        license: str | None = None, content_type: str | None = None, pack: str | None = None,
+    ) -> list[dict]:
         self._ensure_loaded()
 
-        # 1. Semantic search
+        # Build WHERE clauses for filters
+        where_clauses = ["1=1"]
+        params: list[str] = []
+        if license:
+            where_clauses.append("chunks.license = ?")
+            params.append(license)
+        if content_type:
+            where_clauses.append("chunks.type = ?")
+            params.append(content_type)
+        if pack:
+            where_clauses.append("chunks.pack = ?")
+            params.append(pack)
+        where = " AND ".join(where_clauses)
+
+        # 1. Semantic search (filtered)
         emb = self._encode(query)
         q_blob = vec_blob(emb)
-        semantic_raw = self._conn.execute("""
+        semantic_raw = self._conn.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
-              AND k = ?
+              AND k = ? AND {where}
             ORDER BY distance
-        """, (q_blob, top_k * 3)).fetchall()
+        """, [q_blob, top_k * 3] + params).fetchall()
 
         semantic_results = [
             (r[0], {
@@ -246,12 +263,13 @@ class SearchIndex:
                 try:
                     like_conditions = " OR ".join(["LOWER(name) LIKE ?" for _ in words])
                     like_params = [f"%{w}%" for w in words]
+                    # Params: LIKE terms, WHERE filter values, then LIMIT
                     like_raw = self._conn.execute(f"""
                         SELECT id, name, type, pack, text, license
                         FROM chunks
-                        WHERE {like_conditions}
+                        WHERE ({like_conditions}) AND {where}
                         LIMIT ?
-                    """, like_params + [top_k * 3]).fetchall()
+                    """, like_params + params + [top_k * 3]).fetchall()
                     scored: dict[str, tuple[tuple, int]] = {}
                     for r in like_raw:
                         cid = r[0]
@@ -321,19 +339,31 @@ class SearchIndex:
                 # Semantic: distance is available but we use rrf_score when hybrid
                 r["confidence"] = "medium" if (score or 0) < 0.5 else "low"
 
-    def rules_explain(self, topic: str, top_k: int = 3) -> list[dict]:
+    def rules_explain(self, topic: str, top_k: int = 3,
+                      license: str | None = None, content_type: str | None = None) -> list[dict]:
         """Search with boosted journal pages and conditions for core rules."""
         self._ensure_loaded()
+
+        where_clauses = ["1=1"]
+        params: list[str] = []
+        if license:
+            where_clauses.append("chunks.license = ?")
+            params.append(license)
+        if content_type:
+            where_clauses.append("chunks.type = ?")
+            params.append(content_type)
+        where = " AND ".join(where_clauses)
+
         emb = self._encode(topic)
         q_blob = vec_blob(emb)
-        results = self._conn.execute("""
+        results = self._conn.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
-              AND k = ?
+              AND k = ? AND {where}
             ORDER BY distance
-        """, (q_blob, top_k * 3)).fetchall()
+        """, [q_blob, top_k * 3] + params).fetchall()
         scored = []
         for r in results:
             ctype = r[2]
