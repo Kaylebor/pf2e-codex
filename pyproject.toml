@@ -15,9 +15,13 @@ dependencies = [
 
 [project.optional-dependencies]
 onnx = ["optimum[onnxruntime]", "onnxruntime"]
-rocm = ["optimum[onnxruntime]", "onnxruntime-rocm"]
+rocm = ["optimum[onnxruntime]", "onnxruntime-rocm"]  # ROCm 6.x only
 cuda = ["optimum[onnxruntime]", "onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]
+
+# ROCm 7.x requires onnxruntime-migraphx from GitHub:
+#   uv pip install optimum
+#   uv pip install https://github.com/Looong01/onnxruntime-rocm-build/releases/download/v1.25.0/onnxruntime_migraphx-1.25.0-cp313-cp313-manylinux_2_34_x86_64.whl
 
 [project.scripts]
 pf2e-codex = "pf2e_codex.cli:main"

@@ -147,23 +147,28 @@ ONNX is auto-detected. Install in order of preference:
 
 ```bash
 # CPU (always works)
-uv pip install 'optimum[onnxruntime]'  # also pulls onnxruntime
+uv pip install 'optimum[onnxruntime]'
 
-# AMD ROCm (requires ROCm 6.x drivers)
-uv pip install onnxruntime-rocm optimum
+# AMD ROCm 7.x (MIGraphX EP, onnxruntime 1.23+)
+uv pip install optimum
+uv pip install https://github.com/Looong01/onnxruntime-rocm-build/releases/download/v1.25.0/onnxruntime_migraphx-1.25.0-cp313-cp313-manylinux_2_34_x86_64.whl
+# Also need MIGraphX system lib: yay -S migraphx (AUR) or equivalent
+
+# AMD ROCm 6.x (ROCm EP, onnxruntime ≤ 1.22)
+uv pip install -e ".[rocm]"
 
 # NVIDIA CUDA
-uv pip install onnxruntime-gpu optimum
+uv pip install -e ".[cuda]"
 ```
 
 On first use per model, ONNX exports once (cached at `~/.cache/pf2e-codex/onnx/{model}/`).
 Subsequent loads skip export.
+MIGraphX also compiles the model to GPU kernels on first inference (~10-30s per batch shape).
+After compile, steady-state throughput is 50-500× faster than PyTorch CPU.
 
-**Known issues:**
-- `onnxruntime-rocm` 1.22.2 does not support ROCm 7.x. Needs investigation — modern `onnxruntime`
-  may have ROCm built-in via a different variant.
-- Models with short names (e.g. `all-MiniLM-L6-v2`) are resolved to their local HF cache path
-  for export, avoiding Hub auth.
+**Key provider order:** MIGraphX → ROCm → CUDA → CPU
+**Per-batch-shape compile:** MIGraphX compiles once per unique batch size. For a running
+MCP server this happens once at startup.
 
 **Test ONNX is working:**
 ```bash

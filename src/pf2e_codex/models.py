@@ -1,16 +1,21 @@
 """Embedding model registry with hardware-aware recommendations.
 
-Benchmarks on AMD Ryzen 7 7800X3D (8c/16t), batch_size=32, 28.8K chunks:
-┌─────────────────────────────────────────┬───────┬─────┬──────────┬─────────┐
-│ Model                                   │ Params│ Dim │ Time     │ Quality │
-├─────────────────────────────────────────┼───────┼─────┼──────────┼─────────┤
-│ all-MiniLM-L6-v2                        │  22M  │ 384 │ ~50s     │ Good    │
-│ Snowflake/snowflake-arctic-embed-xs     │  22M  │ 384 │ ~35s     │ Good    │
-│ Snowflake/snowflake-arctic-embed-s      │  33M  │ 384 │ ~69s     │ Good    │
-│ intfloat/e5-small-v2                    │  33M  │ 384 │ ~135s    │ Good*   │
-│ Snowflake/snowflake-arctic-embed-m      │ 110M  │ 768 │ ~1h      │ Better  │
-│ nomic-ai/nomic-embed-text-v1.5          │ 137M  │ 768 │ ~1h+     │ Better  │
-└─────────────────────────────────────────┴───────┴─────┴──────────┴─────────┘
+Benchmarks on AMD Ryzen 7 7800X3D (8c/16t) + Radeon RX 7900 XTX (24GB) ROCm 7.2.3.
+ONNX inference via MIGraphXExecutionProvider (onnxruntime-migraphx 1.25.0).
+Steady-state throughput (post-compile), average of 50-100 runs:
+
+| Model | Params | Dim | Index Time (CPU) | Query (CPU batch=100) | Query (GPU batch=100) |
+|---|---|---:|---:|---:|---:|
+| all-MiniLM-L6-v2 | 22M | 384 | ~50s | 520ms | 8.3ms |
+| snowflake-arctic-embed-xs | 22M | 384 | ~35s | 612ms | 8.3ms |
+| snowflake-arctic-embed-s | 33M | 384 | ~69s | 1204ms | — |
+| intfloat/e5-small-v2 | 33M | 384 | ~135s | 1212ms | 13.4ms |
+| snowflake-arctic-embed-m | 110M | 768 | ~1h | — | — |
+| nomic-embed-text-v1.5 | 137M | 768 | ~1h+ | — | — |
+
+Single-query GPU latency: 1.1ms (MiniLM / Arctic xs), 2.4ms (e5-small).
+Compile time: ~10-30s one-time per model, cached in ~/.cache/pf2e-codex/onnx/
+* e5-small requires "query:" / "passage:" prefixing.
 
 * Requires "query:" / "passage:" prefixing.
 """

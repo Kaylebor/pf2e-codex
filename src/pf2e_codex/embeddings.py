@@ -62,9 +62,10 @@ class SentenceTransformersProvider(EmbeddingProvider):
 
 # ── ONNX ────────────────────────────────────────────────────────────────
 
-# Provider priority: native ROCm first, then CUDA, then CPU.
-# ZLUDA self-identifies as CUDA; we prefer native ROCm over emulated CUDA.
+# Provider priority: MIGraphX (ROCm 7+ replacement), ROCm (ROCm 6), CUDA, then CPU.
+# ZLUDA self-identifies as CUDA; prefer native AMD backends over emulated CUDA.
 _ONNX_EXEC_PROVIDERS = [
+    "MIGraphXExecutionProvider",
     "ROCMExecutionProvider",
     "CUDAExecutionProvider",
     "CPUExecutionProvider",
@@ -87,11 +88,17 @@ def _has_onnx() -> bool:
 
 
 def _detect_onnx_provider() -> str | None:
-    """Return the best available ONNX execution provider, or None."""
+    """Return the best candidate from available ONNX execution providers.
+
+    'ort.get_available_providers()' lists what the binary *can* do,
+    but may include providers whose system libraries aren't loadable
+    (e.g. ROCm 7.x with onnxruntime-rocm 1.22.2). Actual verification
+    happens at session creation in ONNXProvider.__init__.
+    """
     if not _has_onnx():
         return None
     import onnxruntime as ort
-    available = set(ort.get_available_providers())
+    available = ort.get_available_providers()
     for preferred in _ONNX_EXEC_PROVIDERS:
         if preferred in available:
             return preferred
@@ -116,19 +123,27 @@ class ONNXProvider(EmbeddingProvider):
         self._export_if_needed(local_path)
 
         # Create session with best provider
+        def _make_session(providers: list[str]) -> ort.InferenceSession:
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            return ort.InferenceSession(
+                str(model_path), opts, providers=providers
+            )
+
+        model_path = self._cache_dir / "model.onnx"
+        if not model_path.exists():
+            raise RuntimeError("Model not exported yet")
+
         provider = _detect_onnx_provider()
         if not provider:
             raise RuntimeError("No ONNX execution provider available")
 
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-        model_path = self._cache_dir / "model.onnx"
-        self._session = ort.InferenceSession(
-            str(model_path),
-            sess_options,
-            providers=[provider],
-        )
+        try:
+            self._session = _make_session([provider])
+        except Exception:
+            # Provider listed but failed at load time (e.g. ROCm 7 vs onnx 1.22)
+            print(f"{provider} unavailable, falling back to CPU")
+            self._session = _make_session(["CPUExecutionProvider"])
 
         # Load tokenizer from local path (avoids Hub auth for short names)
         tokenizer_path = local_path or model_name
@@ -150,9 +165,13 @@ class ONNXProvider(EmbeddingProvider):
         print(f"Exporting {self.model_name} to ONNX (one-time)...")
         start = time.time()
         try:
+            # Export in offline mode if we have a local cache path
+            kwargs = {"export": True}
+            if local_path:
+                kwargs["local_files_only"] = True
             from optimum.onnxruntime import ORTModelForFeatureExtraction
             model = ORTModelForFeatureExtraction.from_pretrained(
-                export_path, export=True
+                export_path, **kwargs
             )
             model.save_pretrained(self._cache_dir)
             print(f"Exported in {time.time() - start:.1f}s -> {self._cache_dir}")
