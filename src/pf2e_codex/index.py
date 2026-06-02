@@ -380,6 +380,39 @@ class SearchIndex:
             for _, r in scored[:top_k]
         ]
 
+    def catalog(self) -> dict:
+        """Return the structure of the database: types, licenses, packs, and counts."""
+        self._ensure_loaded()
+
+        # Content type breakdown
+        types = self._conn.execute(
+            "SELECT type, COUNT(*) FROM chunks GROUP BY type ORDER BY COUNT(*) DESC"
+        ).fetchall()
+
+        # License breakdown
+        licenses = self._conn.execute(
+            "SELECT license, COUNT(*) FROM chunks GROUP BY license ORDER BY COUNT(*) DESC"
+        ).fetchall()
+
+        # Pack breakdown (top 20)
+        packs = self._conn.execute(
+            "SELECT pack, COUNT(*) FROM chunks GROUP BY pack ORDER BY COUNT(*) DESC LIMIT 20"
+        ).fetchall()
+
+        # Total chunks
+        total = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+
+        # Refs count
+        refs_count = self._conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
+
+        return {
+            "total_chunks": total,
+            "total_references": refs_count,
+            "types": {r[0]: r[1] for r in types},
+            "licenses": {r[0]: r[1] for r in licenses},
+            "packs": {r[0]: r[1] for r in packs},
+        }
+
     def fetch_by_id(self, entry_id: str) -> dict | None:
         """Fetch a single chunk by its internal ID, Foundry UUID, slug, or name."""
         self._ensure_loaded()

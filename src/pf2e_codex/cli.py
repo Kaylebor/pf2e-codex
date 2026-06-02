@@ -167,6 +167,28 @@ def status(
 
 
 @app.command()
+def catalog(
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+) -> None:
+    """Show the structure of the PF2E database."""
+    settings = _settings(data_dir=data_dir, model=model)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    cat = search_idx.catalog()
+    typer.echo(f"Total chunks: {cat['total_chunks']}")
+    typer.echo(f"Total references: {cat['total_references']}")
+    typer.echo(f"\nContent types:")
+    for t, count in cat['types'].items():
+        typer.echo(f"  {t:20s} {count:>6}")
+    typer.echo(f"\nLicenses:")
+    for lic, count in cat['licenses'].items():
+        typer.echo(f"  {lic:20s} {count:>6}")
+    typer.echo(f"\nTop packs:")
+    for p, count in cat['packs'].items():
+        typer.echo(f"  {p:50s} {count:>6}")
+
+
+@app.command()
 def config(
     show_file: bool = typer.Option(False, "--file", help="Show which config file is active"),
 ) -> None:

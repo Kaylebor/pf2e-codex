@@ -126,6 +126,19 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         return json.dumps({"entry_id": entry_id, "direction": direction, "results": results}, indent=2)
 
     @mcp.tool()
+    def pf2e_catalog() -> str:
+        """Show the structure of the PF2E database.
+
+        Returns counts of entries by type, license, and pack. Use this to
+        discover what content is available before filtering searches.
+
+        Returns:
+            JSON with total_chunks, types (feat, spell, condition, etc.),
+            licenses (ORC, OGL, NONE), and packs (spells, feats, etc.).
+        """
+        return json.dumps(search.catalog(), indent=2)
+
+    @mcp.tool()
     def pf2e_index_status() -> str:
         """Check the status of the PF2E index (model, chunk count, date)."""
         meta = search.status()
