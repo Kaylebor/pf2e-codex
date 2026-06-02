@@ -103,14 +103,17 @@ class ONNXProvider(EmbeddingProvider):
 
     def __init__(self, model_name: str):
         import onnxruntime as ort
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self.model_name = model_name
         self._cache_dir = _onnx_cache_dir(model_name)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # Resolve model to a local HF cache path (avoids Hub auth)
+        local_path = self._resolve_cache_path()
+
         # Export or reuse cached ONNX model
-        self._export_if_needed()
+        self._export_if_needed(local_path)
 
         # Create session with best provider
         provider = _detect_onnx_provider()
@@ -127,8 +130,9 @@ class ONNXProvider(EmbeddingProvider):
             providers=[provider],
         )
 
-        # Load tokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Load tokenizer from local path (avoids Hub auth for short names)
+        tokenizer_path = local_path or model_name
+        self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
         info = get_model_info(model_name)
         self._query_prefix = info.query_prefix if info else ""
         self._doc_prefix = info.doc_prefix if info else ""
@@ -137,25 +141,53 @@ class ONNXProvider(EmbeddingProvider):
         test_emb = self.embed(["test"])
         self._dim = len(test_emb[0])
 
-    def _export_if_needed(self) -> None:
+    def _export_if_needed(self, local_path: str | None = None) -> None:
         model_path = self._cache_dir / "model.onnx"
         if model_path.exists():
             return
 
+        export_path = local_path or self.model_name
         print(f"Exporting {self.model_name} to ONNX (one-time)...")
         start = time.time()
         try:
             from optimum.onnxruntime import ORTModelForFeatureExtraction
             model = ORTModelForFeatureExtraction.from_pretrained(
-                self.model_name, export=True
+                export_path, export=True
             )
             model.save_pretrained(self._cache_dir)
             print(f"Exported in {time.time() - start:.1f}s -> {self._cache_dir}")
         except Exception as e:
-            # Clean up partial export
             for f in self._cache_dir.glob("*"):
                 f.unlink()
             raise RuntimeError(f"ONNX export failed: {e}")
+
+    def _resolve_cache_path(self) -> str | None:
+        """Find local HF cache path for the model without hitting Hub."""
+        from pathlib import Path as PPath
+
+        cache_dir = PPath.home() / ".cache" / "huggingface" / "hub"
+        if not cache_dir.is_dir():
+            return None
+
+        # Build candidate directory names from model name variants
+        safe_name = self.model_name.replace("/", "--")
+        candidates = [
+            f"models--{safe_name}",
+            f"models--sentence-transformers--{safe_name.split('--')[-1]}",
+        ]
+
+        for d in cache_dir.iterdir():
+            if not d.name.startswith("models--"):
+                continue
+            # Match by suffix (e.g. all-MiniLM-L6-v2 matches models--sentence-transformers--all-MiniLM-L6-v2)
+            if any(cand in d.name for cand in candidates):
+                snap_dir = d / "snapshots"
+                if not snap_dir.is_dir():
+                    continue
+                snapshots = list(snap_dir.iterdir())
+                if snapshots:
+                    return str(snapshots[0])
+        return None
 
     @property
     def dim(self) -> int:

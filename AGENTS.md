@@ -141,15 +141,53 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 2. Register in `_RULE_FLATTENERS` dict
 3. Return plain English string (or `None` to skip)
 
+## ONNX Acceleration (dev setup)
+
+ONNX is auto-detected. Install in order of preference:
+
+```bash
+# CPU (always works)
+uv pip install 'optimum[onnxruntime]'  # also pulls onnxruntime
+
+# AMD ROCm (requires ROCm 6.x drivers)
+uv pip install onnxruntime-rocm optimum
+
+# NVIDIA CUDA
+uv pip install onnxruntime-gpu optimum
+```
+
+On first use per model, ONNX exports once (cached at `~/.cache/pf2e-codex/onnx/{model}/`).
+Subsequent loads skip export.
+
+**Known issues:**
+- `onnxruntime-rocm` 1.22.2 does not support ROCm 7.x. Needs investigation — modern `onnxruntime`
+  may have ROCm built-in via a different variant.
+- Models with short names (e.g. `all-MiniLM-L6-v2`) are resolved to their local HF cache path
+  for export, avoiding Hub auth.
+
+**Test ONNX is working:**
+```bash
+.venv/bin/python -c "
+from pf2e_codex.embeddings import _has_onnx, _detect_onnx_provider
+print('ONNX:', _has_onnx(), 'Provider:', _detect_onnx_provider())
+"
+```
+
+**Force fallback:**
+```bash
+PF2E_PROVIDER=sentence_transformers pf2e-codex index
+```
+
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
 | `sentence-transformers` | Local embedding models |
+| `optimum[onnxruntime]` | ONNX model export (optional) |
+| `onnxruntime[-rocm,-gpu]` | ONNX runtime (optional) |
 | `sqlite-vec` | Vector storage + similarity search |
 | `mcp` | FastMCP server |
 | `pydantic` + `pydantic-settings` | Config + validation |
 | `typer` | CLI framework |
-| `rich` | Terminal output (future) |
 
 Python 3.12+, uv recommended.
