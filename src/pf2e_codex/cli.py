@@ -15,13 +15,13 @@ app = typer.Typer(name="pf2e-codex", help="PF2E rules knowledge base")
 
 
 def _settings(
-    db: str | None = None,
+    data_dir: str | None = None,
     model: str | None = None,
     release: str | None = None,
 ) -> Settings:
     kwargs: dict[str, str] = {}
-    if db:
-        kwargs["db"] = db
+    if data_dir:
+        kwargs["data_dir"] = data_dir
     if model:
         kwargs["model"] = model
     if release:
@@ -54,33 +54,36 @@ def build(
 @app.command()
 def index(
     chunks_file: Path | None = typer.Argument(None, help="Optional pre-built chunks.json"),
-    model: str | None = typer.Option(None, "--model", "-m"),
-    db: str | None = typer.Option(None, "--db", "-d"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     rebuild: bool = typer.Option(False, "--rebuild", help="Replace existing index"),
 ) -> None:
     """Embed chunks and build sqlite-vec index."""
-    settings = _settings(db=db, model=model)
+    settings = _settings(data_dir=data_dir, model=model)
     if chunks_file:
         import json
         chunks: list[dict] = json.loads(chunks_file.read_text())
         typer.echo(f"Loaded {len(chunks)} chunks from {chunks_file}")
+        typer.echo(f"Target DB: {settings.db}")
         embed_and_index(chunks, settings, rebuild=rebuild)
     else:
+        typer.echo(f"Target DB: {settings.db}")
         index_all(settings, rebuild=rebuild)
 
 
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Search query"),
-    db: str | None = typer.Option(None, "--db", "-d"),
-    model: str | None = typer.Option(None, "--model", "-m"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
 ) -> None:
     """Search the PF2E index."""
-    settings = _settings(db=db, model=model)
+    settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     results = search_idx.search(query, top_k)
     typer.echo(f"Query: '{query}'")
+    typer.echo(f"DB: {settings.db}")
     typer.echo(f"Results ({len(results)}):\n")
     for i, r in enumerate(results, 1):
         dist = r.get("distance")
@@ -100,12 +103,12 @@ def search(
 
 @app.command()
 def get(
-    entry_id: str = typer.Argument(..., help="Entry ID (e.g. 'feats:Fury-Instinct' or Foundry UUID)"),
-    db: str | None = typer.Option(None, "--db", "-d"),
-    model: str | None = typer.Option(None, "--model", "-m"),
+    entry_id: str = typer.Argument(..., help="Entry slug, name, UUID, or pack:id"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
 ) -> None:
     """Fetch a single entry by its ID or Foundry UUID."""
-    settings = _settings(db=db, model=model)
+    settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     result = search_idx.fetch_by_id(entry_id)
     if result:
@@ -123,34 +126,36 @@ def related(
     entry_id: str = typer.Argument(..., help="Entry slug, name, or UUID"),
     direction: str = typer.Option("both", "--direction", help="outgoing, incoming, or both"),
     limit: int = typer.Option(10, "--limit", "-n", help="Max results per direction"),
-    db: str | None = typer.Option(None, "--db", "-d"),
-    model: str | None = typer.Option(None, "--model", "-m"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
 ) -> None:
     """Find entries related by cross-references."""
-    settings = _settings(db=db, model=model)
+    settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     results = search_idx.related(entry_id, direction, limit)
     if results.get("outgoing"):
         typer.echo(f"\n{entry_id} references:")
         for r in results["outgoing"]:
-            typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')}")
+            typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')[:100]}")
     if results.get("incoming"):
         typer.echo(f"\nEntries referencing {entry_id}:")
         for r in results["incoming"]:
-            typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')}")
+            typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')[:100]}")
     if not results.get("outgoing") and not results.get("incoming"):
         typer.echo("No related entries found.")
 
 
 @app.command()
 def status(
-    db: str | None = typer.Option(None, "--db", "-d"),
-    model: str | None = typer.Option(None, "--model", "-m"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
 ) -> None:
     """Show index status."""
-    settings = _settings(db=db, model=model)
+    settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider)
     meta = search_idx.status()
+    typer.echo(f"Model: {settings.model}")
+    typer.echo(f"DB:    {settings.db}")
     for k, v in meta.items():
         typer.echo(f"  {k}: {v}")
 
@@ -164,7 +169,9 @@ def config(
     s = get_settings()
     typer.echo("Effective configuration:")
     typer.echo(f"  model: {s.model}")
-    typer.echo(f"  db: {s.db}")
+    typer.echo(f"  data_dir: {s.data_dir}")
+    typer.echo(f"  db: {s.db}  (derived)")
+    typer.echo(f"  provider: {s.provider}")
     typer.echo(f"  release: {s.release}")
     typer.echo(f"  cache_dir: {s.cache_dir}")
     typer.echo(f"  transport: {s.transport}")
@@ -204,12 +211,12 @@ def models(
 
 @app.command()
 def serve(
-    db: str | None = typer.Option(None, "--db", "-d"),
-    model: str | None = typer.Option(None, "--model", "-m"),
-    transport: str = typer.Option("stdio", "--transport", "-t"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
+    transport: str = typer.Option("stdio", "--transport", "-t", help="MCP transport"),
 ) -> None:
     """Start the MCP server (stdio or sse)."""
-    settings = _settings(db=db, model=model)
+    settings = _settings(data_dir=data_dir, model=model)
     settings.transport = transport
     from .mcp_server import serve as _serve
     _serve(settings)

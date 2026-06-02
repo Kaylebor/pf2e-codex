@@ -100,7 +100,7 @@ rules explanations are retrievable.
 
 Priority (highest wins):
 1. Command-line flags / kwargs
-2. Environment variables (`PF2E_DB`, `PF2E_MODEL`, etc.)
+2. Environment variables (`PF2E_DATA_DIR`, `PF2E_MODEL`, etc.)
 3. Config file (`~/.config/pf2e-codex/config.toml` or `./pf2e-codex.toml`)
 4. Built-in defaults
 
@@ -121,7 +121,7 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PF2E_CACHE_DIR` | `~/.cache/pf2e-codex` | Download cache |
-| `PF2E_DB` | `pf2e_v2.db` | sqlite-vec database |
+| `PF2E_DATA_DIR` | `~/.local/share/pf2e-codex` | Data directory |
 | `PF2E_MODEL` | `snowflake-arctic-embed-xs` | Embedding model |
 | `PF2E_PROVIDER` | `auto` | `auto`, `onnx`, `sentence_transformers` |
 | `PF2E_RELEASE` | `pf2e-8.1.2` | PF2E system version |

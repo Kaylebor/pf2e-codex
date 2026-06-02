@@ -109,10 +109,10 @@ pf2e-codex models                      # should list all models
 MCP server test:
 ```bash
 # In one terminal
-PF2E_DB=pf2e_v2.db pf2e-codex serve
+pf2e-codex serve
 
 # In another (send JSON-RPC init + tools/list)
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | PF2E_DB=pf2e_v2.db pf2e-codex serve
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | pf2e-codex serve
 ```
 
 ## Data Source

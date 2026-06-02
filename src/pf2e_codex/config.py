@@ -1,14 +1,15 @@
 """Configuration via Pydantic Settings + TOML config file.
 
+DB path is derived from model name: {data_dir}/pf2e_{model_safe}.db
 Resolution order (highest priority wins):
-1. Keyword arguments (e.g. `Settings(db="x.db")`)
-2. Environment variables (`PF2E_DB`, `PF2E_MODEL`, etc.)
+1. Keyword arguments (e.g. `Settings(data_dir="~/pf2e")`)
+2. Environment variables (`PF2E_DATA_DIR`, `PF2E_MODEL`, etc.)
 3. Config file (`~/.config/pf2e-codex/config.toml` or `./pf2e-codex.toml`)
 4. Class defaults
 
 Example `~/.config/pf2e-codex/config.toml`:
     model = "snowflake-arctic-embed-s"
-    db = "~/pf2e/pf2e_v2.db"
+    data_dir = "~/pf2e"
     release = "pf2e-8.1.2"
 """
 
@@ -23,7 +24,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pf2e-codex"
-DEFAULT_DB = Path("pf2e_v2.db")
+DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "pf2e-codex"
 DEFAULT_MODEL = "snowflake-arctic-embed-xs"
 DEFAULT_RELEASE = "pf2e-8.1.2"
 GITHUB_RELEASE_URL = (
@@ -35,6 +36,15 @@ _CONFIG_PATHS = [
     Path.cwd() / "pf2e-codex.toml",
     Path.cwd() / ".pf2e-codex.toml",
 ]
+
+
+def _model_safe_name(model: str) -> str:
+    return model.replace("/", "--")
+
+
+def _default_db_path(model: str, data_dir: Path) -> Path:
+    safe = _model_safe_name(model)
+    return data_dir / f"pf2e_{safe}.db"
 
 
 def _load_toml() -> dict[str, Any]:
@@ -51,7 +61,7 @@ def _load_env() -> dict[str, Any]:
             raw[key[5:].lower()] = val
     typed: dict[str, Any] = {}
     for k, v in raw.items():
-        if k in ("cache_dir", "db"):
+        if k in ("cache_dir", "data_dir"):
             typed[k] = Path(v)
         else:
             typed[k] = v
@@ -59,7 +69,7 @@ def _load_env() -> dict[str, Any]:
 
 
 class Settings(BaseSettings):
-    """PF2E MCP settings."""
+    """PF2E Codex settings."""
 
     model_config = SettingsConfigDict(
         env_prefix="PF2E_",
@@ -69,11 +79,16 @@ class Settings(BaseSettings):
     )
 
     cache_dir: Path = Field(default=DEFAULT_CACHE_DIR, description="Cache directory for downloads")
-    db: Path = Field(default=DEFAULT_DB, description="Path to sqlite-vec database")
+    data_dir: Path = Field(default=DEFAULT_DATA_DIR, description="Directory for databases and data")
     model: str = Field(default=DEFAULT_MODEL, description="Embedding model name or path")
     provider: str = Field(default="auto", description="Embedding provider: auto, onnx, sentence_transformers")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     transport: str = Field(default="stdio", description="MCP transport: stdio or sse")
+
+    @property
+    def db(self) -> Path:
+        """Derived database path from model name and data directory."""
+        return _default_db_path(self.model, self.data_dir)
 
     @property
     def github_release_url(self) -> str:
