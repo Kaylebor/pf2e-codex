@@ -37,9 +37,11 @@ class SentenceTransformersProvider(EmbeddingProvider):
     """Local sentence-transformers provider."""
 
     def __init__(self, model_name: str, device: str = "cpu"):
-        self.model_name = model_name
-        self._model = SentenceTransformer(model_name, device=device)
+        # Resolve short names (e.g. "snowflake-arctic-embed-xs") to full HF IDs
         info = get_model_info(model_name)
+        resolved = info.name if info else model_name
+        self.model_name = resolved
+        self._model = SentenceTransformer(resolved, device=device)
         self._query_prefix = info.query_prefix if info else ""
         self._doc_prefix = info.doc_prefix if info else ""
 

@@ -25,7 +25,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pf2e-codex"
 DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "pf2e-codex"
-DEFAULT_MODEL = "snowflake-arctic-embed-xs"
+DEFAULT_MODEL = "Snowflake/snowflake-arctic-embed-xs"
 DEFAULT_RELEASE = "pf2e-8.1.2"
 GITHUB_RELEASE_URL = (
     "https://github.com/foundryvtt/pf2e/releases/download/{version}/json-assets.zip"
