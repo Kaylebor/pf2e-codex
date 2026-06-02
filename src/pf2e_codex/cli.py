@@ -10,6 +10,7 @@ from .config import Settings, get_settings
 from .index import SearchIndex
 from .models import list_models, recommend
 from .pipeline import build_chunks, embed_and_index, index_all, save_chunks
+from .cli_rich import print_search_results, print_catalog, print_status, print_validation
 
 app = typer.Typer(name="pf2e-codex", help="PF2E rules knowledge base")
 
@@ -87,24 +88,7 @@ def search(
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.search(query, top_k, hybrid=True)
-    typer.echo(f"Query: '{query}'")
-    typer.echo(f"DB: {settings.db}")
-    typer.echo(f"Results ({len(results)}):\n")
-    for i, r in enumerate(results, 1):
-        dist = r.get("distance")
-        rrf = r.get("rrf_score")
-        if dist is not None:
-            label = f"dist={dist:.4f}"
-        elif rrf is not None:
-            label = f"rrf={rrf:.4f}"
-        else:
-            label = ""
-        typer.echo(f"--- Result {i} ({label}) ---")
-        lic = r.get("license", "")
-        typer.echo(f"[{r['type']}] {r['name']} ({r['pack']}) [{lic}]")
-        preview = r["text"][:600] + ("..." if len(r["text"]) > 600 else "")
-        typer.echo(preview)
-        typer.echo()
+    print_search_results(results, query)
 
 
 @app.command()
@@ -160,10 +144,9 @@ def status(
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     meta = search_idx.status()
-    typer.echo(f"Model: {settings.model}")
-    typer.echo(f"DB:    {settings.db}")
-    for k, v in meta.items():
-        typer.echo(f"  {k}: {v}")
+    meta["model"] = settings.model
+    meta["db"] = str(settings.db)
+    print_status(meta)
 
 
 @app.command()
@@ -175,17 +158,7 @@ def catalog(
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     cat = search_idx.catalog()
-    typer.echo(f"Total chunks: {cat['total_chunks']}")
-    typer.echo(f"Total references: {cat['total_references']}")
-    typer.echo(f"\nContent types:")
-    for t, count in cat['types'].items():
-        typer.echo(f"  {t:20s} {count:>6}")
-    typer.echo(f"\nLicenses:")
-    for lic, count in cat['licenses'].items():
-        typer.echo(f"  {lic:20s} {count:>6}")
-    typer.echo(f"\nTop packs:")
-    for p, count in cat['packs'].items():
-        typer.echo(f"  {p:50s} {count:>6}")
+    print_catalog(cat)
 
 
 @app.command()
@@ -297,15 +270,7 @@ def validate(
         onnx_provider=onnx_provider,
     )
 
-    for r in result["results"]:
-        mark = "✓" if r["rank"] == 1 else (f"r{r['rank']}" if r["rank"] else "✗")
-        typer.echo(f"  {mark:>2} {r['query'][:40]:40s} → {r['expected']:28s} at {r['rank'] or '—':>2}")
-
-    typer.echo()
-    typer.echo(f"  MRR:          {result['mrr']:.3f}")
-    typer.echo(f"  Perfect (#1):  {result['perfect']}/{result['n_queries']}")
-    typer.echo(f"  Top 3:         {result['top3']}/{result['n_queries']}")
-    typer.echo(f"  Not found:     {result['not_found']}/{result['n_queries']}")
+    print_validation(result)
 
 
 def main() -> None:

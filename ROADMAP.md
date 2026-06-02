@@ -4,72 +4,58 @@ Ordered by impact. Check items off as completed.
 
 ## High Impact
 
-- [x] **Hybrid search: semantic + FTS5 exact name matching**
-  - Done: FTS5 external-content table, lazy creation for existing DBs, RRF blending in `SearchIndex.search()`. `distance` for semantic, `rrf_score` for blended results.
-  - Files: `index.py`, `cli.py`, `mcp_server.py`
+- [x] **Hybrid search: semantic + FTS5 via RRF**
+  - Done: Weighted RRF (0.85 semantic / 0.15 name-LIKE). Stop-word filtering, bag-of-words name matching.
 
-- [ ] **Model benchmarking & selection command**
-  - Problem: Users don't know which model suits their hardware without reading docs.
-  - Approach: `pf2e-codex benchmark` downloads 3-4 models, indexes 1000 chunks with each, runs a standard query set, prints quality × speed tradeoffs. Auto-recommend based on measured speed.
-  - Files: `cli.py`, `models.py`, new `benchmark.py`
+- [x] **Model benchmarking & selection command**
+  - Done: `pf2e-codex benchmark` across models × providers (PyTorch CPU, ONNX CPU, ONNX GPU).
 
-- [x] **ONNX export for Arctic / Nomic on CPU/GPU**
-  - Done: `ONNXProvider` with lazy export via `optimum`, runtime provider auto-detection (ROCm → CUDA → CPU), graceful fallback to `SentenceTransformersProvider`. `PF2E_PROVIDER` env override. `install.sh` and PKGBUILD handle system-level GPU detection.
-  - Files: `embeddings.py`, `config.py`, `pyproject.toml`, `install.sh`, `PKGBUILD`
+- [x] **ONNX export for GPU inference**
+  - Done: MIGraphX on 7900 XTX, 50-90x speedup. `PF2E_ONNX_PROVIDER` override.
 
-- [ ] **Incremental updates (diff since last release)**
-  - Problem: `pf2e-codex index` re-downloads and re-embeds everything even on patch releases.
-  - Approach: Check GitHub releases API for newer version. Diff entry IDs against existing DB. Only download, chunk, and embed changed/new entries. Reuse existing chunks for unchanged entries.
-  - Files: `fetcher.py`, `pipeline.py`, `index.py`
+- [x] **Incremental updates**
+  - Done: Content-hash diffing via `pf2e-codex index --update`. Only re-processes changed entries.
+
+- [x] **UUID fetch tool**
+  - Done: `pf2e_get_entry` accepts IDs, slugs, names, UUIDs. `pf2e-codex get` CLI.
+
+- [x] **Cross-reference graph (bidirectional)**
+  - Done: `pf2e_related` + `pf2e-codex related`. Outgoing/incoming refs from description @UUID links and rule element fields.
+
+- [x] **OGL→ORC alias injection**
+  - Done: 256 aliases auto-extracted from Foundry wiki. Stored in chunk `name` field.
+
+- [x] **License tracking**
+  - Done: ORC/OGL/NONE per chunk. Search filters by license.
+
+- [x] **Search enrichment**
+  - Done: refs, legacy_name, confidence in every search result.
+
+- [x] **Catalog tool**
+  - Done: `pf2e_catalog` / `pf2e-codex catalog` — discover types, licenses, packs.
+
+- [x] **Search filters**
+  - Done: `license`, `content_type`, `pack` on `pf2e_search` and `pf2e_rules_explain`.
+
+- [x] **Validation suite**
+  - Done: 25-query suite, MRR 0.850 hybrid. `pf2e-codex validate`.
 
 ## Medium Impact
 
-- [x] **UUID fetch tool**
-  - Done: `pf2e_get_entry` accepts internal IDs (`pack:id`), Foundry UUIDs, bare slugs, or names. Tries exact ID → bare ID suffix → slug → name. `pf2e-codex get` CLI command.
-  - Files: `index.py`, `mcp_server.py`, `cli.py`
+- [ ] **Pretty CLI output (Rich tables)** — search results, status, catalog in rich formatting.
 
-- [x] **Cross-reference graph (bidirectional)**
-  - Done: `refs` table stores `source_id → target_uuid` from both description `@UUID[...]` links and rule element UUID fields (GrantItem, EphemeralEffect, Aura effects). Lazy-created for existing DBs. `SearchIndex.related(id, direction, limit)` with `pf2e_related` MCP tool and `pf2e-codex related` CLI command.
-  - Files: `chunker.py`, `index.py`, `pipeline.py`, `mcp_server.py`, `cli.py`
+- [ ] **MCP streamable-http transport** — for remote clients. stdio works locally.
 
-- [ ] **MCP streamable-http transport**
-  - Problem: `stdio` is the only reliable transport. SSE is deprecated in MCP spec.
-  - Approach: Add `streamable-http` support once the `mcp` library supports it, or implement a small ASGI wrapper.
-  - Files: `mcp_server.py`, `config.py`
+- [ ] **Docker image** — pre-built env, volume-mount for DB.
 
-- [ ] **Validation suite for retrieval quality**
-  - Problem: No automated way to know if a model change or code refactor hurts search quality.
-  - Approach: `tests/retrieval.yaml` with 20-30 known-good query→expected-result pairs. Run after every index build. `pytest` integration.
-  - Files: `tests/retrieval_test.py`, `tests/retrieval.yaml`
+- [ ] **Dual DB for OGL/ORC** — index two releases into separate DBs, query both.
+
+- [ ] **Validation suite expansion** — more queries covering edge cases, interactions.
 
 ## Low Impact / Polish
 
-- [ ] **Pretty CLI output (Rich tables)**
-  - `pf2e-codex search` currently dumps raw text. Rich tables with color-coded types (feat/spell/condition/journal_page) would be much nicer.
-  - Files: `cli.py`
+- [ ] **Web UI** — Gradio/Streamlit for non-MCP users.
 
-- [ ] **Docker image**
-  - For users who don't want to install Python/uv. Single container with `pf2e-codex` pre-installed, volume-mount for DB.
-  - Files: `Dockerfile`, `.dockerignore`
+- [ ] **AGENTS.md auto-update hook** — CI check that docs match module structure.
 
-- [ ] **Web UI (optional, later)**
-  - Simple Gradio/Streamlit interface for non-technical users. Lower priority since MCP + CLI already cover most use cases.
-  - Files: new `web/` directory
-
-- [ ] **AGENTS.md auto-update hook**
-  - Keep `AGENTS.md` in sync with code changes. Could be a CI check or pre-commit hook that verifies the doc reflects current module structure.
-  - Files: `.github/workflows/` or `.pre-commit-config.yaml`
-
-## Done
-
-- [x] Package structure: `src/pf2e_codex/` with proper modules
-- [x] CLI entry point with Typer
-- [x] Config system: env vars + TOML file + Pydantic Settings
-- [x] Pluggable embedding providers with model registry
-- [x] Automatic query/document prefixing for model-specific models
-- [x] MCP server with 5 tools (search, get_entry, related, rules_explain, status)
-- [x] Hardware-aware model recommendations
-- [x] Default model: `snowflake-arctic-embed-xs` (fast, good quality)
-- [x] Hybrid search: semantic + FTS5 via reciprocal rank fusion
-- [x] UUID fetch tool: `pf2e_get_entry` + `pf2e-codex get`
-- [x] Cross-reference graph: bidirectional outgoing/incoming via `pf2e_related` + `pf2e-codex related`
+- [ ] **ONNX auto-download of ONNX runtime via install.sh** — currently user must install manually.
