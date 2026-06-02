@@ -98,20 +98,23 @@ def _rrf_fuse(
     fts_results: list[tuple[str, dict]],
     k: int = 60,
     top_k: int = 5,
+    weight_semantic: float = 0.85,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion of semantic and FTS result lists.
+    """Reciprocal Rank Fusion of semantic and FTS result lists with weighting.
 
-    Each result list is [(id, full_result_dict), ...] ordered best→worst.
+    weight_semantic: weight for semantic scores (FTS gets 1 - weight_semantic).
+    Lower = more emphasis on exact text matching.
     """
+    weight_fts = 1.0 - weight_semantic
     scores: dict[str, float] = {}
     details: dict[str, dict] = {}
 
     for rank, (cid, result) in enumerate(semantic_results, start=1):
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        scores[cid] = scores.get(cid, 0.0) + weight_semantic / (k + rank)
         details[cid] = result
 
     for rank, (cid, result) in enumerate(fts_results, start=1):
-        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        scores[cid] = scores.get(cid, 0.0) + weight_fts / (k + rank)
         if cid not in details:
             details[cid] = result
 
@@ -229,29 +232,48 @@ class SearchIndex:
         if not hybrid:
             return [r for _, r in semantic_results[:top_k]]
 
-        # FTS5 search
-        self._ensure_fts()
+        # Name bag-of-words search — match on content words only, skip
+        # generic type labels like 'spell', 'feat', 'action'.
+        _STOP_WORDS = frozenset({
+            'spell', 'feat', 'action', 'effect', 'item', 'weapon', 'armor',
+            'equipment', 'condition', 'ability', 'feature', 'class',
+            'ancestry', 'background', 'heritage', 'deity', 'hazard',
+            'vehicle', 'familiar', 'npc', 'creature', 'monster', 'ritual',
+        })
+        like_results: list[tuple[str, dict]] = []
         try:
-            fts_raw = self._conn.execute("""
-                SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license
-                FROM fts_chunks
-                JOIN chunks ON fts_chunks.rowid = chunks.rowid
-                WHERE fts_chunks MATCH ?
-                ORDER BY rank
-                LIMIT ?
-            """, (query, top_k * 3)).fetchall()
-            fts_results = [
-                (r[0], {
-                    "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
-                    "text": r[4], "license": r[5], "distance": None,
-                })
-                for r in fts_raw
+            words = [
+                w.strip().lower() for w in query.split()
+                if len(w.strip()) > 2 and w.strip().lower() not in _STOP_WORDS
             ]
+            if words:
+                like_conditions = " OR ".join(["LOWER(name) LIKE ?" for _ in words])
+                like_params = [f"%{w}%" for w in words]
+                like_raw = self._conn.execute(f"""
+                    SELECT id, name, type, pack, text, license
+                    FROM chunks
+                    WHERE {like_conditions}
+                    LIMIT ?
+                """, like_params + [top_k * 3]).fetchall()
+                # Score by number of matching words in name
+                scored: dict[str, tuple[tuple, int]] = {}
+                for r in like_raw:
+                    cid = r[0]
+                    match_count = sum(1 for w in words if w in r[1].lower())
+                    if match_count > 0:
+                        existing = scored.get(cid)
+                        if not existing or existing[1] < match_count:
+                            scored[cid] = (r, match_count)
+                sorted_entries = sorted(scored.values(), key=lambda x: -x[1])
+                for r, _mc in sorted_entries[:top_k * 3]:
+                    like_results.append((r[0], {
+                        "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
+                        "text": r[4], "license": r[5], "distance": None,
+                    }))
         except Exception:
-            # FTS5 unavailable or query syntax error — fall back to pure semantic
-            fts_results = []
+            pass
 
-        return _rrf_fuse(semantic_results, fts_results, top_k=top_k)
+        return _rrf_fuse(semantic_results, like_results, top_k=top_k)
 
     def rules_explain(self, topic: str, top_k: int = 3) -> list[dict]:
         """Search with boosted journal pages and conditions for core rules."""

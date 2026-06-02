@@ -656,7 +656,7 @@ class ChunkBuilder:
 
         return {
             "id": entry.get("_id", ""),
-            "name": name,
+            "name": display_name,
             "type": etype,
             "pack": pack_name,
             "slug": slug,
