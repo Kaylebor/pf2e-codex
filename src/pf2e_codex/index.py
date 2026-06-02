@@ -210,7 +210,7 @@ class SearchIndex:
         emb = self._encode(query)
         q_blob = vec_blob(emb)
         semantic_raw = self._conn.execute("""
-            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, distance
+            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
@@ -221,7 +221,7 @@ class SearchIndex:
         semantic_results = [
             (r[0], {
                 "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
-                "text": r[4], "distance": r[5],
+                "text": r[4], "license": r[5], "distance": r[6],
             })
             for r in semantic_raw
         ]
@@ -233,7 +233,7 @@ class SearchIndex:
         self._ensure_fts()
         try:
             fts_raw = self._conn.execute("""
-                SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text
+                SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license
                 FROM fts_chunks
                 JOIN chunks ON fts_chunks.rowid = chunks.rowid
                 WHERE fts_chunks MATCH ?
@@ -243,7 +243,7 @@ class SearchIndex:
             fts_results = [
                 (r[0], {
                     "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
-                    "text": r[4], "distance": None,
+                    "text": r[4], "license": r[5], "distance": None,
                 })
                 for r in fts_raw
             ]
@@ -259,7 +259,7 @@ class SearchIndex:
         emb = self._encode(topic)
         q_blob = vec_blob(emb)
         results = self._conn.execute("""
-            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, distance
+            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
@@ -278,7 +278,7 @@ class SearchIndex:
             scored.append((distance - boost, r))
         scored.sort(key=lambda x: x[0])
         return [
-            {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4], "distance": r[5]}
+            {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4], "license": r[5], "distance": r[6]}
             for _, r in scored[:top_k]
         ]
 

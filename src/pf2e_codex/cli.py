@@ -100,7 +100,8 @@ def search(
         else:
             label = ""
         typer.echo(f"--- Result {i} ({label}) ---")
-        typer.echo(f"[{r['type']}] {r['name']} ({r['pack']})")
+        lic = r.get("license", "")
+        typer.echo(f"[{r['type']}] {r['name']} ({r['pack']}) [{lic}]")
         preview = r["text"][:600] + ("..." if len(r["text"]) > 600 else "")
         typer.echo(preview)
         typer.echo()
