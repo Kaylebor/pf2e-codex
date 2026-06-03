@@ -65,13 +65,15 @@ Chunk IDs are `pack:entry_id` (e.g. `feats:Fury-Instinct`) because the same `_id
 22M params, 384 dims, ~35s to index 28K chunks on Ryzen 7 7800X3D. Faster and equivalent quality to `all-MiniLM-L6-v2`.
 
 ### OGL vs ORC vs pre/post remaster
-These are orthogonal dimensions:
-- **License** (`chunks.license`): OGL (legacy) vs ORC (remaster). Legal distinction.
-- **Rules rebalancing**: Pre-remaster vs post-remaster mechanical changes.
-  - ORC entries may have different rules than their OGL counterparts.
-  - Aliases capture naming changes but not mechanical changes.
-- **Default behavior**: MCP tools guide LLM to default to ORC (current rules).
-  Only use `license='OGL'` when user explicitly asks for legacy content.
+These are orthogonal — ORC predates the Remaster:
+- **License** (`chunks.license`): OGL (older) vs ORC (newer). Legal distinction.
+  - ORC does NOT mean remaster! Some ORC content predates the Remaster.
+  - OGL content can be remaster (619 renamed entries: Force Barrage, etc.).
+- **Remaster** (`publication.remaster`): True/False/None. Mechanical distinction.
+  - `remaster=True` = current rules (what users want 90% of the time).
+  - `remaster=False` = legacy rules.
+- **Data split**: ORC+remaster=13,366 | OGL+remaster=False=6,446 | OGL+remaster=True=619.
+- **Default behavior**: MCP tools guide LLM to default to remaster=True content.
 
 ### Search enrichment
 Results include: `refs` (outgoing cross-references), `legacy_name` (pre-remaster
