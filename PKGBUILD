@@ -24,7 +24,7 @@ optdepends=(
     'rocm-hip-runtime: HIP runtime for AMD GPU (needed by MIGraphX)'
     'cuda: CUDA runtime for NVIDIA GPU ONNX acceleration'
 )
-makedepends=('python-pip')
+makedepends=('python-pip' 'patchelf')
 # Build from local repo (for AUR: use GitHub tarball URL)
 source=()
 sha256sums=()
@@ -50,6 +50,8 @@ package() {
         echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
         /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
             'onnxruntime-migraphx>=1.25'
+        # Fix: PyPI wheel has GNU_STACK RWE (blocked on hardened kernels)
+        find "$lib/onnxruntime" -name '*.so' -exec patchelf --clear-execstack {} \; 2>/dev/null || true
     elif [ -e /opt/cuda/lib64/libcudart.so ]; then
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
         /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
