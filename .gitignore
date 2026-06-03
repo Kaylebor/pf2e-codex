@@ -30,3 +30,4 @@ pkg/
 src/
 *.pkg.tar.*
 *.src.tar.*
+pf2e-codex/
