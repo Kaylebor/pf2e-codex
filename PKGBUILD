@@ -6,7 +6,7 @@ pkgdesc="PF2E rules knowledge base with MCP, CLI, and SDK interfaces"
 arch=('any')
 url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
-depends=('python' 'python-uv' 'git')
+depends=('python' 'python-uv' 'git' 'python-pytorch')
 optdepends=(
     'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
     'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
