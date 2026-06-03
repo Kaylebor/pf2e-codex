@@ -8,15 +8,15 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
-    'python-onnxruntime'
+    'python-onnxruntime-cpu'
     'python-pydantic'
     'python-pydantic-settings'
-    'python-pyyaml'
+    'python-yaml'
     'python-rich'
     'python-typer'
     'python-sqlite-vec'
     'python-mcp'
-    'python-uvicorn'
+    'uvicorn'
     'python-starlette'
     'python-sse-starlette'
 )
