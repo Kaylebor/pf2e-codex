@@ -113,8 +113,8 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
     start = time.time()
     for chunk, emb in zip(chunks, embeddings):
         conn.execute("""
-            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
             chunk.get("slug", ""),
@@ -123,6 +123,7 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
             chunk["text"], chunk["raw_rules_count"],
             chunk.get("source_hash"),
             chunk.get("license", "NONE"),
+            1 if chunk.get("remaster") else (0 if chunk.get("remaster") is not None else None),
         ))
         conn.execute(
             "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",
@@ -185,6 +186,14 @@ def update_index(settings: Settings) -> None:
     # Lazy-add source_hash column for existing DBs
     try:
         conn.execute("ALTER TABLE chunks ADD COLUMN source_hash TEXT")
+    except Exception:
+        pass  # already exists
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN license TEXT DEFAULT 'NONE'")
+    except Exception:
+        pass  # already exists
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN remaster INTEGER DEFAULT NULL")
     except Exception:
         pass  # already exists
 
@@ -258,8 +267,8 @@ def update_index(settings: Settings) -> None:
 
         # Insert new chunk
         conn.execute("""
-            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
             chunk.get("slug", ""),
@@ -268,6 +277,7 @@ def update_index(settings: Settings) -> None:
             chunk["text"], chunk["raw_rules_count"],
             chunk.get("source_hash"),
             chunk.get("license", "NONE"),
+            1 if chunk.get("remaster") else (0 if chunk.get("remaster") is not None else None),
         ))
         conn.execute(
             "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",

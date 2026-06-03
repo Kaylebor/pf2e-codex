@@ -88,6 +88,15 @@ def print_catalog(cat: dict) -> None:
         lic_table.add_row(lic, f"{count:,}")
     console.print(lic_table)
 
+    # Remaster status
+    console.print("\n")
+    rem_table = Table(title="Remaster Status", box=box.SIMPLE)
+    rem_table.add_column("Status", style="bold")
+    rem_table.add_column("Count", justify="right")
+    for status, count in cat.get("remaster", {}).items():
+        rem_table.add_row(status, f"{count:,}")
+    console.print(rem_table)
+
     # Packs
     console.print("\n")
     pack_table = Table(title="Top Packs", box=box.SIMPLE)

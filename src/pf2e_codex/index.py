@@ -40,7 +40,8 @@ def init_db(db_path: Path, dim: int) -> None:
             text TEXT,
             raw_rules_count INTEGER,
             source_hash TEXT,
-            license TEXT DEFAULT 'NONE'
+            license TEXT DEFAULT 'NONE',
+            remaster INTEGER DEFAULT NULL
         )
     """)
     conn.execute(f"""
@@ -208,7 +209,8 @@ class SearchIndex:
 
     def search(
         self, query: str, top_k: int = 5, hybrid: bool = True,
-        license: str | None = None, content_type: str | None = None, pack: str | None = None,
+        license: str | None = None, content_type: str | None = None,
+        pack: str | None = None, remaster: bool | None = None,
     ) -> list[dict]:
         self._ensure_loaded()
 
@@ -224,13 +226,19 @@ class SearchIndex:
         if pack:
             where_clauses.append("chunks.pack = ?")
             params.append(pack)
+        if remaster is not None:
+            if remaster:
+                where_clauses.append("chunks.remaster = 1")
+            else:
+                # remaster=False or NULL → both count as legacy
+                where_clauses.append("(chunks.remaster = 0 OR chunks.remaster IS NULL)")
         where = " AND ".join(where_clauses)
 
         # 1. Semantic search (filtered)
         emb = self._encode(query)
         q_blob = vec_blob(emb)
         semantic_raw = self._conn.execute(f"""
-            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, distance
+            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
@@ -241,7 +249,8 @@ class SearchIndex:
         semantic_results = [
             (r[0], {
                 "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
-                "text": r[4], "license": r[5], "distance": r[6],
+                "text": r[4], "license": r[5], "remaster": bool(r[6]) if r[6] is not None else None,
+                "distance": r[7],
             })
             for r in semantic_raw
         ]
@@ -265,7 +274,7 @@ class SearchIndex:
                     like_params = [f"%{w}%" for w in words]
                     # Params: LIKE terms, WHERE filter values, then LIMIT
                     like_raw = self._conn.execute(f"""
-                        SELECT id, name, type, pack, text, license
+                        SELECT id, name, type, pack, text, license, remaster
                         FROM chunks
                         WHERE ({like_conditions}) AND {where}
                         LIMIT ?
@@ -282,7 +291,9 @@ class SearchIndex:
                     for r, _mc in sorted_entries[:top_k * 3]:
                         like_results.append((r[0], {
                             "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
-                            "text": r[4], "license": r[5], "distance": None,
+                            "text": r[4], "license": r[5],
+                            "remaster": bool(r[6]) if r[6] is not None else None,
+                            "distance": None,
                         }))
                 except Exception:
                     pass
@@ -340,7 +351,8 @@ class SearchIndex:
                 r["confidence"] = "medium" if (score or 0) < 0.5 else "low"
 
     def rules_explain(self, topic: str, top_k: int = 3,
-                      license: str | None = None, content_type: str | None = None) -> list[dict]:
+                      license: str | None = None, content_type: str | None = None,
+                      remaster: bool | None = None) -> list[dict]:
         """Search with boosted journal pages and conditions for core rules."""
         self._ensure_loaded()
 
@@ -352,12 +364,17 @@ class SearchIndex:
         if content_type:
             where_clauses.append("chunks.type = ?")
             params.append(content_type)
+        if remaster is not None:
+            if remaster:
+                where_clauses.append("chunks.remaster = 1")
+            else:
+                where_clauses.append("(chunks.remaster = 0 OR chunks.remaster IS NULL)")
         where = " AND ".join(where_clauses)
 
         emb = self._encode(topic)
         q_blob = vec_blob(emb)
         results = self._conn.execute(f"""
-            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, distance
+            SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
             WHERE vec_chunks.embedding MATCH vec_f32(?)
@@ -367,7 +384,7 @@ class SearchIndex:
         scored = []
         for r in results:
             ctype = r[2]
-            distance = r[5]
+            distance = r[7]
             boost = 0.0
             if ctype == "journal_page":
                 boost = 0.15
@@ -376,12 +393,14 @@ class SearchIndex:
             scored.append((distance - boost, r))
         scored.sort(key=lambda x: x[0])
         return [
-            {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4], "license": r[5], "distance": r[6]}
+            {"id": r[0], "name": r[1], "type": r[2], "pack": r[3], "text": r[4],
+             "license": r[5], "remaster": bool(r[6]) if r[6] is not None else None,
+             "distance": r[7]}
             for _, r in scored[:top_k]
         ]
 
     def catalog(self) -> dict:
-        """Return the structure of the database: types, licenses, packs, and counts."""
+        """Return the structure of the database: types, licenses, remaster, packs, and counts."""
         self._ensure_loaded()
 
         # Content type breakdown
@@ -392,6 +411,11 @@ class SearchIndex:
         # License breakdown
         licenses = self._conn.execute(
             "SELECT license, COUNT(*) FROM chunks GROUP BY license ORDER BY COUNT(*) DESC"
+        ).fetchall()
+
+        # Remaster breakdown
+        remaster_counts = self._conn.execute(
+            "SELECT CASE WHEN remaster = 1 THEN 'remaster' WHEN remaster = 0 THEN 'legacy' ELSE 'unknown' END as label, COUNT(*) FROM chunks GROUP BY label ORDER BY COUNT(*) DESC"
         ).fetchall()
 
         # Pack breakdown (top 20)
@@ -410,6 +434,7 @@ class SearchIndex:
             "total_references": refs_count,
             "types": {r[0]: r[1] for r in types},
             "licenses": {r[0]: r[1] for r in licenses},
+            "remaster": {r[0]: r[1] for r in remaster_counts},
             "packs": {r[0]: r[1] for r in packs},
         }
 

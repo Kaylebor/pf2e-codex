@@ -652,7 +652,8 @@ class ChunkBuilder:
             if parts:
                 lines += ["", f"Source: {' '.join(parts)}"]
 
-        license_val = system.get("publication", {}).get("license", "NONE")
+        license_val = pub.get("license", "NONE")
+        remaster_val = pub.get("remaster", None)  # True/False/None
 
         return {
             "id": entry.get("_id", ""),
@@ -667,6 +668,7 @@ class ChunkBuilder:
             "has_description": bool(desc_text),
             "refs": all_refs,
             "license": license_val,
+            "remaster": remaster_val,
         }
 
     def _add_type_specific_fields(self, lines: list[str], etype: str, system: dict[str, Any]) -> None:

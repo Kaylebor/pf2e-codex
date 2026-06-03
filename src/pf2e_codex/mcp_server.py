@@ -24,6 +24,7 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         license: str | None = None,
         content_type: str | None = None,
         pack: str | None = None,
+        remaster: bool | None = None,
     ) -> str:
         """Search the PF2E rules database for entries matching a query.
 
@@ -41,6 +42,7 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
             license: Filter by license: 'ORC' (newer license), 'OGL' (older), or null.
             content_type: Filter by type: 'feat', 'spell', 'condition', 'journal_page', etc.
             pack: Filter by pack name: 'spells', 'feats', 'pathfinder-bestiary', etc.
+            remaster: Filter by remaster status: true=current rules, false=legacy rules, null=both.
 
         Returns:
             JSON with results: id, name, type, pack, text, license, refs,
@@ -50,7 +52,7 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         'legacy_name' shows the pre-remaster name (e.g. 'flat-footed' for 'Off-Guard').
         """
         top_k = max(1, min(top_k, 20))
-        results = search.search(query, top_k, hybrid=hybrid, license=license, content_type=content_type, pack=pack)
+        results = search.search(query, top_k, hybrid=hybrid, license=license, content_type=content_type, pack=pack, remaster=remaster)
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()
@@ -84,6 +86,7 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         top_k: int = 3,
         license: str | None = None,
         content_type: str | None = None,
+        remaster: bool | None = None,
     ) -> str:
         """Get core rules explanations for a topic using deep semantic search.
 
@@ -102,12 +105,13 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
             top_k: Number of results (default 3, max 10).
             license: Filter by license: 'ORC', 'OGL', or null.
             content_type: Filter by type: 'condition', 'journal_page', 'feat', etc.
+            remaster: Filter by remaster status: true=current rules, false=legacy rules, null=both.
 
         Returns:
             JSON with prioritized results from journal pages and conditions.
         """
         top_k = max(1, min(top_k, 10))
-        results = search.rules_explain(topic, top_k, license=license, content_type=content_type)
+        results = search.rules_explain(topic, top_k, license=license, content_type=content_type, remaster=remaster)
         return json.dumps({"topic": topic, "results": results}, indent=2)
 
     @mcp.tool()
