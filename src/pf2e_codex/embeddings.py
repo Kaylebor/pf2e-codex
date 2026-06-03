@@ -308,15 +308,18 @@ def get_provider(
 
     Args:
         model_name: HuggingFace model name or identifier.
-        provider: "auto" (try ONNX, fall back to sentence-transformers),
-                  "onnx" (force ONNX, fail if unavailable),
-                  "sentence_transformers" (skip ONNX).
+        provider: "auto" or "onnx" (use ONNX, error if unavailable),
+                  "sentence_transformers" (use PyTorch directly).
         onnx_provider: Override ONNX execution provider. "auto" (default),
                        "migraphx", "rocm", "cuda", "cpu", or "none" (skip ONNX).
                        Falls back to os.environ["PF2E_ONNX_PROVIDER"].
 
     Returns:
         An EmbeddingProvider instance.
+
+    The default path is ONNX: GPU acceleration via MIGraphX/ROCm/CUDA,
+    falling back to CPU-only ONNX automatically. Sentence-transformers
+    is only used when explicitly requested via PF2E_PROVIDER=sentence_transformers.
     """
     provider = os.environ.get("PF2E_PROVIDER", provider).lower()
 
@@ -331,20 +334,26 @@ def get_provider(
     ).lower()
 
     if onnx_provider == "none" or onnx_provider == "skip":
-        return SentenceTransformersProvider(model_name)
+        raise RuntimeError(
+            "ONNX provider disabled. Use PF2E_PROVIDER=sentence_transformers "
+            "for PyTorch fallback, or install onnxruntime."
+        )
 
-    if provider in ("auto", "onnx"):
-        if _has_onnx():
-            try:
-                prov = ONNXProvider(model_name, force_provider=onnx_provider if onnx_provider != "auto" else None)
-                detected = prov._session.get_providers()[0] if hasattr(prov, '_session') else _detect_onnx_provider()
-                print(f"Using ONNX with {detected}")
-                return prov
-            except Exception as e:
-                if provider == "onnx":
-                    raise
-                warnings.warn(f"ONNX unavailable ({e}), falling back to sentence-transformers")
-        elif provider == "onnx":
-            raise RuntimeError("ONNX requested but onnxruntime not installed")
+    # Try ONNX (auto or forced)
+    if _has_onnx():
+        try:
+            force = onnx_provider if onnx_provider != "auto" else None
+            prov = ONNXProvider(model_name, force_provider=force)
+            detected = prov._session.get_providers()[0] if hasattr(prov, '_session') else _detect_onnx_provider()
+            print(f"Using ONNX with {detected}")
+            return prov
+        except Exception as e:
+            raise RuntimeError(
+                f"ONNX failed: {e}. Install onnxruntime or use "
+                f"PF2E_PROVIDER=sentence_transformers for PyTorch fallback."
+            )
 
-    return SentenceTransformersProvider(model_name)
+    raise RuntimeError(
+        "onnxruntime not installed. Install it with: "
+        "uv pip install optimum[onnxruntime]"
+    )

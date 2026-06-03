@@ -8,7 +8,7 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
-    'python-pytorch'
+    'python-optimum'
     'python-pydantic'
     'python-pydantic-settings'
     'python-pyyaml'
@@ -16,22 +16,14 @@ depends=(
     'python-rich'
     'python-sqlite-vec'
     'python-mcp'
-    'python-optimum'
 )
 optdepends=(
-    'python-sentence-transformers: PyTorch fallback when ONNX unavailable'
     'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
     'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
     'python-onnxruntime-cpu: CPU-only ONNX'
     'migraphx: AMD graph optimization for faster inference'
 )
 makedepends=('python-build' 'python-installer' 'python-hatchling')
-optdepends=(
-    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
-    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
-    'python-onnxruntime-cpu: CPU-only ONNX'
-    'migraphx: AMD graph optimization for faster inference'
-)
 source=("git+https://github.com/Kaylebor/pf2e-codex.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 install=pf2e-codex.install
