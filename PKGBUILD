@@ -10,12 +10,9 @@ depends=(
     'python'
 )
 optdepends=(
-    'python-onnxruntime-cpu: CPU ONNX inference (required, install one ONNX variant)'
-    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration'
-    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
-    'migraphx: AMD graph optimization for faster inference'
-    'rocm-opencl-runtime: AMD GPU compute runtime'
-    'cuda: NVIDIA GPU compute runtime'
+    'migraphx: MIGraphX library for AMD GPU ONNX acceleration'
+    'rocm-hip-runtime: HIP runtime for AMD GPU (needed by MIGraphX)'
+    'cuda: CUDA runtime for NVIDIA GPU ONNX acceleration'
 )
 makedepends=('python-pip')
 # Build from local repo (for AUR: use GitHub tarball URL)
@@ -27,14 +24,29 @@ package() {
     # Force system Python (Mise may override PATH)
     export PYTHON=/usr/bin/python3
 
-    # Create isolated venv at install location
-    /usr/bin/python3 -m venv --system-site-packages "$pkgdir/usr/share/pf2e-codex/.venv"
+    local venv="$pkgdir/usr/share/pf2e-codex/.venv"
 
-    # Install from PyPI (for AUR) or from local source directory (for dev)
-    # pip will pull in all deps: transformers, tokenizers, optimum, rich, etc.
-    "$pkgdir/usr/share/pf2e-codex/.venv/bin/pip" install --no-cache-dir "$startdir"
+    # Create isolated venv — all Python deps managed internally
+    /usr/bin/python3 -m venv --system-site-packages "$venv"
 
-    # Create wrapper script to launch from venv
+    # Install pf2e-codex (pulls in optimum[onnxruntime] → CPU onnxruntime, + transformers etc.)
+    "$venv/bin/pip" install --no-cache-dir "$startdir"
+
+    # ── GPU autodetection ──
+    # Upgrade onnxruntime to GPU variant if hardware + system libs are present.
+    # onnxruntime-migraphx wheel bundles the provider .so but needs system
+    # libmigraphx + libamdhip64 → provided by migraphx + rocm-hip-runtime.
+    if command -v rocminfo &>/dev/null && rocminfo &>/dev/null 2>&1; then
+        echo "==> AMD GPU detected — installing onnxruntime-migraphx"
+        "$venv/bin/pip" install --no-cache-dir 'onnxruntime-migraphx>=1.25'
+    elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+        echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
+        "$venv/bin/pip" install --no-cache-dir 'onnxruntime-gpu'
+    else
+        echo "==> No GPU detected — using CPU onnxruntime"
+    fi
+
+    # Create wrapper script
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
