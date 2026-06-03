@@ -25,8 +25,8 @@ pf2e-codex.toml
 # Archives
 _archive/
 
-# makepkg artifacts (srcdir = src/ — NEVER use makepkg -C!)
+# makepkg artifacts (srcdir = src/ — NOW safe for makepkg -C!)
+src/
 pkg/
 *.pkg.tar.*
 *.src.tar.*
-pf2e-codex/

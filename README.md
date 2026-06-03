@@ -47,7 +47,7 @@ pf2e-codex serve
 
 ```
 pf2e-codex/
-├── src/pf2e_codex/
+├── pf2e_codex/
 │   ├── __init__.py        # SDK exports
 │   ├── config.py          # Settings (Pydantic + TOML file)
 │   ├── fetcher.py         # Download json-assets.zip from GitHub releases

@@ -14,7 +14,7 @@ No pre-computed embeddings or PF2E data is shipped. Users run `pf2e-codex index`
 ## Architecture
 
 ```
-src/pf2e_codex/
+pf2e_codex/
 ├── config.py       # Settings: env vars → TOML file → defaults (Pydantic)
 ├── fetcher.py      # Download json-assets.zip from GitHub releases
 ├── chunker.py      # Parse PF2E JSON → enriched text chunks
