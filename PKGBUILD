@@ -43,21 +43,21 @@ package() {
 
     # Strip PyPI GPU packages not matching system — system python-pytorch is used instead
     if [[ "$gpu_type" == "rocm" ]]; then
-        .venv/bin/pip3 uninstall -y torch cuda-bindings cuda-pathfinder cuda-toolkit \n            nvidia-cublas-cu13 nvidia-cuda-cupti-cu13 nvidia-cuda-nvrtc-cu13 \n            nvidia-cudnn-cu13 nvidia-cufft-cu13 nvidia-cufile-cu13 nvidia-curand-cu13 \n            nvidia-cusolver-cu13 nvidia-cusparse-cu13 nvidia-cusparselt-cu13 \n            nvidia-nccl-cu13 nvidia-nvjitlink-cu13 nvidia-nvshmem-cu13 \n            triton 2>/dev/null || true
+        uv pip uninstall torch cuda-bindings cuda-pathfinder cuda-toolkit \n            nvidia-cublas-cu13 nvidia-cuda-cupti-cu13 nvidia-cuda-nvrtc-cu13 \n            nvidia-cudnn-cu13 nvidia-cufft-cu13 nvidia-cufile-cu13 nvidia-curand-cu13 \n            nvidia-cusolver-cu13 nvidia-cusparse-cu13 nvidia-cusparselt-cu13 \n            nvidia-nccl-cu13 nvidia-nvjitlink-cu13 nvidia-nvshmem-cu13 \n            triton 2>/dev/null || true
     elif [[ "$gpu_type" == "cuda" ]]; then
-        .venv/bin/pip3 uninstall -y torch-rocm triton 2>/dev/null || true
+        uv pip uninstall torch-rocm triton 2>/dev/null || true
     else
-        .venv/bin/pip3 uninstall -y torch cuda-bindings cuda-pathfinder cuda-toolkit \n            nvidia-cublas-cu13 nvidia-cuda-cupti-cu13 nvidia-cuda-nvrtc-cu13 \n            nvidia-cudnn-cu13 nvidia-cufft-cu13 nvidia-cufile-cu13 nvidia-curand-cu13 \n            nvidia-cusolver-cu13 nvidia-cusparse-cu13 nvidia-cusparselt-cu13 \n            nvidia-nccl-cu13 nvidia-nvjitlink-cu13 nvidia-nvshmem-cu13 \n            triton torch-rocm 2>/dev/null || true
+        uv pip uninstall torch cuda-bindings cuda-pathfinder cuda-toolkit \n            nvidia-cublas-cu13 nvidia-cuda-cupti-cu13 nvidia-cuda-nvrtc-cu13 \n            nvidia-cudnn-cu13 nvidia-cufft-cu13 nvidia-cufile-cu13 nvidia-curand-cu13 \n            nvidia-cusolver-cu13 nvidia-cusparse-cu13 nvidia-cusparselt-cu13 \n            nvidia-nccl-cu13 nvidia-nvjitlink-cu13 nvidia-nvshmem-cu13 \n            triton torch-rocm 2>/dev/null || true
     fi
 
     # Ensure editable install works (hatchling pth file workaround)
     echo "$pkgdir/usr/share/pf2e-codex/src" > "$pkgdir/usr/share/pf2e-codex/.venv/lib/python3.13/site-packages/pf2e_codex.pth"
 
-    # Create wrapper binary
+    # Create wrapper binary (calls python directly to avoid broken shebang)
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" <<EOF
 #!/usr/bin/env bash
-exec /usr/share/pf2e-codex/.venv/bin/pf2e-codex "\$@"
+exec /usr/share/pf2e-codex/.venv/bin/python3 -m pf2e_codex.cli "\$@"
 EOF
     chmod +x "$pkgdir/usr/bin/pf2e-codex"
 
