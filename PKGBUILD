@@ -10,6 +10,7 @@ depends=(
     'python'
     'python-onnxruntime-cpu'
     'python-optimum'
+    'python-tokenizers'
     'python-pydantic'
     'python-pydantic-settings'
     'python-pyyaml'
@@ -23,7 +24,7 @@ optdepends=(
     'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration (replaces python-onnxruntime-cpu)'
     'migraphx: AMD graph optimization for faster inference'
 )
-makedepends=('python-build' 'python-installer' 'python-hatchling')
+makedepends=('python-build' 'python-installer' 'python-hatchling' 'python-pip')
 source=("git+https://github.com/Kaylebor/pf2e-codex.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 install=pf2e-codex.install
@@ -33,6 +34,9 @@ package() {
 
     # Force system Python (Mise may override PATH)
     export PYTHON=/usr/bin/python3
+
+    # Install transformers from PyPI (CachyOS version has stale tokenizers pin)
+    /usr/bin/python3 -m pip install --target "$pkgdir/usr/lib/python3.14/site-packages" transformers
 
     # Build wheel
     /usr/bin/python3 -m build --wheel --outdir dist
