@@ -6,7 +6,8 @@ pkgdesc="PF2E rules knowledge base with MCP, CLI, and SDK interfaces"
 arch=('any')
 url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
-depends=('python' 'python-uv' 'git' 'python-pytorch')
+depends=('python' 'git' 'python-pytorch')
+makedepends=('python-build' 'python-installer' 'python-hatchling')
 optdepends=(
     'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
     'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
@@ -38,9 +39,12 @@ package() {
         extras="[onnx]"
     fi
 
-    # Install package (system ONNX packages available via --system-site-packages)
+    # Install package
     cd "$pkgdir/usr/share/pf2e-codex"
     UV_LINK_MODE=copy uv pip install -e "."
+
+    # Remove CUDA bloat from PyPI — system python-pytorch is used instead
+    .venv/bin/pip3 uninstall -y torch nvidia-cublas-cu13 nvidia-cuda-cupti-cu13 \n        nvidia-cuda-nvrtc-cu13 nvidia-cudnn-cu13 nvidia-cufft-cu13 nvidia-cufile-cu13 \n        nvidia-curand-cu13 nvidia-cusolver-cu13 nvidia-cusparse-cu13 \n        nvidia-cusparselt-cu13 nvidia-nccl-cu13 nvidia-nvjitlink-cu13 \n        nvidia-nvshmem-cu13 cuda-bindings cuda-pathfinder cuda-toolkit triton \n        2>/dev/null || true
 
     # Ensure editable install works (hatchling pth file workaround)
     echo "$pkgdir/usr/share/pf2e-codex/src" > "$pkgdir/usr/share/pf2e-codex/.venv/lib/python3.13/site-packages/pf2e_codex.pth"
