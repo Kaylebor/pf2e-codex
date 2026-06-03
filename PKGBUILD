@@ -8,9 +8,10 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=('python' 'python-uv' 'git')
 optdepends=(
-    'python-onnxruntime-rocm: AMD GPU ONNX acceleration'
+    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (recommended, includes AVX2 CPU optimizations)'
+    'python-onnxruntime-rocm: AMD GPU ONNX acceleration (without AVX2)'
     'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
-    'python-onnxruntime-cpu: CPU-only ONNX (faster than PyTorch)'
+    'python-onnxruntime-cpu: CPU-only ONNX'
 )
 makedepends=('git')
 source=("git+https://github.com/Kaylebor/pf2e-codex.git#tag=v${pkgver}")
@@ -29,10 +30,12 @@ package() {
 
     # Determine ONNX extra based on installed GPU packages
     local extras=""
-    if pacman -Q python-onnxruntime-rocm &>/dev/null || pacman -Q rocm-hip-sdk &>/dev/null; then
+    if pacman -Q python-onnxruntime-opt-rocm &>/dev/null || pacman -Q python-onnxruntime-rocm &>/dev/null; then
         extras="[rocm]"
-    elif pacman -Q python-onnxruntime-cuda &>/dev/null || pacman -Q cuda &>/dev/null; then
+    elif pacman -Q python-onnxruntime-cuda &>/dev/null; then
         extras="[cuda]"
+    elif pacman -Q python-onnxruntime-cpu &>/dev/null; then
+        extras="[onnx]"
     else
         extras="[onnx]"
     fi

@@ -97,8 +97,8 @@ main() {
     if command -v paru &>/dev/null && [[ -n "$EXTRAS" ]]; then
         echo "Detected Arch (paru). Installing system ONNX packages..."
         case "$GPU" in
-            rocm)  paru -S --noconfirm python-onnxruntime-rocm 2>/dev/null || true ;;
-            cuda)  paru -S --noconfirm python-onnxruntime-cuda 2>/dev/null || true ;;
+            rocm)  paru -S --noconfirm python-onnxruntime-opt-rocm 2>/dev/null || paru -S --noconfirm python-onnxruntime-rocm 2>/dev/null || true ;;
+            cuda)  paru -S --noconfirm python-onnxruntime-opt-cuda 2>/dev/null || paru -S --noconfirm python-onnxruntime-cuda 2>/dev/null || true ;;
             *)     paru -S --noconfirm python-onnxruntime-cpu 2>/dev/null || true ;;
         esac
     fi
