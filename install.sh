@@ -101,6 +101,11 @@ main() {
             cuda)  paru -S --noconfirm python-onnxruntime-opt-cuda 2>/dev/null || paru -S --noconfirm python-onnxruntime-cuda 2>/dev/null || true ;;
             *)     paru -S --noconfirm python-onnxruntime-cpu 2>/dev/null || true ;;
         esac
+        # Try MIGraphX from PyPI if system migraphx library is present
+        if [[ "$GPU" == "rocm" ]] && [[ -f /opt/rocm/lib/libmigraphx_c.so ]]; then
+            echo "System MIGraphX detected, installing Python binding..."
+            uv pip install onnxruntime-migraphx 2>/dev/null || true
+        fi
     fi
 
     if [[ -d "$PREFIX/.git" ]]; then

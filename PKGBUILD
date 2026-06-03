@@ -8,10 +8,10 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=('python' 'python-uv' 'git')
 optdepends=(
-    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (recommended, includes AVX2 CPU optimizations)'
-    'python-onnxruntime-rocm: AMD GPU ONNX acceleration (without AVX2)'
+    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
     'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
     'python-onnxruntime-cpu: CPU-only ONNX'
+    'migraphx: AMD graph optimization for faster inference (any provider)'
 )
 makedepends=('git')
 source=("git+https://github.com/Kaylebor/pf2e-codex.git#tag=v${pkgver}")
@@ -34,8 +34,6 @@ package() {
         extras="[rocm]"
     elif pacman -Q python-onnxruntime-cuda &>/dev/null; then
         extras="[cuda]"
-    elif pacman -Q python-onnxruntime-cpu &>/dev/null; then
-        extras="[onnx]"
     else
         extras="[onnx]"
     fi
