@@ -9,8 +9,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from sentence_transformers import SentenceTransformer
-
 from .models import get_model_info
 
 
@@ -37,6 +35,8 @@ class SentenceTransformersProvider(EmbeddingProvider):
     """Local sentence-transformers provider."""
 
     def __init__(self, model_name: str, device: str = "cpu"):
+        from sentence_transformers import SentenceTransformer
+
         # Resolve short names (e.g. "snowflake-arctic-embed-xs") to full HF IDs
         info = get_model_info(model_name)
         resolved = info.name if info else model_name
