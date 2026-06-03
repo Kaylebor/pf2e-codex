@@ -30,11 +30,17 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
         Returns results with cross-references (refs), legacy names, confidence,
         and license. Supports filtering by license, content type, or pack.
 
+        IMPORTANT: Default to Remaster (ORC) content unless the user explicitly
+        asks for legacy/pre-remaster rules. The ORC version contains the current
+        official rules. Use license='OGL' only when the user specifically asks
+        for legacy content or the original pre-remaster version of an entry.
+
         Args:
             query: Natural language question or keywords.
             top_k: Number of results (default 5, max 20).
             hybrid: If true, boosts exact name matches.
-            license: Filter by license: 'ORC' (remaster), 'OGL' (legacy), or null.
+            license: Filter by license: 'ORC' (current remaster rules, default),
+                     'OGL' (legacy/pre-remaster rules), or null (both).
             content_type: Filter by type: 'feat', 'spell', 'condition', 'journal_page',
                           'action', 'equipment', 'class', etc.
             pack: Filter by pack name: 'spells', 'feats', 'pathfinder-bestiary', etc.

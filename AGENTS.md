@@ -64,6 +64,20 @@ Chunk IDs are `pack:entry_id` (e.g. `feats:Fury-Instinct`) because the same `_id
 ### Default model: `snowflake-arctic-embed-xs`
 22M params, 384 dims, ~35s to index 28K chunks on Ryzen 7 7800X3D. Faster and equivalent quality to `all-MiniLM-L6-v2`.
 
+### OGL vs ORC vs pre/post remaster
+These are orthogonal dimensions:
+- **License** (`chunks.license`): OGL (legacy) vs ORC (remaster). Legal distinction.
+- **Rules rebalancing**: Pre-remaster vs post-remaster mechanical changes.
+  - ORC entries may have different rules than their OGL counterparts.
+  - Aliases capture naming changes but not mechanical changes.
+- **Default behavior**: MCP tools guide LLM to default to ORC (current rules).
+  Only use `license='OGL'` when user explicitly asks for legacy content.
+
+### Search enrichment
+Results include: `refs` (outgoing cross-references), `legacy_name` (pre-remaster
+name for renamed entries), `confidence` (high/medium/low from score thresholds),
+`license` (ORC/OGL/NONE).
+
 ## Gotchas
 
 ### sqlite-vec `vec0` syntax
