@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "PF2E rules knowledge base with MCP, CLI, and SDK interfaces"
 requires-python = ">=3.12"
 dependencies = [
-    "optimum[onnxruntime]",
+    "onnxruntime>=1.20",
+    "transformers>=4.40",
+    "tokenizers>=0.19",
     "sqlite-vec>=0.1",
     "mcp>=1.0",
     "pydantic>=2.0",
@@ -15,6 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+export = ["optimum[onnxruntime]"]  # ONNX model export (one-time per model)
 rocm = ["onnxruntime-rocm"]  # ROCm 6.x
 cuda = ["onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]

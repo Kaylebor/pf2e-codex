@@ -273,6 +273,24 @@ def validate(
     print_validation(result)
 
 
+@app.command()
+def export(
+    model: str = typer.Option("Snowflake/snowflake-arctic-embed-xs", "--model", "-m", help="Model to export to ONNX"),
+) -> None:
+    """Export a model to ONNX (one-time, needs optimum+torch)."""
+    print(f"Exporting {model} to ONNX...")
+    print("This requires optimum + torch. Install with: pip install optimum[onnxruntime]")
+    print()
+    try:
+        from .embeddings import ONNXProvider
+        provider = ONNXProvider(model, force_provider="cpu")
+        print(f"Done! Model cached at ~/.cache/pf2e-codex/onnx/")
+        print(f"Dimension: {provider.dim}")
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+
 def main() -> None:
     app()
 

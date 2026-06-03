@@ -24,33 +24,29 @@ package() {
     # Force system Python (Mise may override PATH)
     export PYTHON=/usr/bin/python3
 
-    local venv="$pkgdir/usr/share/pf2e-codex/.venv"
+    local lib="$pkgdir/usr/share/pf2e-codex/lib"
+    mkdir -p "$lib"
 
-    # Create isolated venv — all Python deps managed internally
-    /usr/bin/python3 -m venv --system-site-packages "$venv"
-
-    # Install pf2e-codex (pulls in optimum[onnxruntime] → CPU onnxruntime, + transformers etc.)
-    "$venv/bin/pip" install --no-cache-dir "$startdir"
+    # Install pf2e-codex + runtime deps (onnxruntime, transformers, tokenizers, etc.)
+    # NO torch/optimum — ONNX export is a separate one-time step.
+    /usr/bin/pip3 install --no-cache-dir --target "$lib" "$startdir"
 
     # ── GPU autodetection ──
-    # Upgrade onnxruntime to GPU variant if hardware + system libs are present.
-    # onnxruntime-migraphx wheel bundles the provider .so but needs system
-    # libmigraphx + libamdhip64 → provided by migraphx + rocm-hip-runtime.
+    # Upgrade onnxruntime to GPU variant. Needs system libs: migraphx + rocm-hip-runtime.
     if command -v rocminfo &>/dev/null && rocminfo &>/dev/null 2>&1; then
         echo "==> AMD GPU detected — installing onnxruntime-migraphx"
-        "$venv/bin/pip" install --no-cache-dir 'onnxruntime-migraphx>=1.25'
+        /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime-migraphx>=1.25'
     elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
-        "$venv/bin/pip" install --no-cache-dir 'onnxruntime-gpu'
-    else
-        echo "==> No GPU detected — using CPU onnxruntime"
+        /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime-gpu'
     fi
 
-    # Create wrapper script (uses python3 -m to avoid baked-in build-time shebang)
+    # Wrapper: PYTHONPATH points to private lib, uses system python3
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
-exec /usr/share/pf2e-codex/.venv/bin/python3 -m pf2e_codex.cli "$@"
+export PYTHONPATH="/usr/share/pf2e-codex/lib${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
