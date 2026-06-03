@@ -8,7 +8,6 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
-    'python-onnxruntime-cpu'
     'python-pydantic'
     'python-pydantic-settings'
     'python-yaml'
@@ -45,13 +44,16 @@ package() {
         'transformers>=4.40,<6.0' 'tokenizers>=0.19,<0.23'
 
     # ── GPU autodetection ──
-    # Replace CPU onnxruntime with MIGraphX/CUDA variant if system libraries present.
+    # Install the right ONNX runtime: MIGraphX (AMD), CUDA (NVIDIA), or CPU.
     if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
         echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
         /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime-migraphx>=1.25'
     elif [ -e /opt/cuda/lib64/libcudart.so ]; then
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
         /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime-gpu'
+    else
+        echo "==> No GPU detected — installing onnxruntime (CPU)"
+        /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime>=1.20'
     fi
 
     # Wrapper: PYTHONPATH points to private lib, uses system python3
