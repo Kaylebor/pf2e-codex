@@ -59,3 +59,21 @@ Ordered by impact. Check items off as completed.
 - [ ] **AGENTS.md auto-update hook** — CI check that docs match module structure.
 
 - [ ] **ONNX auto-download of ONNX runtime via install.sh** — currently user must install manually.
+
+## Hardware Platform Expansion
+
+Current: AMD (ROCm/MIGraphX), NVIDIA (CUDA). Potential additions:
+
+| Hardware | EP | Package | Status |
+|---|---|---|---|
+| Intel CPU/GPU/NPU | OpenVINO | `onnxruntime-openvino` | Production |
+| Qualcomm Snapdragon X/X2 | QNN | `onnxruntime-qnn` | Production |
+| Apple Silicon | CoreML | `onnxruntime-coreml` | Preview |
+| MediaTek Dimensity | NNAPI (generic) | Built-in | Preview |
+| ARM (generic) | ACL / Arm NN | Community | Preview |
+| Huawei Ascend | CANN | Community | Preview |
+
+OpenVINO (Intel) and QNN (Qualcomm) are production-ready. Would require:
+- install.sh GPU detection for Intel/Qualcomm
+- PKGBUILD extras for each provider
+- `PF2E_PROVIDER` / `PF2E_ONNX_PROVIDER` config values
