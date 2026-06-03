@@ -26,7 +26,7 @@ package() {
     cp -r . "$pkgdir/usr/share/pf2e-codex/"
 
     # Create virtual environment
-    uv venv "$pkgdir/usr/share/pf2e-codex/.venv"
+    uv venv --system-site-packages "$pkgdir/usr/share/pf2e-codex/.venv"
 
     # Determine ONNX extra based on installed GPU packages
     local extras=""
@@ -38,14 +38,9 @@ package() {
         extras="[onnx]"
     fi
 
-    # Install package with extras
+    # Install package (system ONNX packages available via --system-site-packages)
     cd "$pkgdir/usr/share/pf2e-codex"
-    if uv pip install -e ".${extras}"; then
-        echo "Installed with ONNX support"
-    else
-        echo "ONNX extra unavailable, falling back to CPU-only"
-        uv pip install -e "."
-    fi
+    UV_LINK_MODE=copy uv pip install -e "."
 
     # Create wrapper binary
     install -dm755 "$pkgdir/usr/bin"
