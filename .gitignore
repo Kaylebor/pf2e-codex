@@ -27,7 +27,6 @@ _archive/
 
 # makepkg artifacts
 pkg/
-src/
 *.pkg.tar.*
 *.src.tar.*
 pf2e-codex/
