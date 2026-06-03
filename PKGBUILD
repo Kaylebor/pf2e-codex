@@ -46,11 +46,11 @@ package() {
         echo "==> No GPU detected — using CPU onnxruntime"
     fi
 
-    # Create wrapper script
+    # Create wrapper script (uses python3 -m to avoid baked-in build-time shebang)
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
-exec /usr/share/pf2e-codex/.venv/bin/pf2e-codex "$@"
+exec /usr/share/pf2e-codex/.venv/bin/python3 -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
