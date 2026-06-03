@@ -38,30 +38,26 @@ package() {
     local lib="$pkgdir/usr/share/pf2e-codex/lib"
     mkdir -p "$lib"
 
-    # Pip wrapper: filter pre-existing system package conflicts (not our problem)
-    _pip() {
-        /usr/bin/pip3 "$@" 2>&1 | grep -vE \
-            -e '^ERROR: pip.*dependency (resolver|conflict)' \
-            -e 'requires .* which is (not installed|incompatible)' \
-            -e 'but you have .* which is incompatible'
-    }
-
-    # System packages provide: pydantic, rich, typer, pyyaml, sqlite-vec, mcp, etc.
-    # We only pip-install what CachyOS has broken: transformers + tokenizers.
-    _pip install --no-cache-dir --target "$lib" --no-deps "$startdir"
-    _pip install --no-cache-dir --target "$lib" \
+    # --no-deps everywhere: pip never scans system packages = zero noise.
+    # System provides: pydantic, rich, typer, pyyaml, sqlite-vec, mcp, etc.
+    /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" "$startdir"
+    /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
         'transformers>=4.40,<6.0' 'tokenizers>=0.19,<0.23'
 
     # ── GPU autodetection ──
+    # onnxruntime-migraphx bundles its own .so, no system onnxruntime needed.
     if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
         echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
-        _pip install --no-cache-dir --target "$lib" 'onnxruntime-migraphx>=1.25'
+        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
+            'onnxruntime-migraphx>=1.25'
     elif [ -e /opt/cuda/lib64/libcudart.so ]; then
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
-        _pip install --no-cache-dir --target "$lib" 'onnxruntime-gpu'
+        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
+            'onnxruntime-gpu'
     else
         echo "==> No GPU detected — installing onnxruntime (CPU)"
-        _pip install --no-cache-dir --target "$lib" 'onnxruntime>=1.20'
+        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
+            'onnxruntime>=1.20'
     fi
 
     # Wrapper: PYTHONPATH points to private lib, uses system python3
