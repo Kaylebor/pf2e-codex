@@ -42,6 +42,9 @@ package() {
     cd "$pkgdir/usr/share/pf2e-codex"
     UV_LINK_MODE=copy uv pip install -e "."
 
+    # Ensure editable install works (hatchling pth file workaround)
+    echo "$pkgdir/usr/share/pf2e-codex/src" > "$pkgdir/usr/share/pf2e-codex/.venv/lib/python3.13/site-packages/pf2e_codex.pth"
+
     # Create wrapper binary
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" <<EOF
