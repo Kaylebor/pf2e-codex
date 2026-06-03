@@ -37,8 +37,8 @@ package() {
     export PYTHON=/usr/bin/python3
 
     # Build wheel
-    python -m build --wheel --outdir dist
+    /usr/bin/python3 -m build --wheel --outdir dist
 
     # Install into system Python
-    python-installer --destdir "$pkgdir" --prefix /usr dist/*.whl
+    /usr/bin/python3 -m installer --destdir "$pkgdir" --prefix /usr dist/*.whl
 }
