@@ -413,9 +413,9 @@ class SearchIndex:
             "SELECT license, COUNT(*) FROM chunks GROUP BY license ORDER BY COUNT(*) DESC"
         ).fetchall()
 
-        # Remaster breakdown
+        # Remaster breakdown (NULL grouped with legacy)
         remaster_counts = self._conn.execute(
-            "SELECT CASE WHEN remaster = 1 THEN 'remaster' WHEN remaster = 0 THEN 'legacy' ELSE 'unknown' END as label, COUNT(*) FROM chunks GROUP BY label ORDER BY COUNT(*) DESC"
+            "SELECT CASE WHEN remaster = 1 THEN 'remaster' ELSE 'legacy' END as label, COUNT(*) FROM chunks GROUP BY label ORDER BY COUNT(*) DESC"
         ).fetchall()
 
         # Pack breakdown (top 20)
