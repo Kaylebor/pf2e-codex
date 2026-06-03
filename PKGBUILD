@@ -8,6 +8,17 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
+    'python-onnxruntime'
+    'python-pydantic'
+    'python-pydantic-settings'
+    'python-pyyaml'
+    'python-rich'
+    'python-typer'
+    'python-sqlite-vec'
+    'python-mcp'
+    'python-uvicorn'
+    'python-starlette'
+    'python-sse-starlette'
 )
 optdepends=(
     'migraphx: MIGraphX library for AMD GPU ONNX acceleration'
@@ -27,16 +38,18 @@ package() {
     local lib="$pkgdir/usr/share/pf2e-codex/lib"
     mkdir -p "$lib"
 
-    # Install pf2e-codex + runtime deps (onnxruntime, transformers, tokenizers, etc.)
-    # NO torch/optimum — ONNX export is a separate one-time step.
-    /usr/bin/pip3 install --no-cache-dir --target "$lib" "$startdir"
+    # System packages provide: onnxruntime, rich, typer, pyyaml, pydantic, sqlite-vec, mcp.
+    # We only pip-install what CachyOS has broken: transformers + tokenizers.
+    /usr/bin/pip3 install --no-cache-dir --target "$lib" --no-deps "$startdir"
+    /usr/bin/pip3 install --no-cache-dir --target "$lib" \
+        'transformers>=4.40,<6.0' 'tokenizers>=0.19,<0.23'
 
     # ── GPU autodetection ──
-    # Upgrade onnxruntime to GPU variant. Needs system libs: migraphx + rocm-hip-runtime.
-    if command -v rocminfo &>/dev/null && rocminfo &>/dev/null 2>&1; then
-        echo "==> AMD GPU detected — installing onnxruntime-migraphx"
+    # Replace CPU onnxruntime with MIGraphX/CUDA variant if system libraries present.
+    if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
+        echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
         /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime-migraphx>=1.25'
-    elif command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    elif [ -e /opt/cuda/lib64/libcudart.so ]; then
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
         /usr/bin/pip3 install --no-cache-dir --target "$lib" 'onnxruntime-gpu'
     fi
