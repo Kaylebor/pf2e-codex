@@ -8,6 +8,7 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
+    'python-onnxruntime-cpu'
     'python-optimum'
     'python-pydantic'
     'python-pydantic-settings'
@@ -18,9 +19,8 @@ depends=(
     'python-mcp'
 )
 optdepends=(
-    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
-    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
-    'python-onnxruntime-cpu: CPU-only ONNX'
+    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (replaces python-onnxruntime-cpu)'
+    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration (replaces python-onnxruntime-cpu)'
     'migraphx: AMD graph optimization for faster inference'
 )
 makedepends=('python-build' 'python-installer' 'python-hatchling')
