@@ -42,7 +42,7 @@ package() {
     # System provides: pydantic, rich, typer, pyyaml, sqlite-vec, mcp, etc.
     /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" "$startdir"
     /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
-        'transformers>=4.40,<6.0' 'tokenizers>=0.19,<0.23'
+        'transformers>=4.40,<5.0' 'tokenizers>=0.19,<0.23'
 
     # ── GPU autodetection ──
     # onnxruntime-migraphx bundles its own .so, no system onnxruntime needed.
