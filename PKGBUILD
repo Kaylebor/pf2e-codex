@@ -14,10 +14,16 @@ depends=(
     'python-pyyaml'
     'python-typer'
     'python-rich'
-    'python-sentence-transformers'
     'python-sqlite-vec'
     'python-mcp'
     'python-optimum'
+)
+optdepends=(
+    'python-sentence-transformers: PyTorch fallback when ONNX unavailable'
+    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (ROCm EP, recommended)'
+    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
+    'python-onnxruntime-cpu: CPU-only ONNX'
+    'migraphx: AMD graph optimization for faster inference'
 )
 makedepends=('python-build' 'python-installer' 'python-hatchling')
 optdepends=(
