@@ -24,24 +24,17 @@ sha256sums=()
 install=pf2e-codex.install
 
 package() {
-    # Copy source from PKGBUILD's directory into the build sandbox
-    cd "$startdir"
-
     # Force system Python (Mise may override PATH)
     export PYTHON=/usr/bin/python3
 
-    # Collect source files to package
-    cp -r pyproject.toml src "$srcdir/"
-
-    cd "$srcdir"
-
-    # Create isolated venv — avoids all system site-package conflicts
+    # Create isolated venv at install location
     /usr/bin/python3 -m venv --system-site-packages "$pkgdir/usr/share/pf2e-codex/.venv"
 
-    # Install pf2e-codex and all its Python deps into the venv
-    "$pkgdir/usr/share/pf2e-codex/.venv/bin/pip" install --no-cache-dir .
+    # Install from PyPI (for AUR) or from local source directory (for dev)
+    # pip will pull in all deps: transformers, tokenizers, optimum, rich, etc.
+    "$pkgdir/usr/share/pf2e-codex/.venv/bin/pip" install --no-cache-dir "$startdir"
 
-    # Create wrapper script
+    # Create wrapper script to launch from venv
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
