@@ -37,8 +37,9 @@ package() {
         gpu_type="cuda"
     fi
 
-    # Install package
+    # Create lockfile and install package
     cd "$pkgdir/usr/share/pf2e-codex"
+    UV_LINK_MODE=copy uv lock
     UV_LINK_MODE=copy uv pip install -e "."
 
     # Strip PyPI GPU packages not matching system — system python-pytorch is used instead
