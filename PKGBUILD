@@ -57,7 +57,7 @@ package() {
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" <<EOF
 #!/usr/bin/env bash
-exec /usr/bin/uv run --project /usr/share/pf2e-codex python -m pf2e_codex.cli "\$@"
+exec /usr/bin/uv run --frozen --project /usr/share/pf2e-codex python -m pf2e_codex.cli "\$@"
 EOF
     chmod +x "$pkgdir/usr/bin/pf2e-codex"
 
