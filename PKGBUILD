@@ -53,11 +53,11 @@ package() {
     # Ensure editable install works (hatchling pth file workaround)
     echo "$pkgdir/usr/share/pf2e-codex/src" > "$pkgdir/usr/share/pf2e-codex/.venv/lib/python3.13/site-packages/pf2e_codex.pth"
 
-    # Create wrapper binary (uses uv to run from project directory)
+    # Create wrapper binary (uses system uv, not Mise-managed one)
     install -dm755 "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" <<EOF
 #!/usr/bin/env bash
-exec uv run --project /usr/share/pf2e-codex python -m pf2e_codex.cli "\$@"
+exec /usr/bin/uv run --project /usr/share/pf2e-codex python -m pf2e_codex.cli "\$@"
 EOF
     chmod +x "$pkgdir/usr/bin/pf2e-codex"
 
