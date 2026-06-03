@@ -33,6 +33,9 @@ install=pf2e-codex.install
 package() {
     cd "$srcdir/pf2e-codex"
 
+    # Force system Python (Mise may override PATH)
+    export PYTHON=/usr/bin/python3
+
     # Build wheel
     python -m build --wheel --outdir dist
 
