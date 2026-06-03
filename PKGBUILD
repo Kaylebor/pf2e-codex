@@ -8,39 +8,44 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
-    'python-onnxruntime-cpu'
-    'python-optimum'
-    'python-tokenizers'
-    'python-pydantic'
-    'python-pydantic-settings'
-    'python-pyyaml'
-    'python-typer'
-    'python-rich'
-    'python-sqlite-vec'
-    'python-mcp'
 )
 optdepends=(
-    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration (replaces python-onnxruntime-cpu)'
-    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration (replaces python-onnxruntime-cpu)'
+    'python-onnxruntime-cpu: CPU ONNX inference (required, install one ONNX variant)'
+    'python-onnxruntime-opt-rocm: AMD GPU ONNX acceleration'
+    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
     'migraphx: AMD graph optimization for faster inference'
+    'rocm-opencl-runtime: AMD GPU compute runtime'
+    'cuda: NVIDIA GPU compute runtime'
 )
-makedepends=('python-build' 'python-installer' 'python-hatchling' 'python-pip')
-source=("git+https://github.com/Kaylebor/pf2e-codex.git#tag=v${pkgver}")
-sha256sums=('SKIP')
+makedepends=('python-pip')
+# Build from local repo (for AUR: use GitHub tarball URL)
+source=()
+sha256sums=()
 install=pf2e-codex.install
 
 package() {
-    cd "$srcdir/pf2e-codex"
+    # Copy source from PKGBUILD's directory into the build sandbox
+    cd "$startdir"
 
     # Force system Python (Mise may override PATH)
     export PYTHON=/usr/bin/python3
 
-    # Install transformers from PyPI (CachyOS version has stale tokenizers pin)
-    /usr/bin/python3 -m pip install --target "$pkgdir/usr/lib/python3.14/site-packages" transformers
+    # Collect source files to package
+    cp -r pyproject.toml src "$srcdir/"
 
-    # Build wheel
-    /usr/bin/python3 -m build --wheel --outdir dist
+    cd "$srcdir"
 
-    # Install into system Python
-    /usr/bin/python3 -m installer --destdir "$pkgdir" --prefix /usr dist/*.whl
+    # Create isolated venv — avoids all system site-package conflicts
+    /usr/bin/python3 -m venv --system-site-packages "$pkgdir/usr/share/pf2e-codex/.venv"
+
+    # Install pf2e-codex and all its Python deps into the venv
+    "$pkgdir/usr/share/pf2e-codex/.venv/bin/pip" install --no-cache-dir .
+
+    # Create wrapper script
+    mkdir -p "$pkgdir/usr/bin"
+    cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
+#!/bin/sh
+exec /usr/share/pf2e-codex/.venv/bin/pf2e-codex "$@"
+WRAPPER
+    chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
