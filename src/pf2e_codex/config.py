@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     cache_dir: Path = Field(default=DEFAULT_CACHE_DIR, description="Cache directory for downloads")
     data_dir: Path = Field(default=DEFAULT_DATA_DIR, description="Directory for databases and data")
     model: str = Field(default=DEFAULT_MODEL, description="Embedding model name or path")
-    provider: str = Field(default="auto", description="Embedding provider: auto, onnx, sentence_transformers")
+    provider: str = Field(default="auto", description="Embedding provider: auto, onnx")
     onnx_provider: str = Field(default="auto", description="ONNX execution provider: auto, migraphx, rocm, cuda, cpu, none")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     transport: str = Field(default="stdio", description="MCP transport: stdio or sse")

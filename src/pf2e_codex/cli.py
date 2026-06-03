@@ -232,9 +232,9 @@ def benchmark(
         help="Comma-separated model names to benchmark",
     ),
     providers: str = typer.Option(
-        "sentence_transformers,onnx",
+        "onnx",
         "--providers", "-p",
-        help="Comma-separated providers: sentence_transformers, onnx",
+        help="Comma-separated providers to benchmark (default: onnx)",
     ),
     chunks: int = typer.Option(200, "--chunks", "-c", help="Number of chunks to benchmark with"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),

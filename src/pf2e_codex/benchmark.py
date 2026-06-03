@@ -140,7 +140,7 @@ def run_benchmark(
     # Run benchmark
     results = []
     for model_name in models:
-        for ptype in (providers or ["sentence_transformers", "onnx"]):
+        for ptype in (providers or ["onnx"]):
             row = {"model": model_name, "provider": ptype, "status": "ok"}
             try:
                 # Quick index: embed + measure time
