@@ -1,0 +1,103 @@
+# Standard query suite for retrieval quality validation
+# 25 queries covering feats, spells, conditions, actions, journal pages, classes, ancestries
+
+q1:
+  query: flat-footed while flanking
+  expected: Darting Monkey
+  reason: Feat that prevents off-guard from flanking
+q2:
+  query: blinded condition
+  expected: Blinded
+  reason: Condition entry for blind
+q3:
+  query: barbarian extra damage with rage
+  expected: Fury Instinct
+  reason: Barbarian instinct that increases rage damage
+q4:
+  query: do status bonuses and penalties stack
+  expected: Bonuses and Penalties
+  reason: Core rules journal page on stacking
+q5:
+  query: fireball spell
+  expected: Fireball
+  reason: Classic evocation spell
+q6:
+  query: off-guard condition
+  expected: Off-Guard
+  reason: Condition for flanked/unaware
+q7:
+  query: dread striker
+  expected: Dread Striker
+  reason: Feat that frightens off-guard foes
+q8:
+  query: sneak attack damage
+  expected: Sneak Attack
+  reason: Rogue class feature for precision damage
+q9:
+  query: flurry of blows monk
+  expected: Flurry of Blows
+  reason: Monk core action for multiple strikes
+q10:
+  query: shield block
+  expected: Shield Block
+  reason: General feat for damage reduction
+q11:
+  query: force barrage
+  expected: Force Barrage
+  reason: Remastered magic missile spell
+q12:
+  query: lesser healing potion
+  expected: Healing Potion (Lesser)
+  reason: Basic healing item
+q13:
+  query: power attack
+  expected: Power Attack
+  reason: Fighter feat for extra damage
+q14:
+  query: barbarian class
+  expected: Barbarian
+  reason: Barbarian class entry
+q15:
+  query: clumsy condition
+  expected: Clumsy
+  reason: Condition penalty to DEX
+q16:
+  query: terrain and cover
+  expected: Cover
+  reason: GM Screen journal page on cover
+q17:
+  query: double slice feat
+  expected: Double Slice
+  reason: Two-weapon fighting feat
+q18:
+  query: dwarf ancestry
+  expected: Dwarf
+  reason: Core ancestry
+q19:
+  query: prone condition
+  expected: Prone
+  reason: Condition for knocked down
+q20:
+  query: dying death saves unconscious
+  expected: Dying
+  reason: Death and dying rules
+q21:
+  query: take cover action
+  expected: Take Cover
+  reason: Basic action to gain cover
+q22:
+  query: stride action movement
+  expected: Stride
+  reason: Basic movement action
+q23:
+  query: flanking rules positioning
+  expected: Flanking
+  reason: GM Screen journal page on flanking
+q24:
+  query: acolyte background
+  expected: Acolyte
+  reason: Clerical background
+q25:
+  query: grabbed condition
+  expected: Grabbed
+  reason: Condition for being held
