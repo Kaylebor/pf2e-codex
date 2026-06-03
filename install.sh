@@ -81,17 +81,28 @@ main() {
     GPU=$(detect_gpu)
     echo "GPU detection: $GPU"
 
-    if [[ "$ONNX_TARGET" == "none" ]]; then
-        EXTRAS=""
-    elif [[ "$GPU" == "rocm" ]]; then
-        EXTRAS="[rocm]"
-    elif [[ "$GPU" == "cuda" ]]; then
-        EXTRAS="[cuda]"
-    else
-        EXTRAS="[onnx]"
+    # Determine ONNX extras
+    EXTRAS=""
+    if [[ "$ONNX_TARGET" != "none" ]]; then
+        if [[ "$GPU" == "rocm" ]]; then
+            EXTRAS="[rocm]"
+        elif [[ "$GPU" == "cuda" ]]; then
+            EXTRAS="[cuda]"
+        else
+            EXTRAS="[onnx]"
+        fi
     fi
 
-    # Clone or update
+    # On Arch: install system ONNX packages via paru if available
+    if command -v paru &>/dev/null && [[ -n "$EXTRAS" ]]; then
+        echo "Detected Arch (paru). Installing system ONNX packages..."
+        case "$GPU" in
+            rocm)  paru -S --noconfirm python-onnxruntime-rocm 2>/dev/null || true ;;
+            cuda)  paru -S --noconfirm python-onnxruntime-cuda 2>/dev/null || true ;;
+            *)     paru -S --noconfirm python-onnxruntime-cpu 2>/dev/null || true ;;
+        esac
+    fi
+
     if [[ -d "$PREFIX/.git" ]]; then
         echo "Updating existing installation..."
         git -C "$PREFIX" pull --ff-only

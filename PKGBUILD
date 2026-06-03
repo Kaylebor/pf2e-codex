@@ -8,8 +8,9 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=('python' 'python-uv' 'git')
 optdepends=(
-    'rocm-hip-sdk: AMD GPU ONNX acceleration'
-    'cuda: NVIDIA GPU ONNX acceleration'
+    'python-onnxruntime-rocm: AMD GPU ONNX acceleration'
+    'python-onnxruntime-cuda: NVIDIA GPU ONNX acceleration'
+    'python-onnxruntime-cpu: CPU-only ONNX (faster than PyTorch)'
 )
 makedepends=('git')
 source=("git+https://github.com/Kaylebor/pf2e-codex.git#tag=v${pkgver}")
@@ -26,11 +27,11 @@ package() {
     # Create virtual environment
     uv venv "$pkgdir/usr/share/pf2e-codex/.venv"
 
-    # Determine ONNX extra based on available GPU drivers
+    # Determine ONNX extra based on installed GPU packages
     local extras=""
-    if pacman -Q rocm-hip-sdk &>/dev/null; then
+    if pacman -Q python-onnxruntime-rocm &>/dev/null || pacman -Q rocm-hip-sdk &>/dev/null; then
         extras="[rocm]"
-    elif pacman -Q cuda &>/dev/null; then
+    elif pacman -Q python-onnxruntime-cuda &>/dev/null || pacman -Q cuda &>/dev/null; then
         extras="[cuda]"
     else
         extras="[onnx]"
