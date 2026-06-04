@@ -11,7 +11,6 @@ Steady-state throughput (post-compile), average of 50-100 runs:
 | snowflake-arctic-embed-s | 33M | 384 | ~69s | 1204ms | — |
 | intfloat/e5-small-v2 | 33M | 384 | ~135s | 1212ms | 13.4ms |
 | snowflake-arctic-embed-m | 110M | 768 | ~1h | — | — |
-| nomic-embed-text-v1.5 | 137M | 768 | ~1h+ | — | — |
 | bge-m3 | 568M | 1024 | ~3h+ | — | — |
 
 bge-m3: GPU strongly recommended (>500M params). No query prefixes needed.
@@ -89,16 +88,6 @@ MODELS: dict[str, ModelInfo] = {
         doc_prefix="",
         notes="Best quality 768d. Slow on CPU, great on GPU.",
     ),
-    "nomic-embed-text-v1.5": ModelInfo(
-        name="nomic-ai/nomic-embed-text-v1.5",
-        params="137M",
-        dim=768,
-        cpu_time_28k="~1h+",
-        quality="Better",
-        query_prefix="search_query: ",
-        doc_prefix="search_document: ",
-        notes="Long context (8192). Slow on CPU, great on GPU.",
-    ),
     "bge-m3": ModelInfo(
         name="BAAI/bge-m3",
         params="568M",
@@ -130,5 +119,5 @@ def recommend(hardware: str = "cpu") -> list[str]:
     if hardware == "cpu":
         return ["snowflake-arctic-embed-xs", "snowflake-arctic-embed-s", "all-MiniLM-L6-v2"]
     elif hardware == "gpu":
-        return ["bge-m3", "snowflake-arctic-embed-m", "nomic-embed-text-v1.5", "snowflake-arctic-embed-s"]
+        return ["bge-m3", "snowflake-arctic-embed-m", "snowflake-arctic-embed-s"]
     return ["snowflake-arctic-embed-xs"]
