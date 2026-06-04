@@ -58,8 +58,8 @@ EOF
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
-export PYTHONPATH="/usr/share/pf2e-codex/lib${PYTHONPATH:+:$PYTHONPATH}"
-exec /usr/bin/python3 -m pf2e_codex.cli "$@"
+export PYTHONPATH="/usr/share/pf2e-codex/lib"
+exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
