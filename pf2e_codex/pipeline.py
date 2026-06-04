@@ -10,7 +10,7 @@ from typing import Any
 
 from .chunker import ChunkBuilder, UUIDResolver, entry_hash
 from .config import Settings
-from .embeddings import get_provider
+from .embeddings import EmbeddingProvider, get_provider
 from .fetcher import extract_all_packs, extract_lang, get_cached_zip
 from .index import init_db, load_vec_extension, rebuild_fts, vec_blob
 
@@ -47,13 +47,15 @@ def save_chunks(chunks: list[dict[str, Any]], path: Path) -> None:
     print(f"Wrote {len(chunks)} chunks -> {path}")
 
 
-def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: bool = False) -> None:
+def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: bool = False,
+                    provider: EmbeddingProvider | None = None) -> None:
     """Embed chunks and store in sqlite-vec."""
-    provider = get_provider(
-        settings.model,
-        provider=settings.provider,
-        onnx_provider=settings.onnx_provider,
-    )
+    if provider is None:
+        provider = get_provider(
+            settings.model,
+            provider=settings.provider,
+            onnx_provider=settings.onnx_provider,
+        )
     dim = provider.dim
     print(f"Embedding model: {settings.model} (dim={dim})")
 
@@ -162,16 +164,18 @@ def index_all(settings: Settings, rebuild: bool = False) -> None:
     embed_and_index(chunks, settings, rebuild=rebuild)
 
 
-def update_index(settings: Settings) -> None:
+def update_index(settings: Settings, _provider: EmbeddingProvider | None = None) -> None:
     """Incremental update: diff against indexed release, only re-process changed entries."""
     import sqlite3
 
-    from .embeddings import get_provider
+    from .embeddings import get_provider as gp
     from .fetcher import extract_all_packs, get_cached_zip
     from .index import init_db, load_vec_extension, rebuild_fts, vec_blob
 
     # Ensure DB exists
-    dim = get_provider(settings.model, provider=settings.provider, onnx_provider=settings.onnx_provider).dim
+    if _provider is None:
+        _provider = gp(settings.model, provider=settings.provider, onnx_provider=settings.onnx_provider)
+    dim = _provider.dim
     init_db(settings.db, dim)
 
     conn = sqlite3.connect(str(settings.db))
@@ -248,12 +252,11 @@ def update_index(settings: Settings) -> None:
         return
 
     # Embed and index only changed chunks
-    provider = get_provider(settings.model, provider=settings.provider, onnx_provider=settings.onnx_provider)
     texts = [c["text"] for c in changed]
     print(f"Embedding {len(changed)} changed chunks...")
     import time
     start = time.time()
-    embeddings = provider.embed(texts)
+    embeddings = _provider.embed(texts)
     print(f"Embedded in {time.time() - start:.1f}s")
 
     print("Updating database...")
@@ -357,9 +360,11 @@ def embed_all_models(
         return results
 
     export_pending = list(set(pending) | set(upd_pending))
+    providers: dict[str, EmbeddingProvider] = {}
 
-    # — Phase 1: Sequential ONNX export —
-    print(f"Phase 1: ONNX export ({len(export_pending)} models, sequential)\n")
+    # — Phase 1: Sequential ONNX export + compile —
+    # Providers are cached and reused in Phase 2 (avoids double MIGraphX compile).
+    print(f"Phase 1: ONNX export + compile ({len(export_pending)} models, sequential)\n")
     export_ok: set[str] = set()
     for model in export_pending:
         model_settings = S(
@@ -371,8 +376,9 @@ def embed_all_models(
         )
         try:
             from .embeddings import get_provider as gp
-            gp(model_settings.model, provider=model_settings.provider,
-               onnx_provider=model_settings.onnx_provider)
+            prov = gp(model_settings.model, provider=model_settings.provider,
+                      onnx_provider=model_settings.onnx_provider)
+            providers[model] = prov
             print(f"[export] {model} OK")
             export_ok.add(model)
         except Exception as e:
@@ -396,7 +402,7 @@ def embed_all_models(
             onnx_provider=settings.onnx_provider,
         )
         try:
-            embed_and_index(chunks, ms, rebuild=False)
+            embed_and_index(chunks, ms, rebuild=False, provider=providers[model])
             return (model, True)
         except Exception as e:
             print(f"[FAIL] {model}: {e}")
@@ -411,7 +417,7 @@ def embed_all_models(
             onnx_provider=settings.onnx_provider,
         )
         try:
-            update_index(ms)
+            update_index(ms, _provider=providers.get(model))
             return (model, True)
         except Exception as e:
             print(f"[FAIL] {model}: {e}")
