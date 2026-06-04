@@ -4,6 +4,8 @@ Ordered by impact. Check items off as completed.
 
 ## High Impact
 
+- [ ] **Pre-built DB download (auto-pull)** — `pf2e-codex pull` downloads pre-computed `sqlite-vec` DBs from GitHub Releases (`pf2e-codex-data` repo). Tagged per PF2E version, checksum-verified. Auto-triggered on first search if no local DB. Per-model DBs stored alongside indexed ones in `$PF2E_DATA_DIR`. Pattern: llama.cpp / GPT4All / Nomic. Removes "wait 5 minutes" onboarding.
+
 - [x] **Hybrid search: semantic + FTS5 via RRF**
   - Done: Weighted RRF (0.85 semantic / 0.15 name-LIKE). Stop-word filtering, bag-of-words name matching.
 
