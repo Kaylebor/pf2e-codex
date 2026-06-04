@@ -125,10 +125,7 @@ class ONNXProvider(EmbeddingProvider):
             return
 
         export_path = local_path or self.model_name
-        print(f"Exporting {self.model_name} to ONNX (one-time)...")
-        print("This requires optimum + torch. Install with:")
-        print("  pip install optimum[onnxruntime]")
-        print()
+        print(f"Exporting {self.model_name} to ONNX (one-time, ~30s)...")
         start = time.time()
         try:
             from optimum.onnxruntime import ORTModelForFeatureExtraction
@@ -136,9 +133,8 @@ class ONNXProvider(EmbeddingProvider):
             for f in self._cache_dir.glob("*"):
                 f.unlink()
             raise RuntimeError(
-                f"ONNX export needs optimum + torch. Install with:\n"
-                f"  pip install optimum[onnxruntime]\n"
-                f"  (missing: {e})"
+                f"ONNX export needs optimum + torch. Rebuild package or run:\n"
+                f"  pip install optimum[onnxruntime]"
             )
         try:
             kwargs = {"export": True}

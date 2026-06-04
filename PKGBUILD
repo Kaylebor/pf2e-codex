@@ -8,16 +8,6 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
-    'python-pydantic'
-    'python-pydantic-settings'
-    'python-yaml'
-    'python-rich'
-    'python-typer'
-    'python-sqlite-vec'
-    'python-mcp'
-    'uvicorn'
-    'python-starlette'
-    'python-sse-starlette'
 )
 optdepends=(
     'migraphx: MIGraphX library for AMD GPU ONNX acceleration'
@@ -38,15 +28,20 @@ package() {
     local lib="$pkgdir/usr/share/pf2e-codex/lib"
     mkdir -p "$lib"
 
-    # --no-deps everywhere: pip never scans system packages = zero noise.
-    # System provides: pydantic, rich, typer, pyyaml, sqlite-vec, mcp, etc.
-    /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" "$startdir"
-    /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
-        'transformers>=4.40,<5.0' 'tokenizers>=0.19,<0.23' \
-        'huggingface-hub>=0.34,<1.0'
+    # Pin torch to CPU-only (onnxruntime-migraphx handles GPU inference)
+    cat > /tmp/pf2e-torch-constraint.txt << 'EOF'
+torch==2.12.0+cpu
+EOF
+
+    # Install pf2e-codex + all deps, torch forced to CPU via constraint
+    /usr/bin/pip3 install --no-cache-dir --target "$lib" \
+        --constraint /tmp/pf2e-torch-constraint.txt \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        "$startdir"
+
+    rm -f /tmp/pf2e-torch-constraint.txt
 
     # ── GPU autodetection ──
-    # onnxruntime-migraphx bundles its own .so, no system onnxruntime needed.
     if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
         echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
         /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
@@ -57,10 +52,6 @@ package() {
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
         /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
             'onnxruntime-gpu'
-    else
-        echo "==> No GPU detected — installing onnxruntime (CPU)"
-        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
-            'onnxruntime>=1.20'
     fi
 
     # Wrapper: PYTHONPATH points to private lib, uses system python3
