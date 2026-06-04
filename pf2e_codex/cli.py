@@ -295,7 +295,7 @@ def export(
 def embed(
     all_models: bool = typer.Option(False, "--all-models", "-A", help="Embed all supported models"),
     models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to embed"),
-    concurrency: int = typer.Option(2, "--concurrency", "-c", help="Max parallel models"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Max parallel models (GPU compile spikes — increase carefully)"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
 ) -> None:
     """Embed chunks for one or more models (shared fetch + chunk phase)."""

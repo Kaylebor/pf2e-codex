@@ -310,7 +310,7 @@ def update_index(settings: Settings) -> None:
 def embed_all_models(
     settings: Settings,
     models: list[str],
-    concurrency: int = 2,
+    concurrency: int = 1,
 ) -> dict[str, bool]:
     """Build chunks once, then export sequentially, embed in parallel.
 
