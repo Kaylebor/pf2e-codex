@@ -347,7 +347,7 @@ def embed(
 
 
 def main() -> None:
-    app()
+    app(prog_name="pf2e-codex")
 
 
 if __name__ == "__main__":
