@@ -9,6 +9,19 @@ from urllib.request import urlopen
 
 from .config import Settings
 
+
+def get_latest_release() -> str:
+    """Detect the latest PF2E system release tag from GitHub API."""
+    import json
+    from urllib.request import urlopen, Request
+    req = Request(
+        "https://api.github.com/repos/foundryvtt/pf2e/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "pf2e-codex/0.1.0"},
+    )
+    with urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())  # type: ignore[no-untyped-call]
+    return data["tag_name"]
+
 CORE_PACKS = [
     "conditions",
     "actions",

@@ -297,6 +297,8 @@ def embed(
     models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to embed"),
     concurrency: int = typer.Option(1, "--concurrency", "-c", help="Max parallel models (GPU compile spikes — increase carefully)"),
     update: bool = typer.Option(False, "--update", "-u", help="Incremental update existing DBs instead of skipping"),
+    latest: bool = typer.Option(False, "--latest", "-l", help="Fetch and update to the latest PF2E release from GitHub"),
+    release: str | None = typer.Option(None, "--release", "-r", help="Specific PF2E release version (e.g. pf2e-8.2.0)"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
 ) -> None:
     """Embed chunks for one or more models (shared fetch + chunk phase)."""
@@ -310,7 +312,36 @@ def embed(
         typer.echo("Specify --all-models or --models MODEL [MODEL...]")
         raise typer.Exit(1)
 
+    if latest and release:
+        typer.echo("--latest and --release are mutually exclusive")
+        raise typer.Exit(1)
+
     settings = _settings(data_dir=data_dir)
+
+    if latest:
+        from .fetcher import get_latest_release
+        typer.echo(f"Detecting latest PF2E release...")
+        latest_rel = get_latest_release()
+        typer.echo(f"Latest: {latest_rel}")
+        from .config import Settings as S
+        settings = S(
+            data_dir=str(settings.data_dir),
+            model=settings.model,
+            release=latest_rel,
+            provider=settings.provider,
+            onnx_provider=settings.onnx_provider,
+        )
+
+    if release:
+        from .config import Settings as S
+        settings = S(
+            data_dir=str(settings.data_dir),
+            model=settings.model,
+            release=release,
+            provider=settings.provider,
+            onnx_provider=settings.onnx_provider,
+        )
+
     from .pipeline import embed_all_models
     embed_all_models(settings, model_list, concurrency=concurrency, update=update)
 
