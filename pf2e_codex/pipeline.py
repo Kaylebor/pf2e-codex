@@ -150,6 +150,7 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
         ("embedding_model", settings.model),
         ("embedding_dim", str(dim)),
         ("total_chunks", str(len(chunks))),
+        ("pf2e_release", settings.release),
         ("index_date", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
     ]:
         conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", (k, v))
