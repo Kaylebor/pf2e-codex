@@ -89,13 +89,14 @@ def embed_one(model: str) -> bool:
 
 
 def main() -> None:
+    global DATA_DIR, CONCURRENCY
+
     parser = argparse.ArgumentParser(description="Generate all PF2E embedding DBs")
     parser.add_argument("--data-dir", default=str(DATA_DIR), help="Data directory")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY, help="Max parallel jobs")
     parser.add_argument("models", nargs="*", help="Specific models (default: all)")
     args = parser.parse_args()
 
-    global DATA_DIR, CONCURRENCY
     DATA_DIR = Path(args.data_dir)
     CONCURRENCY = args.concurrency
     models = args.models or ALL_MODELS
