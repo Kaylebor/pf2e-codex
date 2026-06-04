@@ -48,11 +48,13 @@ EOF
     rm -rf "$lib/onnxruntime" "$lib/onnxruntime-"*.dist-info 2>/dev/null || true
 
     # PEP 420 namespace packages (optimum, etc.) collide with system packages.
-    # Add empty __init__.py to any lib package dirs that lack them.
-    find "$lib" -type d -not -path '*/__pycache__*' | while IFS= read -r dir; do
-        if [ ! -f "$dir/__init__.py" ]; then
-            touch "$dir/__init__.py" 2>/dev/null || true
-        fi
+    # Only target specific packages, not everything (would break .so modules).
+    for pkg in optimum; do
+        find "$lib/$pkg" -type d -not -path '*/__pycache__*' | while IFS= read -r dir; do
+            if [ ! -f "$dir/__init__.py" ]; then
+                touch "$dir/__init__.py" 2>/dev/null || true
+            fi
+        done
     done
 
     # Wrapper: PYTHONPATH points to private lib first, system site-packages
