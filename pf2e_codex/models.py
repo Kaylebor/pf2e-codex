@@ -12,7 +12,10 @@ Steady-state throughput (post-compile), average of 50-100 runs:
 | intfloat/e5-small-v2 | 33M | 384 | ~135s | 1212ms | 13.4ms |
 | snowflake-arctic-embed-m | 110M | 768 | ~1h | — | — |
 | nomic-embed-text-v1.5 | 137M | 768 | ~1h+ | — | — |
+| bge-m3 | 568M | 1024 | ~3h+ | — | — |
 
+bge-m3: GPU strongly recommended (>500M params). No query prefixes needed.
+Best quality model available — 1024d, 8192 token context.
 Single-query GPU latency: 1.1ms (MiniLM / Arctic xs), 2.4ms (e5-small).
 Compile time: ~10-30s one-time per model, cached in ~/.cache/pf2e-codex/onnx/
 * e5-small requires "query:" / "passage:" prefixing.
@@ -96,6 +99,14 @@ MODELS: dict[str, ModelInfo] = {
         doc_prefix="search_document: ",
         notes="Long context (8192). Slow on CPU, great on GPU.",
     ),
+    "bge-m3": ModelInfo(
+        name="BAAI/bge-m3",
+        params="568M",
+        dim=1024,
+        cpu_time_28k="~3h+",
+        quality="Best",
+        notes="Multi-granularity (dense+sparse+colbert). 1024d, 8192 context. No prefixes needed. GPU strongly recommended. MTEB v1: 59.56.",
+    ),
 }
 
 
@@ -114,5 +125,5 @@ def recommend(hardware: str = "cpu") -> list[str]:
     if hardware == "cpu":
         return ["snowflake-arctic-embed-xs", "snowflake-arctic-embed-s", "all-MiniLM-L6-v2"]
     elif hardware == "gpu":
-        return ["snowflake-arctic-embed-m", "nomic-embed-text-v1.5", "snowflake-arctic-embed-s"]
+        return ["bge-m3", "snowflake-arctic-embed-m", "nomic-embed-text-v1.5", "snowflake-arctic-embed-s"]
     return ["snowflake-arctic-embed-xs"]

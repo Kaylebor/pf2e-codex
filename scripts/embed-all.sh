@@ -27,6 +27,7 @@ ALL_MODELS=(
     "all-MiniLM-L6-v2"
     "intfloat/e5-small-v2"
     "nomic-ai/nomic-embed-text-v1.5"
+    "BAAI/bge-m3"
 )
 
 usage() {
