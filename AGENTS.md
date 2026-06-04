@@ -122,9 +122,8 @@ chunks*.json       # intermediate chunk files
 
 ## Testing / Validation
 
-Quick smoke test after changes:
+Quick smoke test after changes (requires package installed via PKGBUILD):
 ```bash
-uv pip install -e "."
 pf2e-codex status                     # should show 28,837 chunks
 pf2e-codex search "flat-footed" -k 3   # hybrid search, should return Darting Monkey
 pf2e-codex get "fury-instinct"         # should return full Fury Instinct entry
@@ -193,6 +192,53 @@ After compile, steady-state throughput is 50-500× faster than PyTorch CPU.
 **Key provider order:** MIGraphX → ROCm → CUDA → CPU
 **Per-batch-shape compile:** MIGraphX compiles once per unique batch size. For a running
 MCP server this happens once at startup.
+
+## Common Commands
+
+```bash
+# Check status & discover DB
+pf2e-codex status
+
+# Build everything from scratch
+pf2e-codex index
+
+# Embed all supported models (shared chunk phase)
+pf2e-codex embed --all-models
+
+# Update all DBs to the latest PF2E release
+pf2e-codex embed --all-models -u --latest
+
+# Incremental update after FoundryVTT PF2E module upgrades
+pf2e-codex embed --all-models -u
+
+# Specific model
+pf2e-codex index -m BAAI/bge-m3
+
+# Search (hybrid: semantic + name match)
+pf2e-codex search "flat-footed" -k 5
+pf2e-codex search "fireball" --license ORC --remaster-only
+
+# Look up a specific entry
+pf2e-codex get fury-instinct
+pf2e-codex get "Compendium.pf2e.feats.Item.ABC123"
+
+# Find related entries (cross-references)
+pf2e-codex related off-guard --direction incoming
+
+# Start MCP server (stdio, for Claude/Cursor/pi)
+pf2e-codex serve
+
+# List all supported models
+pf2e-codex models
+
+# Validate retrieval quality
+pf2e-codex validate
+pf2e-codex validate --mode semantic
+
+# Benchmark model speed
+pf2e-codex benchmark
+pf2e-codex benchmark --models "all-MiniLM-L6-v2,bge-m3" --providers "cpu"
+```
 
 ## Dependencies
 

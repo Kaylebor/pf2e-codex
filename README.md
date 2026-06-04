@@ -225,6 +225,28 @@ for r in results:
     print(r["name"], r["distance"])
 ```
 
+## Usage Examples
+
+```bash
+# Quick start: build your local rules database
+pf2e-codex index
+
+# Search (hybrid semantic + name match)
+pf2e-codex search "fireball" --remaster-only -k 5
+
+# Embed all supported models (shared chunk phase, concurrency-aware)
+pf2e-codex embed --all-models
+
+# Update all DBs to latest PF2E release
+pf2e-codex embed --all-models -u --latest
+
+# Look up an entry
+pf2e-codex get fury-instinct
+
+# Start MCP server (for Claude Desktop, Cursor, pi)
+pf2e-codex serve
+```
+
 ## Legal
 
 - Code: MIT (this repo)
