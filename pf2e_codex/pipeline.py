@@ -305,3 +305,73 @@ def update_index(settings: Settings) -> None:
     print(f"  Removed: {len(orphan_ids)} entries")
     print(f"  DB: {settings.db}")
     conn.close()
+
+
+def embed_all_models(
+    settings: Settings,
+    models: list[str],
+    concurrency: int = 2,
+) -> dict[str, bool]:
+    """Build chunks once, then embed for multiple models in parallel.
+
+    Returns {model_name: success} dict.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .config import Settings as S
+    from .models import get_model_info
+
+    # — Shared phase: fetch + chunk once —
+    print(f"Building chunks from {settings.release}...")
+    chunks = build_chunks(settings)
+    print(f"Generated {len(chunks)} chunks\n")
+
+    results: dict[str, bool] = {}
+    pending = []
+
+    for model in models:
+        info = get_model_info(model)
+        name = info.name if info else model
+        db = settings.data_dir / f"pf2e_{model.replace('/', '--')}.db"
+        if db.exists():
+            print(f"[skip] {name} — DB exists")
+            results[model] = True
+        else:
+            pending.append(model)
+
+    if not pending:
+        print("All models already indexed.")
+        return results
+
+    def _embed_one(model: str) -> tuple[str, bool]:
+        model_settings = S(
+            model=model,
+            data_dir=str(settings.data_dir),
+            release=settings.release,
+            provider=settings.provider,
+            onnx_provider=settings.onnx_provider,
+        )
+        try:
+            embed_and_index(chunks, model_settings, rebuild=False)
+            return (model, True)
+        except Exception as e:
+            print(f"[FAIL] {model}: {e}")
+            return (model, False)
+
+    print(f"Embedding {len(pending)} model(s) with concurrency={concurrency}\n")
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_embed_one, m): m for m in pending}
+        for future in as_completed(futures):
+            model, ok = future.result()
+            results[model] = ok
+            status = "[done]" if ok else "[FAIL]"
+            print(f"{status}  {model}")
+
+    print()
+    failed = sum(1 for v in results.values() if not v)
+    if failed:
+        print(f"{failed} model(s) failed.")
+    else:
+        print("All models embedded successfully.")
+
+    return results

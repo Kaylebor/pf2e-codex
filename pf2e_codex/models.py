@@ -121,6 +121,11 @@ def list_models() -> list[ModelInfo]:
     return list(MODELS.values())
 
 
+ALL_MODEL_NAMES: dict[str, str] = {
+    key: info.name for key, info in MODELS.items()
+}
+
+
 def recommend(hardware: str = "cpu") -> list[str]:
     if hardware == "cpu":
         return ["snowflake-arctic-embed-xs", "snowflake-arctic-embed-s", "all-MiniLM-L6-v2"]

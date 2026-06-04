@@ -291,6 +291,29 @@ def export(
         raise typer.Exit(1)
 
 
+@app.command()
+def embed(
+    all_models: bool = typer.Option(False, "--all-models", "-A", help="Embed all supported models"),
+    models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to embed"),
+    concurrency: int = typer.Option(2, "--concurrency", "-c", help="Max parallel models"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+) -> None:
+    """Embed chunks for one or more models (shared fetch + chunk phase)."""
+    from .models import ALL_MODEL_NAMES
+
+    if all_models:
+        model_list = list(ALL_MODEL_NAMES.values())
+    elif models:
+        model_list = models
+    else:
+        typer.echo("Specify --all-models or --models MODEL [MODEL...]")
+        raise typer.Exit(1)
+
+    settings = _settings(data_dir=data_dir)
+    from .pipeline import embed_all_models
+    embed_all_models(settings, model_list, concurrency=concurrency)
+
+
 def main() -> None:
     app()
 
