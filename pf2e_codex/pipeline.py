@@ -312,7 +312,10 @@ def embed_all_models(
     models: list[str],
     concurrency: int = 2,
 ) -> dict[str, bool]:
-    """Build chunks once, then embed for multiple models in parallel.
+    """Build chunks once, then export sequentially, embed in parallel.
+
+    ONNX export modifies global state (GLOBALS.in_onnx_export) — must
+    be sequential. Embedding is pure inference — can be parallel.
 
     Returns {model_name: success} dict.
     """
@@ -342,7 +345,10 @@ def embed_all_models(
         print("All models already indexed.")
         return results
 
-    def _embed_one(model: str) -> tuple[str, bool]:
+    # — Phase 1: Sequential ONNX export —
+    print(f"Phase 1: ONNX export ({len(pending)} models, sequential)\n")
+    export_ok: set[str] = set()
+    for model in pending:
         model_settings = S(
             model=model,
             data_dir=str(settings.data_dir),
@@ -351,16 +357,40 @@ def embed_all_models(
             onnx_provider=settings.onnx_provider,
         )
         try:
-            embed_and_index(chunks, model_settings, rebuild=False)
+            from .embeddings import get_provider as gp
+            gp(model_settings.model, provider=model_settings.provider,
+               onnx_provider=model_settings.onnx_provider)
+            print(f"[export] {model} OK")
+            export_ok.add(model)
+        except Exception as e:
+            print(f"[export] {model} FAIL: {e}")
+            results[model] = False
+
+    # — Phase 2: Parallel embedding —
+    embed_pending = [m for m in pending if m in export_ok]
+    if not embed_pending:
+        print("\nNo models to embed.")
+        return results
+
+    def _embed_one(model: str) -> tuple[str, bool]:
+        ms = S(
+            model=model,
+            data_dir=str(settings.data_dir),
+            release=settings.release,
+            provider=settings.provider,
+            onnx_provider=settings.onnx_provider,
+        )
+        try:
+            embed_and_index(chunks, ms, rebuild=False)
             return (model, True)
         except Exception as e:
             print(f"[FAIL] {model}: {e}")
             return (model, False)
 
-    print(f"Embedding {len(pending)} model(s) with concurrency={concurrency}\n")
+    print(f"\nPhase 2: Embedding ({len(embed_pending)} models, concurrency={concurrency})\n")
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(_embed_one, m): m for m in pending}
+        futures = {pool.submit(_embed_one, m): m for m in embed_pending}
         for future in as_completed(futures):
             model, ok = future.result()
             results[model] = ok
