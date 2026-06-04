@@ -346,50 +346,6 @@ def embed(
     embed_all_models(settings, model_list, concurrency=concurrency, update=update)
 
 
-@app.command()
-def compile(
-    all_models: bool = typer.Option(False, "--all-models", "-A", help="Compile all supported models"),
-    models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to compile"),
-) -> None:
-    """Pre-compile models for MIGraphX (triggers GPU kernel compilation).
-
-    Compilation currently happens on every session. This command runs it
-    on-demand so you see upfront when it finishes, rather than during
-    indexing. No .mxr caching — not yet supported by the wheel build.
-    """
-    from .models import ALL_MODEL_NAMES
-    from .embeddings import _onnx_cache_dir
-
-    if all_models:
-        model_list = list(ALL_MODEL_NAMES.values())
-    elif models:
-        model_list = models
-    else:
-        typer.echo("Specify --all-models or --models MODEL [MODEL...]")
-        raise typer.Exit(1)
-
-    pending = []
-    for model in model_list:
-        onnx = _onnx_cache_dir(model) / "model.onnx"
-        if onnx.exists():
-            pending.append(model)
-        else:
-            typer.echo(f"[skip] {model} — no .onnx (run index/embed first)")
-
-    if not pending:
-        typer.echo("Nothing to compile.")
-        return
-
-    for model in pending:
-        typer.echo(f"Compiling {model}...")
-        from .embeddings import ONNXProvider
-        try:
-            ONNXProvider(model)
-            typer.echo(f"[done]  {model}")
-        except Exception as e:
-            typer.echo(f"[FAIL] {model}: {e}", err=True)
-
-
 def main() -> None:
     app(prog_name="pf2e-codex")
 
