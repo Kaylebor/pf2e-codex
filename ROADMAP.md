@@ -44,9 +44,8 @@ Ordered by impact. Check items off as completed.
 
 ## Medium Impact
 
-- [ ] **Release pipeline** — two small scripts, assumes `pf2e-codex` on PATH (from PKGBUILD):
-  1. `scripts/embed-all.sh <data-dir>` — runs `pf2e-codex index -m <model>` for every officially-supported model in parallel (GPU handles multiple 768d concurrently). Skips models that already have a DB. Calls `pf2e-codex` via subprocess, not internal imports.
-  2. `scripts/push-release.sh` — takes the generated DBs, creates tagged GitHub Releases on `pf2e-codex-data` per PF2E version + model, auto-tags `latest`. Accepts `--version` for backfilling older PF2E releases.
+- [x] **Release pipeline (embed-all)** — `scripts/embed-all.py`: runs `pf2e-codex index -m <model>` for all supported models in parallel (configurable concurrency), with proper Ctrl+C signal handling via Python `subprocess`. Skips existing DBs. Logs per-model to `/tmp`.
+  2. `scripts/push-release.sh` (TODO) — takes generated DBs, creates tagged GitHub Releases on `pf2e-codex-data`.
 
 - [ ] **Pretty CLI output (Rich tables)** — search results, status, catalog in rich formatting.
 
