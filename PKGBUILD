@@ -44,8 +44,18 @@ EOF
     rm -f /tmp/pf2e-torch-constraint.txt
 
     # System python-onnxruntime-opt-rocm provides onnxruntime with MIGraphX
-    # and .mxr caching. Remove pip's version so system one is used.
-    rm -rf "$lib/onnxruntime" "$lib/onnxruntime-"*.dist-info 2>/dev/null || true
+    # and .mxr caching. Copy it into our lib so -S works (no system leak).
+    python3 -c "
+import onnxruntime as ort, os, shutil, sys
+src = os.path.dirname(ort.__file__)
+dst = sys.argv[1]
+shutil.copytree(src, dst, symlinks=True)
+" "$lib/onnxruntime" 2>/dev/null || true
+    # Also copy dist-info so pip recognizes it
+    for d in /usr/lib/python3*/site-packages/onnxruntime-*.dist-info; do
+        [ -d "$d" ] && cp -r "$d" "$lib/" 2>/dev/null || true
+        break
+    done 2>/dev/null || true
 
     # PEP 420 namespace packages (optimum, etc.) collide with system packages.
     # Only target specific packages, not everything (would break .so modules).
@@ -57,13 +67,13 @@ EOF
         done
     done
 
-    # Wrapper: PYTHONPATH points to private lib first, system site-packages
-    # provide onnxruntime from opt-rocm. No -S (need system site-packages).
+    # Wrapper: PYTHONPATH with only our lib, -S excludes system site-packages.
+    # onnxruntime is copied into lib from system opt-rocm during build.
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
-export PYTHONPATH="/usr/share/pf2e-codex/lib${PYTHONPATH:+:$PYTHONPATH}"
-exec /usr/bin/python3 -m pf2e_codex.cli "$@"
+export PYTHONPATH="/usr/share/pf2e-codex/lib"
+exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
