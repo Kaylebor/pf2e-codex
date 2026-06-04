@@ -137,10 +137,13 @@ class ONNXProvider(EmbeddingProvider):
                 f"  pip install optimum[onnxruntime]"
             )
         try:
+            import transformers.utils.logging
+            transformers.utils.logging.set_verbosity_error()
             kwargs = {"export": True}
             if local_path:
                 kwargs["local_files_only"] = True
             model = ORTModelForFeatureExtraction.from_pretrained(export_path, **kwargs)
+            transformers.utils.logging.set_verbosity_warning()
             model.save_pretrained(self._cache_dir)
             print(f"Exported in {time.time() - start:.1f}s -> {self._cache_dir}")
         except Exception as e:
