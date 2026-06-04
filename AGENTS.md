@@ -1,6 +1,6 @@
 # Agent Guide — pf2e-codex
 
-This document is for LLMs, AI agents, and human collaborators who need to work on this codebase.
+> **Update this file** whenever you change architecture, add/remove modules, switch deps, or alter design decisions. Keep ROADMAP.md and README.md in sync too. Stale docs are worse than no docs.
 
 ## What This Is
 
@@ -11,19 +11,29 @@ A standalone tool for Pathfinder 2E rules lookup. It downloads PF2E data from th
 
 No pre-computed embeddings or PF2E data is shipped. Users run `pf2e-codex index` once to build their local DB.
 
+## Packaging (PKGBUILD)
+
+All Python deps bundled via `pip install --target` into `/usr/share/pf2e-codex/lib/`.
+Torch is pinned to CPU-only via pip constraint file to avoid NVIDIA bloat (~1.3GB total).
+ONNX runtime chosen at build time via GPU detection (ROCm → onnxruntime-migraphx,
+CUDA → onnxruntime-gpu, else CPU). Only system dep is `python`.
+
 ## Architecture
 
 ```
 pf2e_codex/
 ├── config.py       # Settings: env vars → TOML file → defaults (Pydantic)
 ├── fetcher.py      # Download json-assets.zip from GitHub releases
-├── chunker.py      # Parse PF2E JSON → enriched text chunks
+├── chunker.py      # Parse PF2E JSON → enriched text chunks, UUID resolution, OGL→ORC aliases
 ├── models.py       # Embedding model registry + hardware recommendations
-├── embeddings.py   # Provider abstraction (sentence-transformers, ONNX, remote)
-├── index.py        # sqlite-vec DB init + SearchIndex class
-├── pipeline.py     # Orchestration: fetch → extract → chunk → embed → index
-├── mcp_server.py   # FastMCP server with 4 tools
-└── cli.py          # Typer CLI entry point
+├── embeddings.py   # ONNX-only provider (automatic export via optimum, inference via onnxruntime)
+├── index.py        # sqlite-vec DB init + SearchIndex class (hybrid: semantic + FTS5 name LIKE)
+├── pipeline.py     # Orchestration: fetch → extract → chunk → embed → index (+ incremental update)
+├── benchmark.py    # Cross-model embedding speed benchmarks
+├── cli_rich.py     # Rich table formatting for CLI output
+├── validate.py     # Retrieval quality validation suite (25 queries, MRR)
+├── mcp_server.py   # FastMCP server with 6 tools (pf2e_search, pf2e_rules_explain, etc.)
+└── cli.py          # Typer CLI entry point (fetch, index, search, serve, export, etc.)
 ```
 
 ### Key Flow
@@ -95,7 +105,7 @@ WHERE embedding MATCH vec_f32(?)
 ```
 
 ### Model prefixing is automatic
-The `SentenceTransformersProvider` handles query/document prefixes via `models.py` registry. Don't add prefixes manually.
+The `ONNXProvider` handles query/document prefixes via `models.py` registry. Don't add prefixes manually.
 
 ### Config priority (highest wins)
 1. CLI kwargs / function args
@@ -159,22 +169,20 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 ## ONNX Acceleration (dev setup)
 
-ONNX is auto-detected. Install in order of preference:
+ONNX is auto-detected at runtime. MIGraphX is first priority on AMD.
+
+For local development (outside PKGBUILD):
 
 ```bash
 # CPU (always works)
-uv pip install 'optimum[onnxruntime]'
+pip install 'optimum[onnxruntime]'
 
-# AMD ROCm 7.x (MIGraphX EP, onnxruntime 1.23+)
-uv pip install optimum
-uv pip install https://github.com/Looong01/onnxruntime-rocm-build/releases/download/v1.25.0/onnxruntime_migraphx-1.25.0-cp313-cp313-manylinux_2_34_x86_64.whl
-# Also need MIGraphX system lib: yay -S migraphx (AUR) or equivalent
+# AMD GPU (MIGraphX, on PyPI)
+pip install onnxruntime-migraphx
+# System libs needed: migraphx + rocm-hip-runtime
 
-# AMD ROCm 6.x (ROCm EP, onnxruntime ≤ 1.22)
-uv pip install -e ".[rocm]"
-
-# NVIDIA CUDA
-uv pip install -e ".[cuda]"
+# NVIDIA GPU
+pip install onnxruntime-gpu
 ```
 
 On first use per model, ONNX exports once (cached at `~/.cache/pf2e-codex/onnx/{model}/`).
@@ -186,29 +194,15 @@ After compile, steady-state throughput is 50-500× faster than PyTorch CPU.
 **Per-batch-shape compile:** MIGraphX compiles once per unique batch size. For a running
 MCP server this happens once at startup.
 
-**Test ONNX is working:**
-```bash
-.venv/bin/python -c "
-from pf2e_codex.embeddings import _has_onnx, _detect_onnx_provider
-print('ONNX:', _has_onnx(), 'Provider:', _detect_onnx_provider())
-"
-```
-
-**Force fallback:**
-```bash
-PF2E_PROVIDER=sentence_transformers pf2e-codex index
-```
-
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
-| `sentence-transformers` | Local embedding models |
-| `optimum[onnxruntime]` | ONNX model export (optional) |
-| `onnxruntime[-rocm,-gpu]` | ONNX runtime (optional) |
+| `optimum[onnxruntime]` | ONNX model export + runtime inference (bundled in package) |
 | `sqlite-vec` | Vector storage + similarity search |
 | `mcp` | FastMCP server |
 | `pydantic` + `pydantic-settings` | Config + validation |
-| `typer` | CLI framework |
+| `typer` + `rich` | CLI framework + formatting |
 
-Python 3.12+, uv recommended.
+All Python deps are bundled in the PKGBUILD via `pip install --target`.
+The only system dependency is `python`.
