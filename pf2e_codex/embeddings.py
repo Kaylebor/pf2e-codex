@@ -139,7 +139,7 @@ class ONNXProvider(EmbeddingProvider):
         try:
             import transformers.utils.logging
             transformers.utils.logging.set_verbosity_error()
-            kwargs = {"export": True}
+            kwargs = {"export": True, "trust_remote_code": True}
             if local_path:
                 kwargs["local_files_only"] = True
             model = ORTModelForFeatureExtraction.from_pretrained(export_path, **kwargs)
