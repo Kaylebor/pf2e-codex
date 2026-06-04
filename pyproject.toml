@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "PF2E rules knowledge base with MCP, CLI, and SDK interfaces"
 requires-python = ">=3.12"
 dependencies = [
-    "optimum[onnxruntime]",
+    "optimum",
     "sqlite-vec>=0.1",
     "mcp>=1.0",
     "pydantic>=2.0",

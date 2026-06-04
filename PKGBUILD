@@ -33,8 +33,8 @@ package() {
 torch==2.12.0+cpu
 EOF
 
-    # Install pf2e-codex + all deps. optimum[onnxruntime] pulls regular
-    # onnxruntime; we overwrite it with the GPU variant below.
+    # Install pf2e-codex + deps (optimum pulls torch CPU, transformers, etc.
+    # onnxruntime is handled below by GPU detection + fallback).
     /usr/bin/pip3 install --no-cache-dir --target "$lib" \
         --constraint /tmp/pf2e-torch-constraint.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -55,6 +55,10 @@ EOF
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
         /usr/bin/pip3 install --force-reinstall --no-deps --no-cache-dir --target "$lib" \
             'onnxruntime-gpu'
+    else
+        echo "==> No GPU detected — installing onnxruntime (CPU)"
+        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
+            'onnxruntime>=1.20'
     fi
 
     # Wrapper: PYTHONPATH points to private lib, uses system python3
