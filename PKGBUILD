@@ -33,7 +33,8 @@ package() {
 torch==2.12.0+cpu
 EOF
 
-    # Install pf2e-codex + all deps, torch forced to CPU via constraint
+    # Install pf2e-codex + all deps. optimum[onnxruntime] pulls regular
+    # onnxruntime; we overwrite it with the GPU variant below.
     /usr/bin/pip3 install --no-cache-dir --target "$lib" \
         --constraint /tmp/pf2e-torch-constraint.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -42,15 +43,17 @@ EOF
     rm -f /tmp/pf2e-torch-constraint.txt
 
     # ── GPU autodetection ──
+    # --force-reinstall overwrites the CPU onnxruntime from optimum[onnxruntime]
+    # with the GPU variant (includes libonnxruntime_providers_migraphx.so).
     if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
         echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
-        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
+        /usr/bin/pip3 install --force-reinstall --no-deps --no-cache-dir --target "$lib" \
             'onnxruntime-migraphx>=1.25'
         # Fix: PyPI wheel has GNU_STACK RWE (blocked on hardened kernels)
         find "$lib/onnxruntime" -name '*.so' -exec patchelf --clear-execstack {} \; 2>/dev/null || true
     elif [ -e /opt/cuda/lib64/libcudart.so ]; then
         echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
-        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
+        /usr/bin/pip3 install --force-reinstall --no-deps --no-cache-dir --target "$lib" \
             'onnxruntime-gpu'
     fi
 
