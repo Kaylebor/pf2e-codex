@@ -83,10 +83,25 @@ class ONNXProvider(EmbeddingProvider):
         if not model_path.exists():
             raise RuntimeError("Model not exported yet")
 
-        def _make_session(providers: list[str]) -> ort.InferenceSession:
+        # MIGraphX compiled model cache (.mxr) — supported in official opt-rocm builds
+        mxr_path = self._cache_dir / "model.mxr"
+        has_mxr = mxr_path.exists()
+
+        def _provider_opts(provider_name: str) -> list[dict[str, str]]:
+            """Return provider options with .mxr cache if available."""
+            if "MIGraphX" in provider_name:
+                if has_mxr:
+                    return [{"migraphx_load_compiled_model": "1",
+                            "migraphx_load_compiled_path": str(mxr_path)}]
+                else:
+                    return [{"migraphx_save_compiled_model": "1",
+                            "migraphx_save_compiled_path": str(mxr_path)}]
+            return [{}]
+
+        def _make_session(providers: list[str], p_opts: list[dict] | None = None) -> ort.InferenceSession:
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            return ort.InferenceSession(str(model_path), opts, providers=providers)
+            return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=p_opts or [])
 
         if force_provider and force_provider not in ("auto", ""):
             provider_map = {
@@ -97,7 +112,7 @@ class ONNXProvider(EmbeddingProvider):
             }
             mapped = provider_map.get(force_provider, force_provider)
             try:
-                self._session = _make_session([mapped])
+                self._session = _make_session([mapped], _provider_opts(mapped))
             except Exception as e:
                 raise RuntimeError(f"ONNX provider '{force_provider}' unavailable: {e}")
         else:
@@ -105,7 +120,7 @@ class ONNXProvider(EmbeddingProvider):
             if not provider:
                 raise RuntimeError("No ONNX execution provider available")
             try:
-                self._session = _make_session([provider])
+                self._session = _make_session([provider], _provider_opts(provider))
             except Exception:
                 print(f"{provider} unavailable, falling back to CPU")
                 self._session = _make_session(["CPUExecutionProvider"])

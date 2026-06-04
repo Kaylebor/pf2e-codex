@@ -8,13 +8,14 @@ url="https://github.com/Kaylebor/pf2e-codex"
 license=('MIT')
 depends=(
     'python'
+    'python-onnxruntime-opt-rocm'
 )
 optdepends=(
     'migraphx: MIGraphX library for AMD GPU ONNX acceleration'
     'rocm-hip-runtime: HIP runtime for AMD GPU (needed by MIGraphX)'
     'cuda: CUDA runtime for NVIDIA GPU ONNX acceleration'
 )
-makedepends=('python-pip' 'patchelf')
+makedepends=('python-pip')
 # Build from local repo (for AUR: use GitHub tarball URL)
 source=()
 sha256sums=()
@@ -28,13 +29,13 @@ package() {
     local lib="$pkgdir/usr/share/pf2e-codex/lib"
     mkdir -p "$lib"
 
-    # Pin torch to CPU-only (onnxruntime-migraphx handles GPU inference)
+    # Pin torch to CPU-only (GPU inference handled by system opt-rocm).
+    # onnxruntime installed by pip into lib will be deleted below.
     cat > /tmp/pf2e-torch-constraint.txt << 'EOF'
 torch==2.12.0+cpu
 EOF
 
-    # Install pf2e-codex + deps (optimum pulls torch CPU, transformers, etc.
-    # onnxruntime is handled below by GPU detection + fallback).
+    # Install pf2e-codex + deps into private lib.
     /usr/bin/pip3 install --no-cache-dir --target "$lib" \
         --constraint /tmp/pf2e-torch-constraint.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -42,31 +43,25 @@ EOF
 
     rm -f /tmp/pf2e-torch-constraint.txt
 
-    # ── GPU autodetection ──
-    # --force-reinstall overwrites the CPU onnxruntime from optimum[onnxruntime]
-    # with the GPU variant (includes libonnxruntime_providers_migraphx.so).
-    if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
-        echo "==> AMD GPU/ROCm detected — installing onnxruntime-migraphx"
-        /usr/bin/pip3 install --force-reinstall --no-deps --no-cache-dir --target "$lib" \
-            'onnxruntime-migraphx>=1.25'
-        # Fix: PyPI wheel has GNU_STACK RWE (blocked on hardened kernels)
-        find "$lib/onnxruntime" -name '*.so' -exec patchelf --clear-execstack {} \; 2>/dev/null || true
-    elif [ -e /opt/cuda/lib64/libcudart.so ]; then
-        echo "==> NVIDIA GPU detected — installing onnxruntime-gpu"
-        /usr/bin/pip3 install --force-reinstall --no-deps --no-cache-dir --target "$lib" \
-            'onnxruntime-gpu'
-    else
-        echo "==> No GPU detected — installing onnxruntime (CPU)"
-        /usr/bin/pip3 install --no-deps --no-cache-dir --target "$lib" \
-            'onnxruntime>=1.20'
-    fi
+    # System python-onnxruntime-opt-rocm provides onnxruntime with MIGraphX
+    # and .mxr caching. Remove pip's version so system one is used.
+    rm -rf "$lib/onnxruntime" "$lib/onnxruntime-"*.dist-info 2>/dev/null || true
 
-    # Wrapper: PYTHONPATH points to private lib, uses system python3
+    # PEP 420 namespace packages (optimum, etc.) collide with system packages.
+    # Add empty __init__.py to any lib package dirs that lack them.
+    find "$lib" -type d -not -path '*/__pycache__*' | while IFS= read -r dir; do
+        if [ ! -f "$dir/__init__.py" ]; then
+            touch "$dir/__init__.py" 2>/dev/null || true
+        fi
+    done
+
+    # Wrapper: PYTHONPATH points to private lib first, system site-packages
+    # provide onnxruntime from opt-rocm. No -S (need system site-packages).
     mkdir -p "$pkgdir/usr/bin"
     cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
-export PYTHONPATH="/usr/share/pf2e-codex/lib"
-exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
+export PYTHONPATH="/usr/share/pf2e-codex/lib${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
