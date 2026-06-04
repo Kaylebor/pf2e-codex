@@ -44,18 +44,14 @@ EOF
     rm -f /tmp/pf2e-torch-constraint.txt
 
     # System python-onnxruntime-opt-rocm provides onnxruntime with MIGraphX
-    # and .mxr caching. Copy it into our lib so -S works (no system leak).
-    python3 -c "
+    # and .mxr caching. Remove pip's version and copy the system one.
+    rm -rf "$lib/onnxruntime" "$lib/onnxruntime-"*.dist-info 2>/dev/null || true
+    /usr/bin/python3 -c "
 import onnxruntime as ort, os, shutil, sys
 src = os.path.dirname(ort.__file__)
 dst = sys.argv[1]
 shutil.copytree(src, dst, symlinks=True)
-" "$lib/onnxruntime" 2>/dev/null || true
-    # Also copy dist-info so pip recognizes it
-    for d in /usr/lib/python3*/site-packages/onnxruntime-*.dist-info; do
-        [ -d "$d" ] && cp -r "$d" "$lib/" 2>/dev/null || true
-        break
-    done 2>/dev/null || true
+" "$lib/onnxruntime" || echo 'Warning: onnxruntime copy failed — is opt-rocm installed?'
 
     # PEP 420 namespace packages (optimum, etc.) collide with system packages.
     # Only target specific packages, not everything (would break .so modules).
