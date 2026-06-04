@@ -1,32 +1,28 @@
-# Generated data
+
+_archive/
+# Archives
+build/
 chunks.json
 chunks_v2.json
-*.db
-
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-dist/
-build/
-
-# Virtual environments
-.venv/
-venv/
-
 # Config files (user-specific)
-pf2e-codex.toml
-.pf2e-codex.toml
-
+*.db
+dist/
+*.egg-info/
+# Generated data
 # IDE
-.vscode/
 .idea/
-
-# Archives
-_archive/
-
 # makepkg artifacts (srcdir = src/ — NOW safe for makepkg -C!)
-src/
+.pf2e-codex.toml
+pf2e-codex.toml
 pkg/
 *.pkg.tar.*
+*.pyc
+__pycache__/
+# Python
+src/
 *.src.tar.*
+uv.lock
+.venv/
+venv/
+# Virtual environments
+.vscode/
