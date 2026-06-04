@@ -1,7 +1,7 @@
 """Embedding model registry with hardware-aware recommendations.
 
 Benchmarks on AMD Ryzen 7 7800X3D (8c/16t) + Radeon RX 7900 XTX (24GB) ROCm 7.2.3.
-ONNX inference via MIGraphXExecutionProvider (onnxruntime-migraphx 1.25.0).
+ONNX inference via MIGraphXExecutionProvider (official python-onnxruntime-opt-rocm).
 Steady-state throughput (post-compile), average of 50-100 runs:
 
 | Model | Params | Dim | Index Time (CPU) | Query (CPU batch=100) | Query (GPU batch=100) |

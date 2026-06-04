@@ -144,14 +144,11 @@ The tool proactively tries ONNX Runtime for faster inference. It works out of th
 
 | GPU | Install | Source |
 |-----|---------|-------|
-| AMD (ROCm 7.x) | `uv pip install onnxruntime-migraphx` | [Looong01/onnxruntime-rocm-build](https://github.com/Looong01/onnxruntime-rocm-build) |
-| AMD (ROCm 6.x) | `uv pip install -e ".[rocm]"` | PyPI |
-| NVIDIA (CUDA) | `uv pip install -e ".[cuda]"` | PyPI |
-| CPU | `uv pip install -e ".[onnx]"` | PyPI |
+| AMD (ROCm) | `uv pip install onnxruntime-rocm` | PyPI (official) |
+| NVIDIA (CUDA) | `uv pip install onnxruntime-gpu` | PyPI (official) |
+| CPU | `uv pip install onnxruntime` | PyPI (official) |
 
-> **Note:** ROCm 7.x requires `onnxruntime-migraphx` (ROCm EP removed in onnxruntime 1.23+).
-> Install from GitHub Releases:
-> `uv pip install https://github.com/Looong01/onnxruntime-rocm-build/releases/download/v1.25.0/onnxruntime_migraphx-1.25.0-cp313-cp313-manylinux_2_34_x86_64.whl`
+> **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
 
 **Performance (steady-state, 7900 XTX):**
 
