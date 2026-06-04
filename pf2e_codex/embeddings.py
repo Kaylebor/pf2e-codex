@@ -263,6 +263,16 @@ registry = ProviderRegistry()
 registry.register("onnx", ONNXProvider)
 
 
+def _install_hint() -> str:
+    """Return distro-appropriate install instructions for onnxruntime."""
+    if Path("/etc/pacman.conf").exists() or Path("/usr/bin/pacman").exists():
+        return ("\n  sudo pacman -S python-onnxruntime-opt-rocm  (AMD GPU, official)\n"
+                "  sudo pacman -S python-onnxruntime-cuda     (NVIDIA GPU, official)\n"
+                "  sudo pacman -S python-onnxruntime-cpu      (CPU only)")
+    return ("\n  pip install onnxruntime        (CPU)\n"
+            "  pip install onnxruntime-gpu       (NVIDIA GPU, CUDA)")
+
+
 def get_provider(
     model_name: str,
     provider: str = "auto",
@@ -292,9 +302,9 @@ def get_provider(
         )
 
     if not _has_onnx():
+        hint = _install_hint()
         raise RuntimeError(
-            "onnxruntime not installed. Install it with: "
-            "uv pip install optimum[onnxruntime]"
+            f"onnxruntime not installed. Install it with: {hint}"
         )
 
     force = onnx_provider if onnx_provider != "auto" else None
