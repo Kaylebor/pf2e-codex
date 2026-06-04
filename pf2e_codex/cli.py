@@ -296,6 +296,7 @@ def embed(
     all_models: bool = typer.Option(False, "--all-models", "-A", help="Embed all supported models"),
     models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to embed"),
     concurrency: int = typer.Option(1, "--concurrency", "-c", help="Max parallel models (GPU compile spikes — increase carefully)"),
+    update: bool = typer.Option(False, "--update", "-u", help="Incremental update existing DBs instead of skipping"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
 ) -> None:
     """Embed chunks for one or more models (shared fetch + chunk phase)."""
@@ -311,7 +312,7 @@ def embed(
 
     settings = _settings(data_dir=data_dir)
     from .pipeline import embed_all_models
-    embed_all_models(settings, model_list, concurrency=concurrency)
+    embed_all_models(settings, model_list, concurrency=concurrency, update=update)
 
 
 def main() -> None:

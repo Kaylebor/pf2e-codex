@@ -311,11 +311,18 @@ def embed_all_models(
     settings: Settings,
     models: list[str],
     concurrency: int = 1,
+    update: bool = False,
 ) -> dict[str, bool]:
     """Build chunks once, then export sequentially, embed in parallel.
 
     ONNX export modifies global state (GLOBALS.in_onnx_export) — must
     be sequential. Embedding is pure inference — can be parallel.
+
+    Args:
+        settings: Base settings (data_dir, release, etc.).
+        models: List of model names to embed.
+        concurrency: Max parallel embedding jobs.
+        update: If True, run incremental update on existing DBs instead of skipping.
 
     Returns {model_name: success} dict.
     """
@@ -329,26 +336,32 @@ def embed_all_models(
     print(f"Generated {len(chunks)} chunks\n")
 
     results: dict[str, bool] = {}
-    pending = []
+    pending: list[str] = []  # models needing fresh embed
+    upd_pending: list[str] = []  # models needing incremental update
 
     for model in models:
         info = get_model_info(model)
         name = info.name if info else model
         db = settings.data_dir / f"pf2e_{model.replace('/', '--')}.db"
         if db.exists():
-            print(f"[skip] {name} — DB exists")
-            results[model] = True
+            if update:
+                upd_pending.append(model)
+            else:
+                print(f"[skip] {name} — DB exists")
+                results[model] = True
         else:
             pending.append(model)
 
-    if not pending:
+    if not pending and not upd_pending:
         print("All models already indexed.")
         return results
 
+    export_pending = list(set(pending) | set(upd_pending))
+
     # — Phase 1: Sequential ONNX export —
-    print(f"Phase 1: ONNX export ({len(pending)} models, sequential)\n")
+    print(f"Phase 1: ONNX export ({len(export_pending)} models, sequential)\n")
     export_ok: set[str] = set()
-    for model in pending:
+    for model in export_pending:
         model_settings = S(
             model=model,
             data_dir=str(settings.data_dir),
@@ -366,9 +379,11 @@ def embed_all_models(
             print(f"[export] {model} FAIL: {e}")
             results[model] = False
 
-    # — Phase 2: Parallel embedding —
+    # — Phase 2: Parallel embedding/update —
     embed_pending = [m for m in pending if m in export_ok]
-    if not embed_pending:
+    upd_ok = [m for m in upd_pending if m in export_ok]
+
+    if not embed_pending and not upd_ok:
         print("\nNo models to embed.")
         return results
 
@@ -387,15 +402,40 @@ def embed_all_models(
             print(f"[FAIL] {model}: {e}")
             return (model, False)
 
-    print(f"\nPhase 2: Embedding ({len(embed_pending)} models, concurrency={concurrency})\n")
+    def _update_one(model: str) -> tuple[str, bool]:
+        ms = S(
+            model=model,
+            data_dir=str(settings.data_dir),
+            release=settings.release,
+            provider=settings.provider,
+            onnx_provider=settings.onnx_provider,
+        )
+        try:
+            update_index(ms)
+            return (model, True)
+        except Exception as e:
+            print(f"[FAIL] {model}: {e}")
+            return (model, False)
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(_embed_one, m): m for m in embed_pending}
-        for future in as_completed(futures):
-            model, ok = future.result()
-            results[model] = ok
-            status = "[done]" if ok else "[FAIL]"
-            print(f"{status}  {model}")
+    if embed_pending:
+        print(f"\nPhase 2a: Fresh embed ({len(embed_pending)} models, concurrency={concurrency})\n")
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_embed_one, m): m for m in embed_pending}
+            for future in as_completed(futures):
+                model, ok = future.result()
+                results[model] = ok
+                status = "[done]" if ok else "[FAIL]"
+                print(f"{status}  {model}")
+
+    if upd_ok:
+        print(f"\nPhase 2b: Incremental update ({len(upd_ok)} models, concurrency={concurrency})\n")
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_update_one, m): m for m in upd_ok}
+            for future in as_completed(futures):
+                model, ok = future.result()
+                results[model] = ok
+                status = "[done]" if ok else "[FAIL]"
+                print(f"{status}  {model}")
 
     print()
     failed = sum(1 for v in results.values() if not v)
