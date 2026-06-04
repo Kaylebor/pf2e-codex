@@ -4,7 +4,8 @@ post_install() {
     echo "Run 'pf2e-codex serve' to start the MCP server."
     echo ""
     echo "GPU acceleration (AMD):"
-    echo "  Install 'migraphx' and 'rocm-hip-runtime' and rebuild\n    makepkg -Cf && sudo pacman -U pf2e-codex-*.pkg.tar.zst"
+    echo "  Install 'migraphx' and 'rocm-hip-runtime' and rebuild:"
+    echo "    makepkg -Cf && sudo pacman -U pf2e-codex-*.pkg.tar.zst"
     echo "  The PKGBUILD auto-detects AMD GPUs at build time."
 }
 
