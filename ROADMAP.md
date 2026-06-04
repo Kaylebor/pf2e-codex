@@ -44,6 +44,8 @@ Ordered by impact. Check items off as completed.
 
 ## Medium Impact
 
+- [ ] **Release pipeline script** — `scripts/release-embeddings.sh`: rebuilds all officially-supported models in parallel (GPU can handle multiple 768d models concurrently with 24GB VRAM), creates tagged GitHub Releases on `pf2e-codex-data` per PF2E version + model, auto-tags `latest`. Skips models that already have a local release DB. Accepts `--version` for backfilling older PF2E releases. Developer tool, not user-facing.
+
 - [ ] **Pretty CLI output (Rich tables)** — search results, status, catalog in rich formatting.
 
 - [ ] **MCP streamable-http transport** — for remote clients. stdio works locally.
