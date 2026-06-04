@@ -363,27 +363,35 @@ def embed_all_models(
     providers: dict[str, EmbeddingProvider] = {}
 
     # — Phase 1: Sequential ONNX export + compile —
-    # Providers are cached and reused in Phase 2 (avoids double MIGraphX compile).
-    print(f"Phase 1: ONNX export + compile ({len(export_pending)} models, sequential)\n")
-    export_ok: set[str] = set()
-    for model in export_pending:
-        model_settings = S(
-            model=model,
-            data_dir=str(settings.data_dir),
-            release=settings.release,
-            provider=settings.provider,
-            onnx_provider=settings.onnx_provider,
-        )
-        try:
-            from .embeddings import get_provider as gp
-            prov = gp(model_settings.model, provider=model_settings.provider,
-                      onnx_provider=model_settings.onnx_provider)
-            providers[model] = prov
-            print(f"[export] {model} OK")
-            export_ok.add(model)
-        except Exception as e:
-            print(f"[export] {model} FAIL: {e}")
-            results[model] = False
+    # Only models without a cached ONNX export need this.
+    # Cached models skip to Phase 2 (compile happens there, in parallel).
+    from .embeddings import _onnx_cache_dir as _ocd
+    need_export = [m for m in export_pending if not (_ocd(m) / "model.onnx").exists()]
+    export_ok: set[str] = set(export_pending)  # assume all OK, mark failures
+
+    if need_export:
+        print(f"Phase 1: ONNX export + compile ({len(need_export)} models, sequential)\n")
+        for model in need_export:
+            model_settings = S(
+                model=model,
+                data_dir=str(settings.data_dir),
+                release=settings.release,
+                provider=settings.provider,
+                onnx_provider=settings.onnx_provider,
+            )
+            try:
+                from .embeddings import get_provider as gp
+                prov = gp(model_settings.model, provider=model_settings.provider,
+                          onnx_provider=model_settings.onnx_provider)
+                providers[model] = prov
+                print(f"[export] {model} OK")
+            except Exception as e:
+                print(f"[export] {model} FAIL: {e}")
+                export_ok.discard(model)
+                results[model] = False
+
+    if skip_export := [m for m in export_pending if m not in need_export]:
+        print(f"Phase 1: {len(skip_export)} models already exported (skipped)\n")
 
     # — Phase 2: Parallel embedding/update —
     embed_pending = [m for m in pending if m in export_ok]
