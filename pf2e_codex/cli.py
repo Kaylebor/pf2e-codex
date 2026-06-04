@@ -351,10 +351,11 @@ def compile(
     all_models: bool = typer.Option(False, "--all-models", "-A", help="Compile all supported models"),
     models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to compile"),
 ) -> None:
-    """Pre-compile models for MIGraphX (caches GPU kernels as .mxr files).
+    """Pre-compile models for MIGraphX (triggers GPU kernel compilation).
 
-    Run this once per model after ONNX export. Subsequent sessions skip the
-    15-90s MIGraphX compile step. Models with existing .mxr files are skipped.
+    Compilation currently happens on every session. This command runs it
+    on-demand so you see upfront when it finishes, rather than during
+    indexing. No .mxr caching — not yet supported by the wheel build.
     """
     from .models import ALL_MODEL_NAMES
     from .embeddings import _onnx_cache_dir
@@ -369,14 +370,11 @@ def compile(
 
     pending = []
     for model in model_list:
-        mxr = _onnx_cache_dir(model) / "model.mxr"
         onnx = _onnx_cache_dir(model) / "model.onnx"
-        if mxr.exists():
-            typer.echo(f"[skip] {model} — .mxr exists")
-        elif not onnx.exists():
-            typer.echo(f"[skip] {model} — no .onnx (run index/embed first)")
-        else:
+        if onnx.exists():
             pending.append(model)
+        else:
+            typer.echo(f"[skip] {model} — no .onnx (run index/embed first)")
 
     if not pending:
         typer.echo("Nothing to compile.")
