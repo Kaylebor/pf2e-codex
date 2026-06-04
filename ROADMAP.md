@@ -60,8 +60,6 @@ Ordered by impact. Check items off as completed.
 
 - [ ] **Web UI** — Gradio/Streamlit for non-MCP users.
 
-- [ ] **AGENTS.md auto-update hook** — CI check that docs match module structure.
-
 - [ ] **ONNX auto-download of ONNX runtime via install.sh** — currently user must install manually.
 
 ## Hardware Platform Expansion
