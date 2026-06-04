@@ -142,9 +142,10 @@ class ONNXProvider(EmbeddingProvider):
             kwargs = {"export": True, "trust_remote_code": True}
             try:
                 model = ORTModelForFeatureExtraction.from_pretrained(export_path, **kwargs)
-            except Exception:
-                # Fall back to local-only if network unavailable
-                print("Remote download failed, trying local cache...")
+            except (OSError, EnvironmentError, ConnectionError):
+                # Remote download failed (no network, partial cache, HF down)
+                # Retry with local-only — works for fully cached models
+                print("Remote failed, trying local cache...")
                 kwargs["local_files_only"] = True
                 model = ORTModelForFeatureExtraction.from_pretrained(export_path, **kwargs)
             transformers.utils.logging.set_verbosity_warning()
