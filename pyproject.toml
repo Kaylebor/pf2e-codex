@@ -7,6 +7,7 @@ dependencies = [
     "optimum",
     "optimum-onnx",
     "einops",
+    "onnxruntime>=1.20",
     "sqlite-vec>=0.1",
     "mcp>=1.0",
     "pydantic>=2.0",
@@ -17,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-export = ["onnxruntime>=1.20"]  # ONNX model export (one-time per model)
+export = []  # ONNX model export — deps are in core (optimum, onnxruntime)
 rocm = ["onnxruntime-rocm"]  # ROCm 6.x
 cuda = ["onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]
