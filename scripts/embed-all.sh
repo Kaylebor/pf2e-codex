@@ -15,6 +15,20 @@
 
 set -euo pipefail
 
+# Track child PIDs for cleanup on Ctrl+C
+CHILDREN=()
+cleanup() {
+    echo ""
+    echo "Interrupted — killing running jobs..."
+    for pid in "${CHILDREN[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    echo "Cleaned up."
+    exit 130
+}
+trap cleanup INT TERM
+
 DATA_DIR="${PF2E_DATA_DIR:-$HOME/.local/share/pf2e-codex}"
 CONCURRENCY=2
 MODELS=()
@@ -108,6 +122,7 @@ for model in "${PENDING[@]}"; do
             echo "FAILED" > "$RESULTS_DIR/${model//\//_}.status"
         fi
     ) &
+    CHILDREN+=($!)
 
     ACTIVE=$((ACTIVE + 1))
 done
