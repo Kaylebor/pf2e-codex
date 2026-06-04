@@ -269,8 +269,9 @@ def _install_hint() -> str:
         return ("\n  sudo pacman -S python-onnxruntime-opt-rocm  (AMD GPU, official)\n"
                 "  sudo pacman -S python-onnxruntime-cuda     (NVIDIA GPU, official)\n"
                 "  sudo pacman -S python-onnxruntime-cpu      (CPU only)")
-    return ("\n  pip install onnxruntime        (CPU)\n"
-            "  pip install onnxruntime-gpu       (NVIDIA GPU, CUDA)")
+    return ("\n  pip install onnxruntime           (CPU)\n"
+            "  pip install onnxruntime-gpu        (NVIDIA GPU)\n"
+            "  pip install onnxruntime-rocm       (AMD GPU, official — PyPI version 1.22.2)")
 
 
 def get_provider(
