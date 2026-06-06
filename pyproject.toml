@@ -7,7 +7,7 @@ dependencies = [
     "optimum",
     "optimum-onnx",
     "einops",
-    "onnxruntime>=1.20",
+
     "sqlite-vec>=0.1",
     "mcp>=1.0",
     "pydantic>=2.0",
@@ -23,10 +23,11 @@ rocm = ["onnxruntime-rocm"]  # ROCm 6.x
 cuda = ["onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]
 
-# GPU providers:
-#   - ROCm: uv pip install onnxruntime-rocm (official PyPI, version 1.22.2)
-#   - CUDA: uv pip install onnxruntime-gpu
-#   - CPU: onnxruntime is the default (pulled by core deps)
+# onnxruntime NOT in core deps — installed at build time based on GPU detection.
+# Pick one at install time:
+#   AMD: pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+#   NVIDIA: pip install onnxruntime-gpu
+#   CPU: pip install onnxruntime
 
 [project.scripts]
 pf2e-codex = "pf2e_codex.cli:main"

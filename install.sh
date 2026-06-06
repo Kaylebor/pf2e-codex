@@ -93,13 +93,13 @@ main() {
         fi
     fi
 
-    # On Arch: install system ONNX packages via paru if available
+    # On Arch: pip install the GPU-specific onnxruntime variant
     if command -v paru &>/dev/null && [[ -n "$EXTRAS" ]]; then
-        echo "Detected Arch (paru). Installing system ONNX packages..."
+        echo "Detected Arch. Installing onnxruntime variant..."
         case "$GPU" in
-            rocm)  paru -S --noconfirm python-onnxruntime-opt-rocm 2>/dev/null || paru -S --noconfirm python-onnxruntime-rocm 2>/dev/null || true ;;
-            cuda)  paru -S --noconfirm python-onnxruntime-opt-cuda 2>/dev/null || paru -S --noconfirm python-onnxruntime-cuda 2>/dev/null || true ;;
-            *)     paru -S --noconfirm python-onnxruntime-cpu 2>/dev/null || true ;;
+            rocm)  pip install 'onnxruntime-migraphx>=1.25' -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/ ;;
+            cuda)  pip install onnxruntime-gpu ;;
+            *)     pip install onnxruntime ;;
         esac
     fi
 

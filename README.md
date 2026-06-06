@@ -144,9 +144,9 @@ The tool proactively tries ONNX Runtime for faster inference. It works out of th
 
 | GPU | Install | Source |
 |-----|---------|-------|
-| AMD (ROCm) | `uv pip install onnxruntime-rocm` | PyPI (official) |
-| NVIDIA (CUDA) | `uv pip install onnxruntime-gpu` | PyPI (official) |
-| CPU | `uv pip install onnxruntime` | PyPI (official) |
+| AMD (ROCm) | `pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/` | AMD official repo |
+| NVIDIA (CUDA) | `pip install onnxruntime-gpu` | PyPI (official) |
+| CPU | `pip install onnxruntime` | PyPI (official) |
 
 > **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
 

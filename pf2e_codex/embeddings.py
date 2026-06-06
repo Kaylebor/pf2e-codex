@@ -266,12 +266,11 @@ registry.register("onnx", ONNXProvider)
 def _install_hint() -> str:
     """Return distro-appropriate install instructions for onnxruntime."""
     if Path("/etc/pacman.conf").exists() or Path("/usr/bin/pacman").exists():
-        return ("\n  sudo pacman -S python-onnxruntime-opt-rocm  (AMD GPU, official)\n"
-                "  sudo pacman -S python-onnxruntime-cuda     (NVIDIA GPU, official)\n"
-                "  sudo pacman -S python-onnxruntime-cpu      (CPU only)")
-    return ("\n  pip install onnxruntime           (CPU)\n"
-            "  pip install onnxruntime-gpu        (NVIDIA GPU)\n"
-            "  pip install onnxruntime-rocm       (AMD GPU, official — PyPI version 1.22.2)")
+        return ("\n  Rebuild package with: makepkg -Cf\n"
+                "  The PKGBUILD auto-detects GPU and installs the right variant.")
+    return ("\n  pip install onnxruntime       (CPU)\n"
+            "  pip install onnxruntime-gpu    (NVIDIA GPU)\n"
+            '  pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/  (AMD GPU)')
 
 
 def get_provider(

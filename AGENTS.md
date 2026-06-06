@@ -15,8 +15,10 @@ No pre-computed embeddings or PF2E data is shipped. Users run `pf2e-codex index`
 
 All Python deps bundled via `pip install --target` into `/usr/share/pf2e-codex/lib/`.
 Torch is pinned to CPU-only via pip constraint file to avoid NVIDIA bloat (~1.3GB total).
-ONNX runtime comes from system `python-onnxruntime-opt-rocm` (AMD) or `python-onnxruntime` (CPU).
-Only system dep is `python` + `python-onnxruntime-opt-rocm`.
+ONNX runtime chosen at build time based on GPU detection — only the relevant variant installed.
+GPU detection checks `/opt/rocm` (AMD) or `/opt/cuda` (NVIDIA) or falls back to CPU.
+AMD variant fetched from AMD's official repo: `repo.radeon.com`.
+No system package dependencies beyond `python` and `patchelf`.
 
 ## Architecture
 
@@ -173,16 +175,17 @@ ONNX is auto-detected at runtime. MIGraphX is first priority on AMD.
 For local development (outside PKGBUILD):
 
 ```bash
-# CPU
+# CPU (default, bundled by PKGBUILD when no GPU detected)
 pip install onnxruntime
 
-# AMD GPU (official)
-pip install onnxruntime-rocm
-# System libs needed: rocm-hip-sdk
+# AMD GPU (official AMD repo, ROCm 7.2+)
+pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
 
-# NVIDIA GPU (official)
+# NVIDIA GPU
 pip install onnxruntime-gpu
 ```
+
+The PKGBUILD auto-detects your GPU at build time and installs only the relevant variant.
 
 On first use per model, ONNX exports once (cached at `~/.cache/pf2e-codex/onnx/{model}/`).
 Subsequent loads skip export.
