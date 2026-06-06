@@ -23,6 +23,9 @@ rocm = ["onnxruntime-rocm"]  # ROCm 6.x
 cuda = ["onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]
 
+[tool.uv]
+dev-dependencies = ["pytest"]
+
 # onnxruntime NOT in core deps — installed at build time based on GPU detection.
 # Pick one at install time:
 #   AMD: pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
