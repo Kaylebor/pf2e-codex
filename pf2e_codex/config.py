@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     provider: str = Field(default="auto", description="Embedding provider: auto, onnx")
     onnx_provider: str = Field(default="auto", description="ONNX execution provider: auto, migraphx, rocm, cuda, cpu, none")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
-    transport: str = Field(default="stdio", description="MCP transport: stdio or sse")
+    transport: str = Field(default="stdio", description="MCP transport: stdio, sse, or streamable-http")
 
     @property
     def db(self) -> Path:

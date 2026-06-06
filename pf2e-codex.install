@@ -1,7 +1,7 @@
 post_install() {
     echo "=== PF2E Codex installed ==="
     echo "Run 'pf2e-codex index' to build your rules database."
-    echo "Run 'pf2e-codex serve' to start the MCP server."
+    echo "Run 'pf2e-codex mcp' to start the MCP server."
     echo ""
     echo "GPU acceleration (AMD):"
     echo "  Install 'migraphx' and 'rocm-hip-runtime' and rebuild:"

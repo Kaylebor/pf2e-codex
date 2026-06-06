@@ -40,7 +40,7 @@ pf2e-codex index
 pf2e-codex search "flat-footed while flanking"
 
 # Run MCP server (stdio for Claude Desktop / Cursor / pi)
-pf2e-codex serve
+pf2e-codex mcp
 ```
 
 ## Architecture
@@ -94,7 +94,7 @@ rules explanations are retrievable.
 | `pf2e-codex get "fireball"` | Fetch a single entry by slug, name, or UUID |
 | `pf2e-codex related "off-guard" --direction incoming` | Cross-reference graph |
 | `pf2e-codex models` | List embedding models with recommendations |
-| `pf2e-codex serve` | Start MCP server (stdio or sse) |
+| `pf2e-codex mcp` | Start MCP server (stdio, sse, or streamable-http) |
 
 ## Configuration
 
@@ -241,7 +241,10 @@ pf2e-codex embed --all-models -u --latest
 pf2e-codex get fury-instinct
 
 # Start MCP server (for Claude Desktop, Cursor, pi)
-pf2e-codex serve
+pf2e-codex mcp
+
+# MCP over HTTP (remote clients)
+pf2e-codex mcp -t streamable-http --host 0.0.0.0 --port 8080
 ```
 
 ## Legal

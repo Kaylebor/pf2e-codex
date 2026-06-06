@@ -135,11 +135,29 @@ pf2e-codex models                      # should list all models
 
 MCP server test:
 ```bash
-# In one terminal
-pf2e-codex serve
+# stdio (Claude Desktop, pi, Cursor)
+pf2e-codex mcp
 
-# In another (send JSON-RPC init + tools/list)
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | pf2e-codex serve
+# streamable-http (remote clients)
+pf2e-codex mcp -t streamable-http --host 0.0.0.0 --port 8080
+
+# SSE
+pf2e-codex mcp -t sse
+```
+
+Test via stdio:
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | pf2e-codex mcp
+```
+
+Test via HTTP:
+```bash
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+## Data Source
 ```
 
 ## Data Source
@@ -229,7 +247,7 @@ pf2e-codex get "Compendium.pf2e.feats.Item.ABC123"
 pf2e-codex related off-guard --direction incoming
 
 # Start MCP server (stdio, for Claude/Cursor/pi)
-pf2e-codex serve
+pf2e-codex mcp
 
 # List all supported models
 pf2e-codex models
