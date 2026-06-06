@@ -7,6 +7,7 @@ dependencies = [
     "optimum",
     "optimum-onnx",
     "einops",
+    "onnxruntime>=1.20,<1.26",
 
     "sqlite-vec>=0.1",
     "mcp>=1.0",
@@ -23,8 +24,8 @@ rocm = ["onnxruntime-rocm"]  # ROCm 6.x
 cuda = ["onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]
 
-[tool.uv]
-dev-dependencies = ["pytest"]
+[dependency-groups]
+dev = ["pytest"]
 
 # onnxruntime NOT in core deps — installed at build time based on GPU detection.
 # Pick one at install time:

@@ -17,8 +17,13 @@ DB_PATH = DATA_DIR / f"pf2e_{MODEL_SAFE}.db"
 
 
 def _search() -> object | None:
-    """Return a SearchIndex if the DB exists, else None."""
+    """Return a SearchIndex if the DB + onnxruntime are available, else None."""
     if not DB_PATH.exists():
+        return None
+    try:
+        import onnxruntime
+        onnxruntime.get_available_providers()  # verify it works
+    except Exception:
         return None
     from pf2e_codex.config import Settings
     from pf2e_codex.index import SearchIndex
@@ -26,7 +31,10 @@ def _search() -> object | None:
     return SearchIndex(s.db, s.model, s.provider, s.onnx_provider)
 
 
-needs_db = pytest.mark.skipif(not DB_PATH.exists(), reason=f"DB not found at {DB_PATH}")
+needs_db = pytest.mark.skipif(
+    not DB_PATH.exists() or _search() is None,
+    reason="DB or onnxruntime not available"
+)
 
 
 class TestSearch:
