@@ -299,7 +299,10 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
         conn.execute("DELETE FROM chunks WHERE id LIKE ?", (f"{oid}%",))
         conn.execute("DELETE FROM refs WHERE source_id LIKE ?", (f"{oid}%",))
 
-    # Update meta
+    # Update meta — refresh total_chunks after deletions
+    actual = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+        ("total_chunks", str(actual)))
     conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
         ("pf2e_release", settings.release))
     conn.commit()
