@@ -10,11 +10,11 @@ from .config import Settings, get_settings
 from .index import SearchIndex
 
 
-def create_mcp_app(settings: Settings | None = None) -> FastMCP:
+def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
     settings = settings or get_settings()
     search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
 
-    mcp = FastMCP("pf2e")
+    mcp = FastMCP("pf2e", host=host, port=port)
 
     @mcp.tool()
     def pf2e_search(
@@ -154,10 +154,15 @@ def create_mcp_app(settings: Settings | None = None) -> FastMCP:
     return mcp
 
 
-def serve(settings: Settings | None = None) -> None:
+def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> None:
     settings = settings or get_settings()
-    mcp = create_mcp_app(settings)
-    if settings.transport == "stdio":
+    mcp = create_mcp_app(settings, host=host, port=port)
+    transport = settings.transport
+    if transport == "stdio":
         mcp.run(transport="stdio")
+    elif transport == "streamable-http":
+        print(f"MCP server on http://{host}:{port}/mcp  (streamable-http)")
+        mcp.run(transport="streamable-http")
     else:
+        print(f"MCP server on http://{host}:{port}/sse  (SSE)")
         mcp.run(transport="sse")

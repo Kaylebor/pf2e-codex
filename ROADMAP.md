@@ -49,7 +49,7 @@ Ordered by impact. Check items off as completed.
 
 - [ ] **Pretty CLI output (Rich tables)** — search results, status, catalog in rich formatting.
 
-- [ ] **MCP streamable-http transport** — for remote clients. stdio works locally.
+- [x] **MCP streamable-http transport** — `pf2e-codex serve -t streamable-http --host 0.0.0.0 --port 8080`. Supports stdio, SSE, and streamable-http. Remote clients connect via HTTP POST to `/mcp`. Host/port configurable.
 
 - [ ] **Docker image** — pre-built env, volume-mount for DB.
 

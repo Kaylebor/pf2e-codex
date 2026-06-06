@@ -215,13 +215,15 @@ def models(
 def serve(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
-    transport: str = typer.Option("stdio", "--transport", "-t", help="MCP transport"),
+    transport: str = typer.Option("stdio", "--transport", "-t", help="MCP transport: stdio, sse, or streamable-http"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address (streamable-http / sse)"),
+    port: int = typer.Option(8000, "--port", "-p", help="Port (streamable-http / sse)"),
 ) -> None:
-    """Start the MCP server (stdio or sse)."""
+    """Start the MCP server (stdio, sse, or streamable-http)."""
     settings = _settings(data_dir=data_dir, model=model)
     settings.transport = transport
     from .mcp_server import serve as _serve
-    _serve(settings)
+    _serve(settings, host=host, port=port)
 
 
 @app.command()
