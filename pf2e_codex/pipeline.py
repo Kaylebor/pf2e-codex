@@ -417,7 +417,7 @@ def embed_all_models(
             onnx_provider=settings.onnx_provider,
         )
         try:
-            embed_and_index(chunks, ms, rebuild=rebuild, provider=providers[model])
+            embed_and_index(chunks, ms, rebuild=rebuild, provider=providers.get(model))
             return (model, True)
         except Exception as e:
             print(f"[FAIL] {model}: {e}")
