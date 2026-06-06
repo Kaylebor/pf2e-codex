@@ -615,6 +615,8 @@ class ChunkBuilder:
         display_name = f"{name} (formerly {old_name})" if old_name else name
 
         lines = [f"{etype}: {display_name}" + (f" ({slug})" if slug else "")]
+        if old_name:
+            lines.append(f"Also known as: {old_name}")
         if level is not None:
             lines.append(f"Level: {level}")
         if action_cost:
