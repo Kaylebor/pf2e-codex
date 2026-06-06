@@ -319,6 +319,7 @@ def embed_all_models(
     models: list[str],
     concurrency: int = 1,
     update: bool = False,
+    rebuild: bool = False,
 ) -> dict[str, bool]:
     """Build chunks once, then export sequentially, embed in parallel.
 
@@ -351,7 +352,9 @@ def embed_all_models(
         name = info.name if info else model
         db = settings.data_dir / f"pf2e_{model.replace('/', '--')}.db"
         if db.exists():
-            if update:
+            if rebuild:
+                pending.append(model)
+            elif update:
                 upd_pending.append(model)
             else:
                 print(f"[skip] {name} — DB exists")
@@ -414,7 +417,7 @@ def embed_all_models(
             onnx_provider=settings.onnx_provider,
         )
         try:
-            embed_and_index(chunks, ms, rebuild=False, provider=providers[model])
+            embed_and_index(chunks, ms, rebuild=rebuild, provider=providers[model])
             return (model, True)
         except Exception as e:
             print(f"[FAIL] {model}: {e}")

@@ -300,6 +300,7 @@ def embed(
     models: list[str] | None = typer.Option(None, "--models", "-m", help="Specific models to embed"),
     concurrency: int = typer.Option(1, "--concurrency", "-c", help="Max parallel models (GPU compile spikes — increase carefully)"),
     update: bool = typer.Option(False, "--update", "-u", help="Incremental update existing DBs instead of skipping"),
+    rebuild: bool = typer.Option(False, "--rebuild", "-f", help="Rebuild existing DBs from scratch (for chunker changes)"),
     latest: bool = typer.Option(False, "--latest", "-l", help="Fetch and update to the latest PF2E release from GitHub"),
     release: str | None = typer.Option(None, "--release", "-r", help="Specific PF2E release version (e.g. pf2e-8.2.0)"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
@@ -346,7 +347,7 @@ def embed(
         )
 
     from .pipeline import embed_all_models
-    embed_all_models(settings, model_list, concurrency=concurrency, update=update)
+    embed_all_models(settings, model_list, concurrency=concurrency, update=update, rebuild=rebuild)
 
 
 def main() -> None:
