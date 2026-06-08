@@ -89,22 +89,12 @@ EOF
     done
 
     # Wrapper: PYTHONPATH with only our lib, -S excludes system site-packages.
-    # For AMD builds, LD_LIBRARY_PATH points to bundled protobuf 34 in the onnxruntime capi dir.
+    # Bundled protobuf 34 is pre-loaded at runtime in _preload_onnx.py.
     mkdir -p "$pkgdir/usr/bin"
-    if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
-        cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
-#!/bin/sh
-PYTHONPATH="/usr/share/pf2e-codex/lib"
-LD_LIBRARY_PATH="$PYTHONPATH/onnxruntime/capi${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export PYTHONPATH LD_LIBRARY_PATH
-exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
-WRAPPER
-    else
-        cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
+    cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
 export PYTHONPATH="/usr/share/pf2e-codex/lib"
 exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
 WRAPPER
-    fi
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
