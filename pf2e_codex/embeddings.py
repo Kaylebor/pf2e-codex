@@ -85,6 +85,11 @@ class ONNXProvider(EmbeddingProvider):
 
         def _provider_opts(provider_name: str) -> list[dict[str, str]]:
             """Return provider options for the given provider."""
+            if "MIGraphX" in provider_name:
+                # Automatic .mxr cache directory (replaces deprecated migraphx_save_compiled_*)
+                cache_dir = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "migraphx_cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                return [{"migraphx_model_cache_dir": str(cache_dir)}]
             return [{}]
 
         def _make_session(providers: list[str], p_opts: list[dict] | None = None) -> ort.InferenceSession:

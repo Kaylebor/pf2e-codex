@@ -193,13 +193,20 @@ before any onnxruntime import, making them visible to transitive deps.
 If onnxruntime shows "MIGraphX not available", verify `libprotobuf.so.34.1.0` exists in
 `/usr/share/pf2e-codex/lib/onnxruntime/capi/`.
 
-### MIGraphX compiled-model caching was removed in ROCm 6.4
+### MIGraphX compiled-model caching (automatic directory cache)
 
-The `migraphx_save_compiled_*` and `migraphx_load_compiled_*` provider options were **deprecated
-and removed in ROCm 6.4** (the user's ROCm 7.2.3 no longer has them). These options cause
-"Parse Unknown provider option" errors if passed. The fix: just pass empty provider options `[{}]`
-for MIGraphX — the EP works fine without them. See:
-https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html#session-variables
+The old per-model `migraphx_save_compiled_*` / `migraphx_load_compiled_*` options were removed
+in ROCm 6.4. They were replaced by a single **automatic directory cache**:
+- **Provider option**: `migraphx_model_cache_dir`
+- **Environment variable**: `ORT_MIGRAPHX_MODEL_CACHE_PATH`
+
+When set, MIGraphX automatically caches compiled `.mxr` files in that directory with filenames
+based on model hash + GPU arch + input shapes. On subsequent loads, it skips compilation.
+
+Our code sets this to `~/.cache/pf2e-codex/onnx/migraphx_cache/`.
+
+Source: `onnxruntime/core/providers/migraphx/migraphx_execution_provider.cc` (v1.25.0).
+Docs are outdated — see https://github.com/microsoft/onnxruntime/issues/25379.
 
 ### Config priority (highest wins)
 1. CLI kwargs / function args
