@@ -32,6 +32,12 @@ def _read_endpoint() -> str | None:
         return None
 
 
+_MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+
+
 def _check_server(endpoint: str, timeout: float = 2.0) -> bool:
     """Check if MCP server is responsive at the given endpoint."""
     try:
@@ -48,7 +54,7 @@ def _check_server(endpoint: str, timeout: float = 2.0) -> bool:
                     "clientInfo": {"name": "pf2e-codex-cli", "version": "0.1.0"}
                 }
             }).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=_MCP_HEADERS,
             method="POST",
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
@@ -74,7 +80,7 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
                     "clientInfo": {"name": "pf2e-codex-cli", "version": "0.1.0"}
                 }
             }).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=_MCP_HEADERS,
             method="POST",
         )
         init_resp = urllib.request.urlopen(init_req, timeout=timeout)
@@ -82,7 +88,7 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
         session_id = init_data.get("result", {}).get("sessionId")
 
         # Send initialized notification
-        notif_headers = {"Content-Type": "application/json"}
+        notif_headers = dict(_MCP_HEADERS)
         if session_id:
             notif_headers["Mcp-Session-Id"] = session_id
         notif_req = urllib.request.Request(
@@ -97,7 +103,7 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
         urllib.request.urlopen(notif_req, timeout=timeout)
 
         # Call tool
-        call_headers = {"Content-Type": "application/json"}
+        call_headers = dict(_MCP_HEADERS)
         if session_id:
             call_headers["Mcp-Session-Id"] = session_id
         call_req = urllib.request.Request(
