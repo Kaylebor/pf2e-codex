@@ -199,16 +199,11 @@ class SearchIndex:
     @property
     def provider(self) -> EmbeddingProvider:
         if self._provider is None:
-            import sys
-            print(f"[DIAG] Creating ONNX provider for {self.model_name}", file=sys.stderr)
             self._provider = get_provider(
                 self.model_name,
                 provider=self._provider_type,
                 onnx_provider=self._onnx_provider,
             )
-        else:
-            import sys
-            print(f"[DIAG] Reusing existing provider for {self.model_name}", file=sys.stderr)
         return self._provider
 
     def _encode(self, text: str) -> list[float]:
