@@ -98,13 +98,23 @@ class Reranker:
                 return _session(["CPUExecutionProvider"])
 
     def _load_tokenizer(self):
-        """Load tokenizer from cache or original model."""
+        """Load tokenizer from cache or original model.
+
+        fix_mistral_regex=False: workaround for transformers bug
+        https://github.com/huggingface/transformers/issues/42591
+        """
         from transformers import AutoTokenizer
         cache_path = str(self._cache_dir)
         try:
-            return AutoTokenizer.from_pretrained(cache_path, local_files_only=True)
+            return AutoTokenizer.from_pretrained(
+                cache_path, local_files_only=True,
+                fix_mistral_regex=False,
+            )
         except Exception:
-            return AutoTokenizer.from_pretrained(self.model_name)
+            return AutoTokenizer.from_pretrained(
+                self.model_name,
+                fix_mistral_regex=False,
+            )
 
     def _warmup(self) -> None:
         """Run one inference to warm up MIGraphX compile."""

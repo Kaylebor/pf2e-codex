@@ -257,7 +257,7 @@ def validate(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
     onnx_provider: str = typer.Option("auto", "--onnx-provider", help="ONNX provider override"),
     mode: str = typer.Option("hybrid", "--mode", help="Search mode: hybrid or semantic"),
-    rerank: bool = typer.Option(True, "--rerank", help="Enable cross-encoder reranker"),
+    rerank: bool = typer.Option(False, "--rerank", help="Enable cross-encoder reranker"),
 ) -> None:
     """Validate retrieval quality against standard query suite."""
     from .validate import run_validation, load_queries

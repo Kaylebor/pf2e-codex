@@ -212,7 +212,7 @@ class SearchIndex:
         self, query: str, top_k: int = 5, hybrid: bool = True,
         license: str | None = None, content_type: str | None = None,
         pack: str | None = None, remaster: bool | None = None,
-        rerank: bool = True,
+        rerank: bool = False,
     ) -> list[dict]:
         self._ensure_loaded()
 
