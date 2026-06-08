@@ -89,14 +89,13 @@ class ONNXProvider(EmbeddingProvider):
 
         def _provider_opts(provider_name: str) -> list[dict[str, str]]:
             """Return provider options with .mxr cache if available."""
-            if "MIGraphX" in provider_name:
-                if has_mxr:
-                    return [{"migraphx_load_compiled_model": "1",
-                            "migraphx_load_compiled_path": str(mxr_path)}]
-                else:
-                    return [{"migraphx_save_compiled_model": "1",
-                            "migraphx_save_compiled_path": str(mxr_path)}]
-            return [{}]
+            if "MIGraphX" not in provider_name:
+                return [{}]
+            if has_mxr:
+                return [{"migraphx_load_compiled_model": "1",
+                        "migraphx_load_compiled_path": str(mxr_path)}]
+            return [{"migraphx_save_compiled_model": "1",
+                    "migraphx_save_compiled_path": str(mxr_path)}]
 
         def _make_session(providers: list[str], p_opts: list[dict] | None = None) -> ort.InferenceSession:
             opts = ort.SessionOptions()
@@ -122,8 +121,13 @@ class ONNXProvider(EmbeddingProvider):
             try:
                 self._session = _make_session([provider], _provider_opts(provider))
             except Exception:
-                print(f"{provider} unavailable, falling back to CPU")
-                self._session = _make_session(["CPUExecutionProvider"])
+                # MIGraphX may reject provider options (e.g. caching not supported).
+                # Retry without options.
+                try:
+                    self._session = _make_session([provider], [{}])
+                except Exception:
+                    print(f"{provider} unavailable, falling back to CPU")
+                    self._session = _make_session(["CPUExecutionProvider"])
 
         tokenizer_path = local_path or model_name
         self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
