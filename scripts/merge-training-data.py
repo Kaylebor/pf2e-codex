@@ -104,3 +104,7 @@ def main() -> None:
         print(f"{total_invalid} entries flagged for review in {raw_dir}/*.errors")
     else:
         print("No errors. All raw files consumed.")
+
+
+if __name__ == "__main__":
+    main()
