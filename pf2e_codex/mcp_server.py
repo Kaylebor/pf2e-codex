@@ -3,11 +3,33 @@
 from __future__ import annotations
 
 import json
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
 
 from .config import Settings, get_settings
 from .index import SearchIndex
+
+
+# Recent search history (for result flagging)
+_RECENT: deque[dict] = deque(maxlen=5)
+_FLAGGED_PATH = (get_settings().data_dir if get_settings().data_dir else Path.home() / ".local" / "share" / "pf2e-codex") / "flagged_results.jsonl"
+
+
+def _flagged_path() -> Path:
+    settings = get_settings()
+    return settings.data_dir / "flagged_results.jsonl"
+
+
+def _store_recent(query: str, results: list[dict], **params: str | int | bool | None) -> None:
+    _RECENT.append({
+        "query": query,
+        "results": results,
+        "params": params,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
@@ -57,6 +79,48 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         results = search.search(query, top_k, hybrid=hybrid, rerank=rerank,
                                 license=license, content_type=content_type,
                                 pack=pack, remaster=remaster)
+        _store_recent(query, results, top_k=top_k, hybrid=hybrid, rerank=rerank,
+                      license=license, content_type=content_type, pack=pack, remaster=remaster)
+        return json.dumps({"query": query, "results": results}, indent=2)
+
+    @mcp.tool()
+    def pf2e_flag_result(
+        result_index: int,
+        note: str = "",
+    ) -> str:
+        """Flag a search result as incorrect or low-quality.
+
+        Call this right after pf2e_search when you notice a bad result.
+        result_index: 1-based index of the bad result in the last search.
+        note: Optional description of what's wrong (e.g. "wrong entry type", "outdated rule").
+
+        Returns:
+            Confirmation message.
+        """
+        if not _RECENT:
+            return json.dumps({"error": "No recent search to flag"}, indent=2)
+
+        last = _RECENT[-1]
+        idx = result_index - 1  # convert to 0-based
+        if idx < 0 or idx >= len(last["results"]):
+            return json.dumps({
+                "error": f"result_index out of range (1-{len(last['results'])})"}, indent=2)
+
+        flagged = {
+            **last,
+            "flagged_result": last["results"][idx],
+            "result_index": result_index,
+            "note": note,
+            "flagged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        del flagged["results"]  # keep only the flagged one, not the full list
+
+        path = _flagged_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(flagged) + "\n")
+
+        return json.dumps({"ok": True, "flagged": flagged["flagged_result"]["name"]}, indent=2)
         return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()

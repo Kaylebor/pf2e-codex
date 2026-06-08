@@ -35,6 +35,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Merge subagent training data")
     parser.add_argument("--input-dir", default="training_data/raw", help="Raw JSONL input directory")
     parser.add_argument("--output", default="training_data/dataset.jsonl", help="Merged output path")
+    parser.add_argument("--validate", action="store_true", help="Run round-trip reranker validation on merged dataset")
     args = parser.parse_args()
 
     raw_dir = Path(args.input_dir)
@@ -104,6 +105,35 @@ def main() -> None:
         print(f"{total_invalid} entries flagged for review in {raw_dir}/*.errors")
     else:
         print("No errors. All raw files consumed.")
+
+    # ── Optional round-trip validation via reranker ──
+    if args.validate and output_path.exists() and total_valid > 0:
+        print(f"\nRunning round-trip validation on {total_valid} triplets...")
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from pf2e_codex.reranker import Reranker
+            reranker = Reranker()
+        except Exception as e:
+            print(f"  Skipped — reranker not available: {e}")
+            return
+
+        flipped = 0
+        from tqdm import tqdm
+        with open(output_path) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+
+        for item in tqdm(lines, desc="Validating", unit="triplet"):
+            pos_score = reranker.rerank(item["query"], [{"text": item["pos"], "id": "pos"}], top_k=1)
+            neg_score = reranker.rerank(item["query"], [{"text": item["neg"], "id": "neg"}], top_k=1)
+            if pos_score[0].get("rerank_score", 0) <= neg_score[0].get("rerank_score", 0):
+                flipped += 1
+                # Write flagged triplet to error file
+                with open(output_path.with_suffix(".flipped.jsonl"), "a") as err:
+                    err.write(json.dumps(item) + "\n")
+
+        print(f"  Round-trip: {flipped}/{total_valid} triplets where neg >= pos (written to {output_path.with_suffix('.flipped.jsonl')})")
+        if flipped / max(total_valid, 1) > 0.1:
+            print(f"  ⚠  High flip rate ({100*flipped//total_valid}%) — consider regenerating these packs")
 
 
 if __name__ == "__main__":
