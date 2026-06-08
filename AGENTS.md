@@ -15,10 +15,43 @@ No pre-computed embeddings or PF2E data is shipped. Users run `pf2e-codex index`
 
 All Python deps bundled via `pip install --target` into `/usr/share/pf2e-codex/lib/`.
 Torch is pinned to CPU-only via pip constraint file to avoid NVIDIA bloat (~1.3GB total).
-ONNX runtime chosen at build time based on GPU detection — only the relevant variant installed.
-GPU detection checks `/opt/rocm` (AMD) or `/opt/cuda` (NVIDIA) or falls back to CPU.
-AMD variant fetched from AMD's official repo: `repo.radeon.com`.
 No system package dependencies beyond `python` and `patchelf`.
+
+### ONNX: NEVER install CPU onnxruntime
+
+The CPU onnxruntime variant is NEVER installed in the PKGBUILD. This is intentional and
+mandatory — it causes file collisions (cp314-suffixed `.so` wins over GPU variant) and wastes
+build time.
+
+The correct pattern:
+```bash
+# 1. Install pf2e-codex WITHOUT transitive deps (--no-deps)
+/usr/bin/pip3 install --no-cache-dir --no-deps --target "$lib" "$startdir"
+
+# 2. Install non-onnxruntime deps from pyproject.toml
+/usr/bin/pip3 install --no-cache-dir --target "$lib" \
+    --constraint /tmp/pf2e-torch-constraint.txt \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    $(python3 -c "import tomllib, json; d=tomllib.load(open('$startdir/pyproject.toml','rb'))['project']['dependencies']; print(' '.join(json.load(open('/tmp/pf2e-non-ort-deps.json'))))")
+
+# 3. Install GPU-specific onnxruntime variant
+if [ amd ]; then
+    pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+elif [ nvidia ]; then
+    pip install onnxruntime-gpu
+else
+    pip install onnxruntime
+fi
+```
+
+Why `--no-deps`? Because `pf2e-codex` has `onnxruntime>=1.20` as a dependency. Without
+`--no-deps`, pip installs CPU onnxruntime as a transitive dep, then the GPU variant
+installs on top of it — but the cp314-suffixed `.so` files from the CPU variant remain
+and Python loads those instead of the GPU ones.
+
+If the PKGBUILD ever starts failing with "onnxruntime not installed" or
+"MIGraphX not available", check that CPU onnxruntime was NOT pulled in by the
+deps install step.
 
 ## Architecture
 
@@ -108,6 +141,22 @@ WHERE embedding MATCH vec_f32(?)
 
 ### Model prefixing is automatic
 The `ONNXProvider` handles query/document prefixes via `models.py` registry. Don't add prefixes manually.
+
+### Protobuf 34 is bundled for MIGraphX
+On systems with protobuf 35+ (CachyOS 2026+), `onnxruntime-migraphx` needs `libprotobuf.so.34`
+which is not in the system. The PKGBUILD downloads `protobuf-34.1-1-x86_64.pkg.tar.zst` from
+the Arch archive and extracts the `.so` files into `onnxruntime/capi/`.
+At runtime, `pf2e_codex/_preload_onnx.py` pre-loads these with `ctypes.CDLL(RTLD_GLOBAL)`
+before any onnxruntime import, making them visible to transitive deps.
+
+If onnxruntime shows "MIGraphX not available", verify `libprotobuf.so.34.1.0` exists in
+`/usr/share/pf2e-codex/lib/onnxruntime/capi/`.
+
+### MIGraphX compiled-model caching is probed at runtime
+`embeddings.py` probes whether `migraphx_save_compiled_path` is supported by attempting a
+minimal session creation. Some builds (e.g. onnxruntime-migraphx 1.25 + ROCm 7.2) reject
+this option. The probe result is cached for the process lifetime. If unsupported, sessions
+are created with empty provider options (MIGraphX still works, just no `.mxr` disk cache).
 
 ### Config priority (highest wins)
 1. CLI kwargs / function args
