@@ -15,7 +15,7 @@ optdepends=(
     'rocm-hip-runtime: HIP runtime for AMD GPU (needed by MIGraphX)'
     'cuda: CUDA runtime for NVIDIA GPU ONNX acceleration'
 )
-makedepends=('python-pip')
+makedepends=('python-pip' 'curl')
 # Build from local repo (for AUR: use GitHub tarball URL)
 source=()
 sha256sums=()
@@ -49,7 +49,26 @@ EOF
         /usr/bin/pip3 install --no-cache-dir --target "$lib" \
             'onnxruntime-migraphx>=1.25' \
             -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
-        # Fix: AMD wheel may have GNU_STACK RWE (blocked on hardened kernels)
+        # ── Bundle protobuf 34 (transitive dep of MIGraphX on protobuf 35+ systems) ──
+        echo "==> Bundling protobuf 34 (transitive dep of MIGraphX)"
+        local pb_url="https://archive.archlinux.org/packages/p/protobuf/protobuf-34.1-1-x86_64.pkg.tar.zst"
+        local pb_dir=$(mktemp -d)
+        curl -sL -o "$pb_dir/protobuf-34.pkg.tar.zst" "$pb_url"
+        tar -xaf "$pb_dir/protobuf-34.pkg.tar.zst" -C "$pb_dir"
+        local capi_dir=$(find "$lib" -type d -name capi -path '*/onnxruntime/capi' | head -1)
+        cp "$pb_dir/usr/lib/libprotobuf.so.34.1.0" "$capi_dir/"
+        cp "$pb_dir/usr/lib/libutf8_validity.so.34.1.0" "$capi_dir/"
+        cp "$pb_dir/usr/lib/libutf8_range.so.34.1.0" "$capi_dir/"
+        (cd "$capi_dir" && for f in *.so.34.1.0; do
+            ln -sf "$f" "${f%.1.0}"; ln -sf "$f" "${f%%.so.34.1.0}.so"
+        done)
+        rm -rf "$pb_dir"
+        # Add protobuf 34 to the provider's RPATH via LD_LIBRARY_PATH in wrapper
+        # (RPATH doesn't propagate through libmigraphx_c.so's own RPATH)
+        # Clean up stale CPU wheel files that collide
+        find "$lib/onnxruntime/capi" -name '*.cpython-*-x86_64-linux-gnu.so' -delete
+        find "$lib/onnxruntime" -path '*/capi/libonnxruntime.so.*' ! -name '*.1.25.0' -delete 2>/dev/null || true
+        # Fix GNU_STACK RWE (hardened kernels)
         find "$lib/onnxruntime" -name '*.so' -exec patchelf --clear-execstack {} \; 2>/dev/null || true
     elif [ -e /opt/cuda/lib64/libcudart.so ]; then
         echo "==> NVIDIA GPU detected — onnxruntime-gpu"
@@ -70,12 +89,22 @@ EOF
     done
 
     # Wrapper: PYTHONPATH with only our lib, -S excludes system site-packages.
-    # onnxruntime is copied into lib from system opt-rocm during build.
+    # For AMD builds, LD_LIBRARY_PATH points to bundled protobuf 34 in the onnxruntime capi dir.
     mkdir -p "$pkgdir/usr/bin"
-    cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
+    if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
+        cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
+#!/bin/sh
+PYTHONPATH="/usr/share/pf2e-codex/lib"
+LD_LIBRARY_PATH="$PYTHONPATH/onnxruntime/capi${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PYTHONPATH LD_LIBRARY_PATH
+exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
+WRAPPER
+    else
+        cat > "$pkgdir/usr/bin/pf2e-codex" << 'WRAPPER'
 #!/bin/sh
 export PYTHONPATH="/usr/share/pf2e-codex/lib"
 exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
 WRAPPER
+    fi
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 }
