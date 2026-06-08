@@ -255,54 +255,37 @@ class SearchIndex:
             for r in semantic_raw
         ]
 
-        # 2. Name bag-of-words search (for hybrid mode)
-        _STOP_WORDS = frozenset({
-            'spell', 'feat', 'action', 'effect', 'item', 'weapon', 'armor',
-            'equipment', 'condition', 'ability', 'feature', 'class',
-            'ancestry', 'background', 'heritage', 'deity', 'hazard',
-            'vehicle', 'familiar', 'npc', 'creature', 'monster', 'ritual',
-        })
-        like_results: list[tuple[str, dict]] = []
+        # 2. FTS5 full-text search (replaces name bag-of-words LIKE)
+        fts_results: list[tuple[str, dict]] = []
         if hybrid:
-            words = [
-                w.strip().lower() for w in query.split()
-                if len(w.strip()) > 2 and w.strip().lower() not in _STOP_WORDS
-            ]
+            words = [w.strip().lower() for w in query.split() if len(w.strip()) > 2]
             if words:
                 try:
-                    like_conditions = " OR ".join(["LOWER(name) LIKE ?" for _ in words])
-                    like_params = [f"%{w}%" for w in words]
-                    # Params: LIKE terms, WHERE filter values, then LIMIT
-                    like_raw = self._conn.execute(f"""
-                        SELECT id, name, type, pack, text, license, remaster
-                        FROM chunks
-                        WHERE ({like_conditions}) AND {where}
+                    self._ensure_fts()
+                    fts_query = " AND ".join(f'"{w}"' for w in words)
+                    fts_raw = self._conn.execute(f"""
+                        SELECT c.id, c.name, c.type, c.pack, c.text, c.license, c.remaster, rank
+                        FROM fts_chunks
+                        JOIN chunks c ON c.rowid = fts_chunks.rowid
+                        WHERE fts_chunks MATCH ? AND {where}
+                        ORDER BY rank
                         LIMIT ?
-                    """, like_params + params + [top_k * 3]).fetchall()
-                    scored: dict[str, tuple[tuple, int]] = {}
-                    for r in like_raw:
-                        cid = r[0]
-                        match_count = sum(1 for w in words if w in r[1].lower())
-                        if match_count > 0:
-                            existing = scored.get(cid)
-                            if not existing or existing[1] < match_count:
-                                scored[cid] = (r, match_count)
-                    sorted_entries = sorted(scored.values(), key=lambda x: -x[1])
-                    for r, _mc in sorted_entries[:top_k * 3]:
-                        like_results.append((r[0], {
+                    """, [fts_query] + params + [top_k * 3]).fetchall()
+                    for r in fts_raw:
+                        fts_results.append((r[0], {
                             "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
                             "text": r[4], "license": r[5],
                             "remaster": bool(r[6]) if r[6] is not None else None,
-                            "distance": None,
+                            "distance": r[7],
                         }))
                 except Exception:
                     pass
 
-        # 3. Build results
+        # 3. Build results — hybrid: semantic embeddings + FTS5 full-text
         if not hybrid:
             results = [r for _, r in semantic_results[:top_k]]
         else:
-            results = _rrf_fuse(semantic_results, like_results, top_k=top_k)
+            results = _rrf_fuse(semantic_results, fts_results, top_k=top_k)
 
         # 4. Enrich with refs, legacy names, confidence
         self._enrich_results(results)
