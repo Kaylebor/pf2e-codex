@@ -193,11 +193,13 @@ before any onnxruntime import, making them visible to transitive deps.
 If onnxruntime shows "MIGraphX not available", verify `libprotobuf.so.34.1.0` exists in
 `/usr/share/pf2e-codex/lib/onnxruntime/capi/`.
 
-### MIGraphX compiled-model caching is probed at runtime
-`embeddings.py` probes whether `migraphx_save_compiled_path` is supported by attempting a
-minimal session creation. Some builds (e.g. onnxruntime-migraphx 1.25 + ROCm 7.2) reject
-this option. The probe result is cached for the process lifetime. If unsupported, sessions
-are created with empty provider options (MIGraphX still works, just no `.mxr` disk cache).
+### MIGraphX compiled-model caching was removed in ROCm 6.4
+
+The `migraphx_save_compiled_*` and `migraphx_load_compiled_*` provider options were **deprecated
+and removed in ROCm 6.4** (the user's ROCm 7.2.3 no longer has them). These options cause
+"Parse Unknown provider option" errors if passed. The fix: just pass empty provider options `[{}]`
+for MIGraphX — the EP works fine without them. See:
+https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html#session-variables
 
 ### Config priority (highest wins)
 1. CLI kwargs / function args
