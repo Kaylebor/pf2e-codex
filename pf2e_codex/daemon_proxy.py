@@ -38,6 +38,21 @@ _MCP_HEADERS = {
 }
 
 
+def _parse_sse_response(raw: str) -> dict | None:
+    """Parse SSE response to extract JSON-RPC result."""
+    for line in raw.split("\n"):
+        if line.startswith("data: "):
+            try:
+                return json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+    # Try parsing as plain JSON (in case json_response mode is enabled)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 def _check_server(endpoint: str, timeout: float = 2.0) -> bool:
     """Check if MCP server is responsive at the given endpoint."""
     try:
@@ -58,8 +73,9 @@ def _check_server(endpoint: str, timeout: float = 2.0) -> bool:
             method="POST",
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
-        data = json.loads(resp.read())
-        return "result" in data
+        raw = resp.read().decode()
+        data = _parse_sse_response(raw)
+        return data is not None and "result" in data
     except Exception:
         return False
 
@@ -84,7 +100,8 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
             method="POST",
         )
         init_resp = urllib.request.urlopen(init_req, timeout=timeout)
-        init_data = json.loads(init_resp.read())
+        init_raw = init_resp.read().decode()
+        init_data = _parse_sse_response(init_raw)
         session_id = init_data.get("result", {}).get("sessionId")
 
         # Send initialized notification
@@ -121,7 +138,8 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
             method="POST",
         )
         call_resp = urllib.request.urlopen(call_req, timeout=timeout)
-        call_data = json.loads(call_resp.read())
+        call_raw = call_resp.read().decode()
+        call_data = _parse_sse_response(call_raw)
 
         # Extract result from MCP response
         result = call_data.get("result", {})
