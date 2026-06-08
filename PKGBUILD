@@ -34,20 +34,25 @@ package() {
 torch==2.12.0+cpu
 EOF
 
-    # Install pf2e-codex + all deps (including onnxruntime CPU variant).
-    # We'll remove onnxruntime below and replace with the GPU-specific variant.
+    # Install pf2e-codex WITHOUT transitive deps (we pick the right onnxruntime variant below).
+    /usr/bin/pip3 install --no-cache-dir --no-deps --target "$lib" "$startdir"
+
+    # Install non-onnxruntime deps from pyproject.toml (optimum, einops, sqlite-vec, etc.)
+    python3 -c "
+import tomllib, json
+with open('$startdir/pyproject.toml', 'rb') as f:
+    deps = tomllib.load(f)['project']['dependencies']
+filtered = [d for d in deps if 'onnxruntime' not in d]
+print(json.dumps(filtered))
+" > /tmp/pf2e-non-ort-deps.json
     /usr/bin/pip3 install --no-cache-dir --target "$lib" \
         --constraint /tmp/pf2e-torch-constraint.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu \
-        "$startdir"
-
-    rm -f /tmp/pf2e-torch-constraint.txt
+        $(python3 -c "import json; print(' '.join(json.load(open('/tmp/pf2e-non-ort-deps.json'))))")
+    rm -f /tmp/pf2e-non-ort-deps.json /tmp/pf2e-torch-constraint.txt
 
     # ── GPU detection ──
-    # Strip CPU onnxruntime that was pulled in as a transitive dep.
-    # Will be replaced with the right variant below.
-    rm -rf "$lib/onnxruntime" "$lib/onnxruntime-"*.dist-info "$lib/onnxruntime_migraphx-"*.dist-info 2>/dev/null || true
-    # Install ONLY the onnxruntime variant for this hardware. No fallbacks.
+    # Install ONLY the onnxruntime variant for this hardware. No fallbacks, no CPU variant ever.
     if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
         echo "==> AMD GPU detected — onnxruntime-migraphx from AMD repo"
         /usr/bin/pip3 install --no-cache-dir --target "$lib" \

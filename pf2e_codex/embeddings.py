@@ -87,15 +87,37 @@ class ONNXProvider(EmbeddingProvider):
         mxr_path = self._cache_dir / "model.mxr"
         has_mxr = mxr_path.exists()
 
+        # Cache whether MIGraphX supports compiled-model options.
+        # Some builds (e.g. onnxruntime-migraphx 1.25 + ROCm 7.2) reject
+        # migraphx_save_compiled_path. We probe once and fall back to empty options.
+        _migraphx_cache_ok = False
+
         def _provider_opts(provider_name: str) -> list[dict[str, str]]:
-            """Return provider options with .mxr cache if available."""
+            nonlocal _migraphx_cache_ok
             if "MIGraphX" not in provider_name:
                 return [{}]
-            if has_mxr:
+            if not _migraphx_cache_ok:
+                # Probe whether caching options are supported
+                try:
+                    opts = ort.SessionOptions()
+                    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                    test_opts = {"migraphx_save_compiled_model": "1",
+                                "migraphx_save_compiled_path": "/tmp/_pf2e_migraphx_probe.mxr"}
+                    _ = ort.InferenceSession(str(model_path), opts,
+                        providers=["MIGraphXExecutionProvider"],
+                        provider_options=[test_opts])
+                    _migraphx_cache_ok = True
+                except Exception:
+                    _migraphx_cache_ok = False
+            if not _migraphx_cache_ok:
+                return [{}]
+            if has_mxr and _migraphx_cache_ok:
                 return [{"migraphx_load_compiled_model": "1",
                         "migraphx_load_compiled_path": str(mxr_path)}]
-            return [{"migraphx_save_compiled_model": "1",
-                    "migraphx_save_compiled_path": str(mxr_path)}]
+            if _migraphx_cache_ok:
+                return [{"migraphx_save_compiled_model": "1",
+                        "migraphx_save_compiled_path": str(mxr_path)}]
+            return [{}]
 
         def _make_session(providers: list[str], p_opts: list[dict] | None = None) -> ort.InferenceSession:
             opts = ort.SessionOptions()
@@ -121,13 +143,8 @@ class ONNXProvider(EmbeddingProvider):
             try:
                 self._session = _make_session([provider], _provider_opts(provider))
             except Exception:
-                # MIGraphX may reject provider options (e.g. caching not supported).
-                # Retry without options.
-                try:
-                    self._session = _make_session([provider], [{}])
-                except Exception:
-                    print(f"{provider} unavailable, falling back to CPU")
-                    self._session = _make_session(["CPUExecutionProvider"])
+                print(f"{provider} unavailable, falling back to CPU")
+                self._session = _make_session(["CPUExecutionProvider"])
 
         tokenizer_path = local_path or model_name
         self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
