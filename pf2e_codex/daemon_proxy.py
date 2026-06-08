@@ -100,9 +100,8 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
             method="POST",
         )
         init_resp = urllib.request.urlopen(init_req, timeout=timeout)
-        init_raw = init_resp.read().decode()
-        init_data = _parse_sse_response(init_raw)
-        session_id = init_data.get("result", {}).get("sessionId")
+        session_id = init_resp.headers.get("mcp-session-id")
+        init_resp.read()  # consume body
 
         # Send initialized notification
         notif_headers = dict(_MCP_HEADERS)
