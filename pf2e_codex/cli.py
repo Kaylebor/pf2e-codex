@@ -261,7 +261,7 @@ def mcp_cmd(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     transport: str = typer.Option("stdio", "--transport", "-t", help="MCP transport: stdio, sse, or streamable-http"),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address (streamable-http / sse)"),
-    port: int = typer.Option(0, "--port", "-p", help="Port (streamable-http / sse, 0 = auto-pick)"),
+    port: int = typer.Option(14141, "--port", "-p", help="Port (streamable-http / sse, default 14141)"),
 ) -> None:
     """Start the MCP server (for Claude, pi, Cursor, etc.)."""
     settings = _settings(data_dir=data_dir, model=model)

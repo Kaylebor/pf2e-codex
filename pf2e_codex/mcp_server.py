@@ -21,11 +21,33 @@ from .index import SearchIndex
 _SERVER_JSON: Path | None = None
 
 
-def _find_free_port(host: str = "127.0.0.1") -> int:
-    """Find a free TCP port on the given host."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, 0))
-        return s.getsockname()[1]
+def _check_port_free(host: str, port: int) -> bool:
+    """Check if a port is free on the given host."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def _pick_port(host: str, preferred: int) -> int:
+    """Return preferred port if free, otherwise find a free one."""
+    if _check_port_free(host, preferred):
+        return preferred
+    # Preferred port occupied — find any free port
+    import random
+    for _ in range(50):
+        candidate = random.randint(10000, 60000)
+        if _check_port_free(host, candidate):
+            print(
+                f"Port {preferred} in use, using {candidate} instead."
+                f" Update your MCP config to http://127.0.0.1:{candidate}/mcp",
+                file=sys.stderr,
+            )
+            return candidate
+    # Last resort
+    return _find_free_port(host)
 
 
 def _write_server_json(host: str, port: int, transport: str) -> Path:
@@ -275,14 +297,16 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
     return mcp
 
 
-def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 0) -> None:
+DEFAULT_PORT = 14141
+
+
+def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> None:
     settings = settings or get_settings()
     transport = settings.transport
 
-    # For HTTP transports, auto-pick port if not specified and write server.json
+    # For HTTP transports, check port availability and write server.json
     if transport in ("streamable-http", "sse"):
-        if port == 0:
-            port = _find_free_port(host)
+        port = _pick_port(host, port)
         global _SERVER_JSON
         _SERVER_JSON = _write_server_json(host, port, transport)
         _register_cleanup()

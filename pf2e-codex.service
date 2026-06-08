@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/pf2e-codex mcp -t streamable-http
+ExecStart=/usr/bin/pf2e-codex mcp -t streamable-http --port 14141
 Restart=on-failure
 RestartSec=5
 
