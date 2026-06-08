@@ -28,6 +28,7 @@ def run_validation(
     provider: str = "auto",
     onnx_provider: str | None = None,
     top_k: int = 10,
+    rerank: bool = True,
 ) -> dict:
     """Run the query suite and return metrics."""
     from .index import SearchIndex
@@ -37,7 +38,7 @@ def run_validation(
     results = []
 
     for q in queries:
-        hits = search.search(q["query"], top_k=top_k, hybrid=hybrid)
+        hits = search.search(q["query"], top_k=top_k, hybrid=hybrid, rerank=rerank)
         names = [r["name"] for r in hits]
         rank = next((i + 1 for i, n in enumerate(names) if q["expected"].lower() in n.lower()), None)
         results.append({
