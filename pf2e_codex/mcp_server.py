@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import atexit
 import json
+import signal
+import socket
+import sys
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +15,55 @@ from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
 
 from .config import Settings, get_settings
 from .index import SearchIndex
+
+
+# Server endpoint file — CLI reads this to detect running server
+_SERVER_JSON: Path | None = None
+
+
+def _find_free_port(host: str = "127.0.0.1") -> int:
+    """Find a free TCP port on the given host."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def _write_server_json(host: str, port: int, transport: str) -> Path:
+    """Write server endpoint to server.json for CLI auto-detection."""
+    settings = get_settings()
+    path = settings.data_dir / "server.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "endpoint": f"http://{host}:{port}/mcp",
+        "host": host,
+        "port": port,
+        "transport": transport,
+        "pid": __import__("os").getpid(),
+    }
+    path.write_text(json.dumps(data, indent=2))
+    return path
+
+
+def _cleanup_server_json() -> None:
+    """Remove server.json on shutdown."""
+    global _SERVER_JSON
+    if _SERVER_JSON and _SERVER_JSON.exists():
+        _SERVER_JSON.unlink(missing_ok=True)
+        _SERVER_JSON = None
+
+
+def _register_cleanup() -> None:
+    """Register cleanup handlers for graceful shutdown."""
+    atexit.register(_cleanup_server_json)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        prev = signal.getsignal(sig)
+        def _handler(signum, frame, _prev=prev):
+            _cleanup_server_json()
+            if callable(_prev):
+                _prev(signum, frame)
+            elif _prev == signal.SIG_DFL:
+                sys.exit(128 + signum)
+        signal.signal(sig, _handler)
 
 
 # Recent search history (for result flagging)
@@ -222,15 +275,25 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
     return mcp
 
 
-def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> None:
+def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 0) -> None:
     settings = settings or get_settings()
-    mcp = create_mcp_app(settings, host=host, port=port)
     transport = settings.transport
+
+    # For HTTP transports, auto-pick port if not specified and write server.json
+    if transport in ("streamable-http", "sse"):
+        if port == 0:
+            port = _find_free_port(host)
+        global _SERVER_JSON
+        _SERVER_JSON = _write_server_json(host, port, transport)
+        _register_cleanup()
+
+    mcp = create_mcp_app(settings, host=host, port=port)
+
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "streamable-http":
-        print(f"MCP server on http://{host}:{port}/mcp  (streamable-http)")
+        print(f"MCP server on http://{host}:{port}/mcp  (streamable-http)", file=sys.stderr)
         mcp.run(transport="streamable-http")
     else:
-        print(f"MCP server on http://{host}:{port}/sse  (SSE)")
+        print(f"MCP server on http://{host}:{port}/sse  (SSE)", file=sys.stderr)
         mcp.run(transport="sse")

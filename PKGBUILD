@@ -109,4 +109,7 @@ export PYTHONPATH="/usr/share/pf2e-codex/lib"
 exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
+
+    # SystemD user service (disabled by default)
+    install -Dm644 "$startdir/pf2e-codex.service" "$pkgdir/usr/lib/systemd/user/pf2e-codex.service"
 }

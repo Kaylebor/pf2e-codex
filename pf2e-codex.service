@@ -1,0 +1,12 @@
+[Unit]
+Description=PF2E Codex MCP Server
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/pf2e-codex mcp -t streamable-http
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

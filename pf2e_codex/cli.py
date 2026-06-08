@@ -86,6 +86,11 @@ def search(
     rerank: bool = typer.Option(False, "--rerank", help="Enable cross-encoder reranker"),
 ) -> None:
     """Search the PF2E index."""
+    from .daemon_proxy import proxy_search
+    result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank)
+    if result:
+        print_search_results(result.get("results", []), query)
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
@@ -99,6 +104,17 @@ def get(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
 ) -> None:
     """Fetch a single entry by its ID or Foundry UUID."""
+    from .daemon_proxy import proxy_get_entry
+    result = proxy_get_entry(entry_id)
+    if result:
+        if "error" in result:
+            typer.echo(result["error"], err=True)
+            raise typer.Exit(code=1)
+        typer.echo(f"[{result['type']}] {result['name']} ({result['pack']})")
+        typer.echo(f"ID: {result['id']}")
+        typer.echo()
+        typer.echo(result["text"])
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     result = search_idx.fetch_by_id(entry_id)
@@ -121,6 +137,21 @@ def related(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
 ) -> None:
     """Find entries related by cross-references."""
+    from .daemon_proxy import proxy_related
+    result = proxy_related(entry_id, direction, limit)
+    if result:
+        results = result.get("results", {})
+        if results.get("outgoing"):
+            typer.echo(f"\n{entry_id} references:")
+            for r in results["outgoing"]:
+                typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')[:100]}")
+        if results.get("incoming"):
+            typer.echo(f"\nEntries referencing {entry_id}:")
+            for r in results["incoming"]:
+                typer.echo(f"  [{r['type']}] {r['name']} ({r['pack']}) — {r.get('context', '')[:100]}")
+        if not results.get("outgoing") and not results.get("incoming"):
+            typer.echo("No related entries found.")
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.related(entry_id, direction, limit)
@@ -142,6 +173,12 @@ def status(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
 ) -> None:
     """Show index status."""
+    from .daemon_proxy import proxy_status
+    meta = proxy_status()
+    if meta:
+        meta["model"] = meta.get("model", "unknown")
+        print_status(meta)
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     meta = search_idx.status()
@@ -156,6 +193,11 @@ def catalog(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
 ) -> None:
     """Show the structure of the PF2E database."""
+    from .daemon_proxy import proxy_catalog
+    cat = proxy_catalog()
+    if cat:
+        print_catalog(cat)
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     cat = search_idx.catalog()
@@ -219,7 +261,7 @@ def mcp_cmd(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     transport: str = typer.Option("stdio", "--transport", "-t", help="MCP transport: stdio, sse, or streamable-http"),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address (streamable-http / sse)"),
-    port: int = typer.Option(8000, "--port", "-p", help="Port (streamable-http / sse)"),
+    port: int = typer.Option(0, "--port", "-p", help="Port (streamable-http / sse, 0 = auto-pick)"),
 ) -> None:
     """Start the MCP server (for Claude, pi, Cursor, etc.)."""
     settings = _settings(data_dir=data_dir, model=model)
