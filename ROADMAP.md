@@ -55,7 +55,7 @@ Ordered by impact. Check items off as completed.
   - Data: subagents read raw pack JSONs (`~/.cache/pf2e-codex/extract-*/`), generate `(query, positive_chunk, negative_chunk)` triplets per pack (~2000-3000 total).
   - Sampling: per-pack strategy, parallel subagents via `pi subagents`, output JSONL.
   - Training: `flagembedding`'s `train_reranker.py` via `uv run`, ~1-2h on 7900 XTX.
-  - Storage: Push merged LoRA ONNX model to HuggingFace Hub (`kaylebor/pf2e-codex-reranker`). Private or public — weights encode relevance patterns, not rule text (ORC-safe).
+  - Storage: Push merged LoRA ONNX model to HuggingFace Hub (`kaylebor/pf2e-codex-reranker`). Include `NOTICE` in HF repo crediting Paizo + Wizards under ORC + OGL 1.0a.
   - Config: `reranker_model = "kaylebor/pf2e-codex-reranker"` in `config.toml` — loads from HF Hub automatically.
   - Expected lift: 0.893 → ~0.92-0.95 MRR. Falls back to hybrid-only if fine-tuned model absent.
 
