@@ -49,7 +49,13 @@ Ordered by impact. Check items off as completed.
 
 - [ ] **Pretty CLI output (Rich tables)** — search results, status, catalog in rich formatting.
 
-- [x] **MCP streamable-http transport** — `pf2e-codex serve -t streamable-http --host 0.0.0.0 --port 8080`. Supports stdio, SSE, and streamable-http. Remote clients connect via HTTP POST to `/mcp`. Host/port configurable.
+- [x] **MCP streamable-http transport** — `pf2e-codex mcp -t streamable-http --host 0.0.0.0 --port 8080`. Supports stdio, SSE, and streamable-http. Remote clients connect via HTTP POST to `/mcp`. Host/port configurable.
+
+- [ ] **Cross-encoder reranker fine-tuning** — train `bge-reranker-v2-m3` on PF2E rules domain.
+  - Data: subagents read raw pack JSONs (`~/.cache/pf2e-codex/extract-*/`), generate `(query, positive_chunk, negative_chunk)` triplets per pack (~2000-3000 total).
+  - Sampling: per-pack strategy, parallel subagents via `pi subagents`, output JSONL.
+  - Training: `flagembedding`'s `train_reranker.py` via `uv run`, ~1-2h on 7900 XTX.
+  - Expected lift: 0.893 → ~0.92-0.95 MRR. Falls back to hybrid-only if fine-tuned model absent.
 
 - [ ] **Docker image** — pre-built env, volume-mount for DB.
 
