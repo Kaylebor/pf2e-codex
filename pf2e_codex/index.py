@@ -138,6 +138,7 @@ class SearchIndex:
         self._provider_type = provider
         self._onnx_provider = onnx_provider
         self._provider: EmbeddingProvider | None = None
+        self._reranker: Any | None = None
         self._dim: int | None = None
         self._conn: sqlite3.Connection | None = None
         self._fts_ready: bool = False
@@ -211,6 +212,7 @@ class SearchIndex:
         self, query: str, top_k: int = 5, hybrid: bool = True,
         license: str | None = None, content_type: str | None = None,
         pack: str | None = None, remaster: bool | None = None,
+        rerank: bool = False,
     ) -> list[dict]:
         self._ensure_loaded()
 
@@ -282,13 +284,26 @@ class SearchIndex:
                     pass
 
         # 3. Build results — hybrid: semantic embeddings + FTS5 full-text
+        rrf_top_k = top_k * 10 if rerank else top_k  # more candidates for reranker
         if not hybrid:
-            results = [r for _, r in semantic_results[:top_k]]
+            results = [r for _, r in semantic_results[:rrf_top_k]]
         else:
-            results = _rrf_fuse(semantic_results, fts_results, top_k=top_k)
+            results = _rrf_fuse(semantic_results, fts_results, top_k=rrf_top_k)
 
         # 4. Enrich with refs, legacy names, confidence
         self._enrich_results(results)
+
+        # Optional second-stage cross-encoder reranking
+        if rerank and len(results) > 1:
+            try:
+                if self._reranker is None:
+                    from .reranker import Reranker
+                    self._reranker = Reranker()
+                # Use RRF top 50 as candidates, rerank to top_k
+                results = self._reranker.rerank(query, results, top_k=top_k)
+            except Exception as e:
+                print(f"Reranker failed: {e}")
+
         return results
 
     def _enrich_results(self, results: list[dict]) -> None:

@@ -83,11 +83,12 @@ def search(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
+    rerank: bool = typer.Option(False, "--rerank", help="Enable cross-encoder reranker"),
 ) -> None:
     """Search the PF2E index."""
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
-    results = search_idx.search(query, top_k, hybrid=True)
+    results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
     print_search_results(results, query)
 
 
