@@ -345,6 +345,9 @@ pf2e-codex related off-guard --direction incoming
 # Start MCP server (stdio, for Claude/Cursor/pi)
 pf2e-codex mcp
 
+# Start MCP server (streamable-http, auto-pick port)
+pf2e-codex mcp -t streamable-http
+
 # List all supported models
 pf2e-codex models
 
@@ -356,6 +359,31 @@ pf2e-codex validate --mode semantic
 pf2e-codex benchmark
 pf2e-codex benchmark --models "all-MiniLM-L6-v2,bge-m3" --providers "cpu"
 ```
+
+### Daemon proxy (auto-detection)
+
+CLI query commands (search, get, related, status, catalog) auto-detect a running
+MCP server and proxy queries to it. This avoids MIGraphX compilation overhead (~7s)
+for each CLI invocation.
+
+```bash
+# Start server in background (auto-picks port, writes server.json)
+pf2e-codex mcp -t streamable-http &
+
+# CLI queries now proxy to the server (~0.1s instead of ~7s)
+pf2e-codex search fireball
+pf2e-codex get fury-instinct
+```
+
+SystemD user service (optional):
+```bash
+systemctl --user enable pf2e-codex
+systemctl --user start pf2e-codex
+```
+
+The server writes `~/.local/share/pf2e-codex/server.json` with the endpoint.
+CLI reads this file to detect the server. If server is not responsive, falls back
+to local inference.
 
 ## Dependencies
 
