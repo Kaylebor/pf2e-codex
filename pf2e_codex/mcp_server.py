@@ -112,6 +112,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
     search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
 
     mcp = FastMCP("pf2e", host=host, port=port)
+    mcp._search_index = search  # prevent GC — keep provider alive across requests
 
     @mcp.tool()
     def pf2e_search(
