@@ -34,7 +34,8 @@ package() {
 torch==2.12.0+cpu
 EOF
 
-    # Install pf2e-codex + deps (no onnxruntime — pulled separately below).
+    # Install pf2e-codex + all deps (including onnxruntime CPU variant).
+    # We'll remove onnxruntime below and replace with the GPU-specific variant.
     /usr/bin/pip3 install --no-cache-dir --target "$lib" \
         --constraint /tmp/pf2e-torch-constraint.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -43,6 +44,9 @@ EOF
     rm -f /tmp/pf2e-torch-constraint.txt
 
     # ── GPU detection ──
+    # Strip CPU onnxruntime that was pulled in as a transitive dep.
+    # Will be replaced with the right variant below.
+    rm -rf "$lib/onnxruntime" "$lib/onnxruntime-"*.dist-info "$lib/onnxruntime_migraphx-"*.dist-info 2>/dev/null || true
     # Install ONLY the onnxruntime variant for this hardware. No fallbacks.
     if [ -e /opt/rocm/lib/libamdhip64.so ] || [ -e /opt/rocm/lib/libamdhip64.so.7 ]; then
         echo "==> AMD GPU detected — onnxruntime-migraphx from AMD repo"
@@ -66,7 +70,10 @@ EOF
         # Add protobuf 34 to the provider's RPATH via LD_LIBRARY_PATH in wrapper
         # (RPATH doesn't propagate through libmigraphx_c.so's own RPATH)
         # Clean up stale CPU wheel files that collide
+        # (CPU 1.26.0 ships onnxruntime_pybind11_state.cpython-314-*.so which
+        #  Python prefers over migraphx's onnxruntime_pybind11_state.so)
         find "$lib/onnxruntime/capi" -name '*.cpython-*-x86_64-linux-gnu.so' -delete
+        find "$lib/onnxruntime/capi" -name '*.cpython-*-aarch64-linux-gnu.so' -delete 2>/dev/null || true
         find "$lib/onnxruntime" -path '*/capi/libonnxruntime.so.*' ! -name '*.1.25.0' -delete 2>/dev/null || true
         # Fix GNU_STACK RWE (hardened kernels)
         find "$lib/onnxruntime" -name '*.so' -exec patchelf --clear-execstack {} \; 2>/dev/null || true
