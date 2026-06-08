@@ -34,7 +34,7 @@ def _store_recent(query: str, results: list[dict], **params: str | int | bool | 
 
 def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
     settings = settings or get_settings()
-    search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
 
     mcp = FastMCP("pf2e", host=host, port=port)
 

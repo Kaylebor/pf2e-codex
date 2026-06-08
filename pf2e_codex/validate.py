@@ -32,7 +32,7 @@ def run_validation(
 ) -> dict:
     """Run the query suite and return metrics."""
     from .index import SearchIndex
-    search = SearchIndex(db_path, model_name, provider=provider, onnx_provider=onnx_provider)
+    search = SearchIndex(db_path, model_name, provider=provider, onnx_provider=onnx_provider, reranker_model="")
 
     queries = load_queries()
     results = []

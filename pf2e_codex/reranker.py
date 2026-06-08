@@ -17,7 +17,10 @@ _RERANKER_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "reranker"
 
 # Pre-exported ONNX models (avoids needing optimum for export)
 ONNX_RERANKER_MODELS = {
-    "bge-reranker-v2-m3": "onnx-community/bge-reranker-v2-m3-ONNX",
+    "bge-reranker-v2-m3": {
+        "repo": "onnx-community/bge-reranker-v2-m3-ONNX",
+        "description": "Base cross-encoder (general domain)",
+    },
 }
 
 
@@ -31,9 +34,15 @@ class Reranker:
     def __init__(
         self,
         model_name: str = "bge-reranker-v2-m3",
+        model_repo: str = "",
         force_provider: str | None = None,
     ):
-        self.model_name = ONNX_RERANKER_MODELS.get(model_name, model_name)
+        # Custom HF repo (fine-tuned) overrides built-in models
+        if model_repo:
+            self.model_name = model_repo
+        else:
+            entry = ONNX_RERANKER_MODELS.get(model_name)
+            self.model_name = entry["repo"] if entry else model_name
         self._cache_dir = _RERANKER_CACHE / self.model_name.replace("/", "--")
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 

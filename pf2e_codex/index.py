@@ -130,13 +130,14 @@ def _rrf_fuse(
 class SearchIndex:
     """Search index backed by sqlite-vec with optional FTS5 hybrid blending."""
 
-    def __init__(self, db_path: Path | str, model_name: str, provider: str = "auto", onnx_provider: str | None = None):
+    def __init__(self, db_path: Path | str, model_name: str, provider: str = "auto", onnx_provider: str | None = None, reranker_model: str = ""):
         import sqlite3
 
         self.db_path = Path(db_path)
         self.model_name = model_name
         self._provider_type = provider
         self._onnx_provider = onnx_provider
+        self._reranker_model = reranker_model
         self._provider: EmbeddingProvider | None = None
         self._reranker: Any | None = None
         self._dim: int | None = None
@@ -298,7 +299,7 @@ class SearchIndex:
             try:
                 if self._reranker is None:
                     from .reranker import Reranker
-                    self._reranker = Reranker()
+                    self._reranker = Reranker(model_repo=self._reranker_model)
                 # Use RRF top 50 as candidates, rerank to top_k
                 results = self._reranker.rerank(query, results, top_k=top_k)
             except Exception as e:

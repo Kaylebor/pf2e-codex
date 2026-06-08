@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     provider: str = Field(default="auto", description="Embedding provider: auto, onnx")
     onnx_provider: str = Field(default="auto", description="ONNX execution provider: auto, migraphx, rocm, cuda, cpu, none")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
+    reranker_model: str = Field(default="", description="Fine-tuned reranker model on HuggingFace (e.g. 'youruser/pf2e-codex-reranker'). Empty = use built-in bge-reranker-v2-m3.")
     transport: str = Field(default="stdio", description="MCP transport: stdio, sse, or streamable-http")
 
     @property
