@@ -83,7 +83,10 @@ class Reranker:
         def _session(providers):
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            return ort.InferenceSession(str(model_path), opts, providers=providers)
+            cache_dir = _onnx_cache_dir(self.model_name) / "migraphx_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            provider_opts = [{"migraphx_model_cache_dir": str(cache_dir)}]
+            return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=provider_opts)
 
         if force_provider and force_provider not in ("auto", ""):
             provider_map = {
