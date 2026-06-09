@@ -38,6 +38,25 @@ _ONNX_EXEC_PROVIDERS = [
 ]
 
 _ONNX_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx"
+_MIGRAPHX_SYSTEM_CACHE = Path("/usr/share/pf2e-codex/migraphx_cache")
+_MIGRAPHX_USER_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "migraphx_cache"
+
+
+def _migraphx_cache_dir() -> Path:
+    """Return active MIGraphX cache dir.
+
+    Priority: PF2E_MIGRAPHX_CACHE_DIR env var > system dir (if .mxr present) > user dir.
+    """
+    import os as _os
+    env_override = _os.environ.get("PF2E_MIGRAPHX_CACHE_DIR")
+    if env_override:
+        p = Path(env_override)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    if list(_MIGRAPHX_SYSTEM_CACHE.glob("*.mxr")):
+        return _MIGRAPHX_SYSTEM_CACHE
+    _MIGRAPHX_USER_CACHE.mkdir(parents=True, exist_ok=True)
+    return _MIGRAPHX_USER_CACHE
 
 
 def _onnx_cache_dir(model_name: str) -> Path:
@@ -86,10 +105,7 @@ class ONNXProvider(EmbeddingProvider):
         def _provider_opts(provider_name: str) -> list[dict[str, str]]:
             """Return provider options for the given provider."""
             if "MIGraphX" in provider_name:
-                # Automatic .mxr cache directory (replaces deprecated migraphx_save_compiled_*)
-                cache_dir = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "migraphx_cache"
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                return [{"migraphx_model_cache_dir": str(cache_dir)}]
+                return [{"migraphx_model_cache_dir": str(_migraphx_cache_dir())}]
             return [{}]
 
         def _make_session(providers: list[str], p_opts: list[dict] | None = None) -> ort.InferenceSession:

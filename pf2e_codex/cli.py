@@ -395,6 +395,49 @@ def embed(
     embed_all_models(settings, model_list, concurrency=concurrency, update=update, rebuild=rebuild)
 
 
+@app.command()
+def warmup(
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model to warm up"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+    cache_dir: str | None = typer.Option(None, "--cache-dir", help="Override MIGraphX cache dir (for PKGBUILD install)"),
+) -> None:
+    """Pre-compile ONNX models for MIGraphX GPU.
+
+    Runs one inference on embedding model and reranker to trigger
+    MIGraphX compilation. Saves .mxr files to cache dir for instant
+    subsequent use. Used by PKGBUILD post-install.
+    """
+    import time as _time
+
+    settings = _settings(data_dir=data_dir, model=model)
+
+    # Override cache dir if specified
+    if cache_dir:
+        import os as _os
+        _os.environ["PF2E_MIGRAPHX_CACHE_DIR"] = cache_dir
+        from pathlib import Path as _Path
+        _Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # Warm up embedding model
+    from .embeddings import get_provider
+    typer.echo(f"Warming up embedding model: {settings.model}")
+    t0 = _time.monotonic()
+    provider = get_provider(settings.model, settings.provider, settings.onnx_provider)
+    _ = provider.embed_query("warmup")
+    typer.echo(f"  Embedding compiled in {_time.monotonic() - t0:.1f}s")
+
+    # Warm up reranker
+    if settings.reranker_model:
+        from .reranker import Reranker
+        typer.echo(f"Warming up reranker: {settings.reranker_model}")
+        t0 = _time.monotonic()
+        rk = Reranker(model_repo=settings.reranker_model)
+        _ = rk.rerank("warmup", [{"text": "warmup document", "id": "_warmup"}], top_k=1)
+        typer.echo(f"  Reranker compiled in {_time.monotonic() - t0:.1f}s")
+
+    typer.echo("Warmup complete.")
+
+
 def main() -> None:
     app(prog_name="pf2e-codex")
 

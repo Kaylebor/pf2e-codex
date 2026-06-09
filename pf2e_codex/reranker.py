@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .embeddings import _onnx_cache_dir, _detect_onnx_provider, _has_onnx
+from .embeddings import _onnx_cache_dir, _detect_onnx_provider, _has_onnx, _migraphx_cache_dir
 
 _RERANKER_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "reranker"
 
@@ -83,8 +83,7 @@ class Reranker:
         def _session(providers):
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            cache_dir = _onnx_cache_dir(self.model_name) / "migraphx_cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_dir = _migraphx_cache_dir()
             provider_opts = [{"migraphx_model_cache_dir": str(cache_dir)}]
             return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=provider_opts)
 
