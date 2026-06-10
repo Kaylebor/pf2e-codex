@@ -579,23 +579,22 @@ class SearchIndex:
 
     def warmup(self) -> None:
         """Eagerly initialize providers (background thread at daemon start)."""
-        import sys as _sys  # noqa: PLC0415
         import time as _time  # noqa: PLC0415
         t0 = _time.monotonic()
-        print(f"[warmup] Starting background warmup (model={self.model_name}, reranker={self._reranker_model})", file=_sys.stderr, flush=True)
+        print(f"[warmup] Starting ({self.model_name}, reranker={self._reranker_model})", flush=True)
         try:
-            print(f"[warmup] Loading embedding provider...", file=_sys.stderr, flush=True)
+            print(f"[warmup] Loading embedding provider...", flush=True)
             _ = self.provider.embed_query("warmup")
-            print(f"[warmup] Embedding ready ({_time.monotonic() - t0:.0f}s)", file=_sys.stderr, flush=True)
+            print(f"[warmup] Embedding ready ({_time.monotonic() - t0:.0f}s)", flush=True)
             if self._reranker_model:
                 from .reranker import Reranker  # noqa: PLC0415
                 t1 = _time.monotonic()
-                print(f"[warmup] Loading reranker ({self._reranker_model})...", file=_sys.stderr, flush=True)
+                print(f"[warmup] Loading reranker ({self._reranker_model})...", flush=True)
                 self._reranker = Reranker(model_repo=self._reranker_model)
                 self._reranker.rerank("warmup", [{"text": "warmup", "id": "_warmup"}], top_k=1)
-                print(f"[warmup] Reranker ready ({_time.monotonic() - t1:.0f}s)", file=_sys.stderr, flush=True)
-            print(f"[warmup] Complete ({_time.monotonic() - t0:.0f}s)", file=_sys.stderr, flush=True)
+                print(f"[warmup] Reranker ready ({_time.monotonic() - t1:.0f}s)", flush=True)
+            print(f"[warmup] Done ({_time.monotonic() - t0:.0f}s)", flush=True)
         except Exception as e:
-            print(f"[warmup] FAILED: {e}", file=_sys.stderr, flush=True)
+            print(f"[warmup] FAILED: {e}", flush=True)
         finally:
             self.warmup_ready.set()
