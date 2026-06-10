@@ -83,7 +83,7 @@ def search(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
-    rerank: bool = typer.Option(False, "--rerank", help="Enable cross-encoder reranker"),
+    rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
 ) -> None:
     """Search the PF2E index."""
     from .daemon_proxy import proxy_search
@@ -303,7 +303,7 @@ def validate(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
     onnx_provider: str = typer.Option("auto", "--onnx-provider", help="ONNX provider override"),
     mode: str = typer.Option("hybrid", "--mode", help="Search mode: hybrid or semantic"),
-    rerank: bool = typer.Option(False, "--rerank", help="Enable cross-encoder reranker"),
+    rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
 ) -> None:
     """Validate retrieval quality against standard query suite."""
     from .validate import run_validation, load_queries
