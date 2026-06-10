@@ -479,21 +479,18 @@ def pull(
     # Resolve model list
     if all_models:
         from .models import list_models
-        model_list = [m["name"] for m in list_models()]
+        model_list = [m.name for m in list_models()]
     elif models:
-        model_list = [m.strip() for m in models.split(",")]
-        # Expand short names via fuzzy match
-        from .models import list_models
-        available = {m["name"]: m["name"] for m in list_models()}
-        resolved = []
-        for m in model_list:
-            found = None
-            for full in available:
-                if m.lower().replace("/", "--") in full.lower():
-                    found = full
-                    break
-            resolved.append(found if found else m)
-        model_list = resolved
+        # Expand common abbreviations
+        ABBREV = {
+            "xs": "Snowflake/snowflake-arctic-embed-xs",
+            "s": "Snowflake/snowflake-arctic-embed-s",
+            "m": "Snowflake/snowflake-arctic-embed-m",
+            "bge": "BAAI/bge-m3",
+            "e5": "intfloat/e5-small-v2",
+            "mini": "all-MiniLM-L6-v2",
+        }
+        model_list = [ABBREV.get(m.strip().lower(), m.strip()) for m in models.split(",")]
     elif model:
         model_list = [model]
     else:
