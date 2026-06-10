@@ -7,6 +7,10 @@ post_install() {
     echo "  Install 'migraphx' and 'rocm-hip-runtime' and rebuild:"
     echo "    makepkg -Cf && sudo pacman -U pf2e-codex-*.pkg.tar.zst"
     echo "  The PKGBUILD auto-detects AMD GPUs at build time."
+    echo ""
+    echo "Pre-compiling ONNX models for GPU..."
+    echo "  (This may take several minutes — safe to interrupt, will resume on first query)"
+    pf2e-codex warmup --cache-dir /usr/share/pf2e-codex/migraphx_cache --threads 2 2>&1 || true
 }
 
 post_upgrade() {
