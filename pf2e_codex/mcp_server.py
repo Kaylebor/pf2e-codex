@@ -111,6 +111,11 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
     settings = settings or get_settings()
     search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
 
+    # Background warmup: eagerly compile models so first query is fast.
+    # Daemon starts accepting requests immediately; warmup runs in parallel.
+    import threading as _threading
+    _threading.Thread(target=search.warmup, daemon=True).start()
+
     mcp = FastMCP("pf2e", host=host, port=port)
     mcp._search_index = search  # prevent GC — keep provider alive across requests
 

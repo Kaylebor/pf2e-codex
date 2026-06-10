@@ -568,3 +568,15 @@ class SearchIndex:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    def warmup(self) -> None:
+        """Eagerly initialize providers (background thread at daemon start)."""
+        try:
+            _ = self.provider.embed_query("warmup")
+            if self._reranker_model:
+                from .reranker import Reranker  # noqa: PLC0415
+                self._reranker = Reranker(model_repo=self._reranker_model)
+                self._reranker.rerank("warmup", [{"text": "warmup", "id": "_warmup"}], top_k=1)
+        except Exception as e:
+            import sys as _sys  # noqa: PLC0415
+            print(f"Background warmup failed: {e}", file=_sys.stderr)
