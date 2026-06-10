@@ -25,6 +25,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pf2e-codex"
 DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "pf2e-codex"
+SYSTEM_DATA_DIR = Path("/usr/share/pf2e-codex/db")
 DEFAULT_MODEL = "Snowflake/snowflake-arctic-embed-xs"
 DEFAULT_RELEASE = "pf2e-8.2.0"
 GITHUB_RELEASE_URL = (
@@ -90,8 +91,17 @@ class Settings(BaseSettings):
 
     @property
     def db(self) -> Path:
-        """Derived database path from model name and data directory."""
-        return _default_db_path(self.model, self.data_dir)
+        """Derived database path from model name and data directory.
+
+        Checks user data dir first, falls back to system dir (PKGBUILD).
+        """
+        user_db = _default_db_path(self.model, self.data_dir)
+        if user_db.exists():
+            return user_db
+        system_db = _default_db_path(self.model, SYSTEM_DATA_DIR)
+        if system_db.exists():
+            return system_db
+        return user_db  # doesn't exist yet; index command will create in user dir
 
     @property
     def github_release_url(self) -> str:

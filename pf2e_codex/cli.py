@@ -452,6 +452,79 @@ def warmup(
     typer.echo("Warmup complete.")
 
 
+@app.command()
+def pull(
+    model: str = typer.Option("", "--model", "-m", help="Single model to download (e.g. 'Snowflake/snowflake-arctic-embed-m')"),
+    models: str | None = typer.Option(None, "--models", help="Comma-separated list of models"),
+    all_models: bool = typer.Option(False, "--all", help="Download all available pre-built DBs"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Target data directory (default: user dir)"),
+    release: str | None = typer.Option(None, "--release", help="PF2E release version (e.g. 'pf2e-8.2.0')"),
+) -> None:
+    """Download pre-built embedding databases from GitHub Releases.
+
+    Downloads sqlite-vec databases with pre-computed embeddings,
+    skipping the need to run 'index' or 'embed-all'.
+
+    Examples:
+        pf2e-codex pull --all              # all models
+        pf2e-codex pull -m arctic-embed-m  # single model
+        pf2e-codex pull --models xs,m,bge  # specific models
+    """
+    import urllib.request as _req
+
+    settings = _settings(data_dir=data_dir)
+    target_dir = settings.data_dir
+    rel = release or settings.release
+
+    # Resolve model list
+    if all_models:
+        from .models import list_models
+        model_list = [m["name"] for m in list_models()]
+    elif models:
+        model_list = [m.strip() for m in models.split(",")]
+        # Expand short names via fuzzy match
+        from .models import list_models
+        available = {m["name"]: m["name"] for m in list_models()}
+        resolved = []
+        for m in model_list:
+            found = None
+            for full in available:
+                if m.lower().replace("/", "--") in full.lower():
+                    found = full
+                    break
+            resolved.append(found if found else m)
+        model_list = resolved
+    elif model:
+        model_list = [model]
+    else:
+        typer.echo("Specify --model, --models, or --all", err=True)
+        raise typer.Exit(code=1)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, m in enumerate(model_list):
+        from .config import _model_safe_name
+        db_name = f"pf2e_{_model_safe_name(m)}.db"
+        url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/v{rel}/{db_name}"
+        dest = target_dir / db_name
+
+        if dest.exists():
+            typer.echo(f"  [{i+1}/{len(model_list)}] {m} — already exists, skipping")
+            continue
+
+        typer.echo(f"  [{i+1}/{len(model_list)}] {m} — downloading...", nl=False)
+        try:
+            _req.urlretrieve(url, dest)
+            size_mb = dest.stat().st_size / 1024**2
+            typer.echo(f" {size_mb:.0f}MB")
+        except Exception as e:
+            if dest.exists():
+                dest.unlink()
+            typer.echo(f" failed: {e}")
+
+    typer.echo(f"Done. DBs in: {target_dir}")
+
+
 def main() -> None:
     app(prog_name="pf2e-codex")
 
