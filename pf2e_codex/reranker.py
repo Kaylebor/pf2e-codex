@@ -83,6 +83,9 @@ class Reranker:
         def _session(providers):
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            warmup_threads = os.environ.get("PF2E_WARMUP_THREADS")
+            if warmup_threads:
+                opts.intra_op_num_threads = int(warmup_threads)
             cache_dir = _migraphx_cache_dir()
             provider_opts = [{"migraphx_model_cache_dir": str(cache_dir)}]
             return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=provider_opts)

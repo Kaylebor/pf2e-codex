@@ -111,6 +111,9 @@ class ONNXProvider(EmbeddingProvider):
         def _make_session(providers: list[str], p_opts: list[dict] | None = None) -> ort.InferenceSession:
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            warmup_threads = os.environ.get("PF2E_WARMUP_THREADS")
+            if warmup_threads:
+                opts.intra_op_num_threads = int(warmup_threads)
             return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=p_opts or [])
 
         if force_provider and force_provider not in ("auto", ""):

@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     onnx_provider: str = Field(default="auto", description="ONNX execution provider: auto, migraphx, rocm, cuda, cpu, none")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     reranker_model: str = Field(default="Kaylebor/pf2e-codex-reranker", description="Fine-tuned reranker model on HuggingFace. Empty = use built-in bge-reranker-v2-m3.")
+    warmup_threads: int = Field(default=2, description="ONNX intra-op threads during 'pf2e-codex warmup'. Lower = less GPU power draw.")
     transport: str = Field(default="stdio", description="MCP transport: stdio, sse, or streamable-http")
 
     @property
