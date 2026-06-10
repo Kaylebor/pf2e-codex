@@ -402,6 +402,7 @@ def warmup(
     cache_dir: str | None = typer.Option(None, "--cache-dir", help="Override MIGraphX cache dir (for PKGBUILD install)"),
     model_dir: str | None = typer.Option(None, "--model-dir", help="Override ONNX model download dir (for PKGBUILD install)"),
     threads: int = typer.Option(0, "--threads", help="ONNX intra-op threads. Lower = less GPU power draw. Default: config warmup_threads."),
+    force: bool = typer.Option(False, "--force", help="Recompile even if .mxr cache already exists"),
 ) -> None:
     """Pre-compile ONNX models for MIGraphX GPU.
 
@@ -431,6 +432,15 @@ def warmup(
         _os.environ["PF2E_ONNX_CACHE_DIR"] = model_dir
         _Path(model_dir).mkdir(parents=True, exist_ok=True)
         typer.echo(f"Model cache dir: {model_dir}")
+
+    # Skip if already compiled (unless --force)
+    from .embeddings import _migraphx_cache_dir as _resolve_cache_dir
+    resolved_cache = _resolve_cache_dir()
+    existing = list(resolved_cache.glob("*.mxr"))
+    if existing and not force:
+        typer.echo(f"Already warm ({len(existing)} .mxr files in {resolved_cache}), skipping.")
+        typer.echo("Use --force to recompile.")
+        return
 
     # Warm up embedding model
     from .embeddings import get_provider
