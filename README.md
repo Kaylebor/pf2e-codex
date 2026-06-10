@@ -94,7 +94,52 @@ rules explanations are retrievable.
 | `pf2e-codex get "fireball"` | Fetch a single entry by slug, name, or UUID |
 | `pf2e-codex related "off-guard" --direction incoming` | Cross-reference graph |
 | `pf2e-codex models` | List embedding models with recommendations |
-| `pf2e-codex mcp` | Start MCP server (stdio, sse, or streamable-http) |
+| `pf2e-codex validator` | Validate search quality against 25-query suite |
+| `pf2e-codex warmup` | Pre-compile ONNX models for GPU (--threads, --force) |
+| `pf2e-codex pull` | Download pre-built embedding DB from GitHub Releases |
+| `pf2e-codex mcp` | Start MCP server (--transport streamable-http for daemon) |
+
+## Daemon (systemd)
+
+For persistent GPU inference, run the MCP server as a systemd user service.
+The daemon warms up models in background and auto-downloads the embedding DB
+on first query.
+
+```bash
+# Enable and start
+systemctl --user enable --now pf2e-codex
+
+# Check status
+systemctl --user status pf2e-codex
+
+# CLI commands auto-detect the daemon and proxy to it
+pf2e-codex search "fireball"
+```
+
+On first start, the daemon downloads the embedding DB (~97MB) and compiles
+ONNX models for MIGraphX GPU (~8 min for reranker, ~1 min for embeddings).
+Subsequent starts use cached `.mxr` files and are instant.
+
+### Warmup
+
+Pre-compile models at install time so the daemon starts warm:
+
+```bash
+pf2e-codex warmup --threads 2
+```
+
+On AMD GPU + ROCm, this compiles the embedding model and reranker into
+`.mxr` cache files. Subsequent daemon starts skip recompilation.
+
+### First-query auto-download
+
+When the daemon receives its first search and no embedding DB exists,
+it auto-downloads a pre-computed sqlite-vec DB from GitHub Releases.
+To rebuild from scratch instead:
+
+```bash
+pf2e-codex embed
+```
 
 ## Configuration
 

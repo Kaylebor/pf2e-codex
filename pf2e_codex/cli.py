@@ -89,8 +89,12 @@ def search(
     from .daemon_proxy import proxy_search
     result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank)
     if result:
-        print_search_results(result.get("results", []), query)
-        return
+        if "results" in result:
+            print_search_results(result["results"], query)
+            return
+        if "error" in result:
+            typer.echo(f"Daemon: {result['error']}", err=True)
+            typer.echo("Falling back to local inference (may be slow on first run)...", err=True)
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
