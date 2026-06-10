@@ -38,16 +38,22 @@ def run_validation(
     queries = load_queries()
     results = []
 
-    for q in queries:
-        hits = search.search(q["query"], top_k=top_k, hybrid=hybrid, rerank=rerank)
-        names = [r["name"] for r in hits]
-        rank = next((i + 1 for i, n in enumerate(names) if q["expected"].lower() in n.lower()), None)
-        results.append({
-            "query": q["query"],
-            "expected": q["expected"],
-            "rank": rank,
-            "top_3": names[:3],
-        })
+    try:
+        for q in queries:
+            hits = search.search(q["query"], top_k=top_k, hybrid=hybrid, rerank=rerank)
+            names = [r["name"] for r in hits]
+            rank = next((i + 1 for i, n in enumerate(names) if q["expected"].lower() in n.lower()), None)
+            results.append({
+                "query": q["query"],
+                "expected": q["expected"],
+                "rank": rank,
+                "top_3": names[:3],
+            })
+    finally:
+        search.close()
+        del search
+        import gc as _gc
+        _gc.collect()
 
     ranks = [r["rank"] for r in results]
     mrrs = [1.0 / r if r else 0.0 for r in ranks]
