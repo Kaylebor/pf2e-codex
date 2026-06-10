@@ -46,23 +46,19 @@ class RerankerTripletDataset(Dataset):
 def collate_fn(batch, tokenizer, max_length):
     queries, pos_texts, neg_texts = zip(*batch)
 
-    # Tokenize (query, positive) pairs
-    pos_enc = tokenizer(
-        list(queries), list(pos_texts),
-        padding=True, truncation=True, max_length=max_length,
-        return_tensors="pt",
-    )
-    # Tokenize (query, negative) pairs
-    neg_enc = tokenizer(
-        list(queries), list(neg_texts),
+    # Batch pos and neg together in ONE forward call (ROCm fix: separate
+    # forward passes can corrupt LayerNorm gradients)
+    all_queries = list(queries) + list(queries)
+    all_texts = list(pos_texts) + list(neg_texts)
+    enc = tokenizer(
+        all_queries, all_texts,
         padding=True, truncation=True, max_length=max_length,
         return_tensors="pt",
     )
     return {
-        "pos_input_ids": pos_enc["input_ids"],
-        "pos_attention_mask": pos_enc["attention_mask"],
-        "neg_input_ids": neg_enc["input_ids"],
-        "neg_attention_mask": neg_enc["attention_mask"],
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"],
+        "batch_size": len(queries),
     }
 
 
@@ -123,20 +119,16 @@ def train(args):
         total_train_loss = 0.0
 
         for step, batch in enumerate(train_loader):
-            pos_input_ids = batch["pos_input_ids"].to(device)
-            pos_attention_mask = batch["pos_attention_mask"].to(device)
-            neg_input_ids = batch["neg_input_ids"].to(device)
-            neg_attention_mask = batch["neg_attention_mask"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            batch_size = batch["batch_size"]
 
-            # Forward: score(query, pos) and score(query, neg)
-            pos_out = model(input_ids=pos_input_ids, attention_mask=pos_attention_mask)
-            neg_out = model(input_ids=neg_input_ids, attention_mask=neg_attention_mask)
-
-            pos_score = pos_out.logits.squeeze(-1)
-            neg_score = neg_out.logits.squeeze(-1)
+            # Single forward pass — batch pos and neg together (ROCm LayerNorm fix)
+            all_scores = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
+            pos_score = all_scores[:batch_size]
+            neg_score = all_scores[batch_size:]
 
             # Margin ranking loss: pos_score should be > neg_score by margin
-            # Use a numerically stable version: max(0, margin - (pos - neg))
             loss = torch.clamp(args.margin - pos_score + neg_score, min=0).mean()
 
             optimizer.zero_grad()
@@ -160,16 +152,14 @@ def train(args):
         total = 0
         with torch.no_grad():
             for batch in val_loader:
-                pos_input_ids = batch["pos_input_ids"].to(device)
-                pos_attention_mask = batch["pos_attention_mask"].to(device)
-                neg_input_ids = batch["neg_input_ids"].to(device)
-                neg_attention_mask = batch["neg_attention_mask"].to(device)
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                batch_size = batch["batch_size"]
 
-                pos_out = model(input_ids=pos_input_ids, attention_mask=pos_attention_mask)
-                neg_out = model(input_ids=neg_input_ids, attention_mask=neg_attention_mask)
-
-                pos_score = pos_out.logits.squeeze(-1)
-                neg_score = neg_out.logits.squeeze(-1)
+                with torch.no_grad():
+                    all_scores = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
+                    pos_score = all_scores[:batch_size]
+                    neg_score = all_scores[batch_size:]
 
                 loss = torch.clamp(args.margin - pos_score + neg_score, min=0).mean()
                 total_val_loss += loss.item()
