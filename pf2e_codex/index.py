@@ -150,7 +150,25 @@ class SearchIndex:
         import sqlite3
 
         if not self.db_path.exists():
-            raise FileNotFoundError(f"Database not found: {self.db_path}")
+            # Auto-download pre-built DB from GitHub Releases
+            from .config import DEFAULT_RELEASE
+            from .config import _model_safe_name
+            import urllib.request as _req
+            db_name = f"pf2e_{_model_safe_name(self.model_name)}.db"
+            release = DEFAULT_RELEASE
+            url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/{release}/{db_name}"
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"Downloading pre-computed DB ({db_name})...", end=" ", flush=True)
+            try:
+                _req.urlretrieve(url, self.db_path)
+                size_mb = self.db_path.stat().st_size / 1024**2
+                print(f"{size_mb:.0f}MB")
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Database not found: {self.db_path}. "
+                    f"Auto-download failed.\n"
+                    f"Run 'pf2e-codex embed' to build from scratch"
+                )
         self._conn = sqlite3.connect(str(self.db_path))
         load_vec_extension(self._conn)
         row = self._conn.execute(
