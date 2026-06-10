@@ -400,6 +400,7 @@ def warmup(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model to warm up"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
     cache_dir: str | None = typer.Option(None, "--cache-dir", help="Override MIGraphX cache dir (for PKGBUILD install)"),
+    model_dir: str | None = typer.Option(None, "--model-dir", help="Override ONNX model download dir (for PKGBUILD install)"),
     threads: int = typer.Option(0, "--threads", help="ONNX intra-op threads. Lower = less GPU power draw. Default: config warmup_threads."),
 ) -> None:
     """Pre-compile ONNX models for MIGraphX GPU.
@@ -418,12 +419,18 @@ def warmup(
     _os.environ["PF2E_WARMUP_THREADS"] = str(thread_count)
     typer.echo(f"Warmup threads: {thread_count}")
 
-    # Override cache dir if specified
+    from pathlib import Path as _Path
+
+    # Override MIGraphX cache dir
     if cache_dir:
-        import os as _os
         _os.environ["PF2E_MIGRAPHX_CACHE_DIR"] = cache_dir
-        from pathlib import Path as _Path
         _Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # Override ONNX model download dir (avoids root's home during PKGBUILD install)
+    if model_dir:
+        _os.environ["PF2E_ONNX_CACHE_DIR"] = model_dir
+        _Path(model_dir).mkdir(parents=True, exist_ok=True)
+        typer.echo(f"Model cache dir: {model_dir}")
 
     # Warm up embedding model
     from .embeddings import get_provider

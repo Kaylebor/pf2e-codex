@@ -60,8 +60,9 @@ def _migraphx_cache_dir() -> Path:
 
 
 def _onnx_cache_dir(model_name: str) -> Path:
+    base = os.environ.get("PF2E_ONNX_CACHE_DIR", str(_ONNX_CACHE))
     safe = model_name.replace("/", "--")
-    return _ONNX_CACHE / safe
+    return Path(base) / safe
 
 
 def _has_onnx() -> bool:
