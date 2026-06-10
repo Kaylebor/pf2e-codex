@@ -40,7 +40,7 @@ Ordered by impact. Check items off as completed.
   - Done: `license`, `content_type`, `pack` on `pf2e_search` and `pf2e_rules_explain`.
 
 - [x] **Validation suite**
-  - Done: 25-query suite, MRR 0.850 hybrid. `pf2e-codex validate`.
+  - Done: 25-query suite, MRR 0.893 hybrid, **0.960 with reranker**. `pf2e-codex validate`.
 
 ## Medium Impact
 
@@ -54,10 +54,10 @@ Ordered by impact. Check items off as completed.
 - [ ] **Cross-encoder reranker fine-tuning** — train `bge-reranker-v2-m3` on PF2E rules domain.
   - Data: subagents read raw pack JSONs (`~/.cache/pf2e-codex/extract-*/`), generate `(query, positive_chunk, negative_chunk)` triplets per pack (~2000-3000 total).
   - Sampling: per-pack strategy, parallel subagents via `pi subagents`, output JSONL.
-  - Training: `flagembedding`'s `train_reranker.py` via `uv run`, ~1-2h on 7900 XTX.
-  - Storage: Push merged LoRA ONNX model to HuggingFace Hub (`kaylebor/pf2e-codex-reranker`). Include `NOTICE` in HF repo crediting Paizo + Wizards under ORC + OGL 1.0a.
-  - Config: `reranker_model = "kaylebor/pf2e-codex-reranker"` in `config.toml` — loads from HF Hub automatically.
-  - Expected lift: 0.893 → ~0.92-0.95 MRR. Falls back to hybrid-only if fine-tuned model absent.
+  - Training: custom PyTorch script via `uv run` (margin ranking loss, 3 epochs), ~30min on 7900 XTX.
+  - Storage: Push ONNX model to HuggingFace Hub (`kaylebor/pf2e-codex-reranker-minilm`).
+  - Config: `reranker_model = "kaylebor/pf2e-codex-reranker-minilm"` — default, auto-downloaded.
+  - Achieved: **0.960 MRR** (was 0.893 baseline). 23/25 perfect, 25/25 Top 3.
 
 - [ ] **Docker image** — pre-built env, volume-mount for DB.
 

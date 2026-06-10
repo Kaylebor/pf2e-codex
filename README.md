@@ -221,26 +221,36 @@ PF2E_PROVIDER=onnx pf2e-codex index
 ## Embedding Models
 
 All models work out of the box. Query/document prefixing is handled automatically.
+Reranking is enabled by default and uses a fine-tuned MiniLM cross-encoder
+(88MB, Kaylebor/pf2e-codex-reranker-minilm) that significantly boosts quality.
 
-### CPU recommendations
+### Search quality (with fine-tuned MiniLM reranker, MRR metric)
+
+Tested on AMD Ryzen 7 7800X3D + Radeon RX 7900 XTX, 25-query PF2E validation suite:
+
+| Model | Params | Dim | DB Size | MRR | Perfect |
+|-------|--------|-----|---------|-----|---------|
+| `all-MiniLM-L6-v2` | 22M | 384 | 97MB | **0.980** | 24/25 |
+| `snowflake-arctic-embed-xs` | 22M | 384 | 97MB | 0.960 | 24/25 |
+| `snowflake-arctic-embed-s` | 33M | 384 | 97MB | 0.960 | 23/25 |
+| `snowflake-arctic-embed-m` | 110M | 768 | 141MB | 0.960 | 23/25 |
+| `BAAI/bge-m3` | 568M | 1024 | 170MB | 0.920 | 23/25 |
+| `intfloat/e5-small-v2` | 33M | 384 | 97MB | 0.880 | 22/25 |
+
+### CPU indexing performance
 
 Tested on AMD Ryzen 7 7800X3D, indexing 28,837 chunks:
 
-| Model | Params | Dim | Index Time | Quality |
-|-------|--------|-----|------------|---------|
-| `snowflake-arctic-embed-xs` | 22M | 384 | ~35s | Good |
-| `snowflake-arctic-embed-s` | 33M | 384 | ~70s | Good |
-| `all-MiniLM-L6-v2` | 22M | 384 | ~50s | Good |
-| `e5-small-v2` | 33M | 384 | ~135s | Good |
+| Model | Index Time |
+|-------|----------|
+| `snowflake-arctic-embed-xs` | ~35s |
+| `all-MiniLM-L6-v2` | ~50s |
+| `snowflake-arctic-embed-s` | ~70s |
+| `intfloat/e5-small-v2` | ~135s |
+| `snowflake-arctic-embed-m` | ~1h |
+| `BAAI/bge-m3` | ~3h+ |
 
-**Default: `snowflake-arctic-embed-xs`** — fastest on CPU, equivalent quality to MiniLM, automatic prefixing handled.
-
-### GPU recommendations
-
-| Model | Params | Dim | Quality |
-|-------|--------|-----|---------|
-| `snowflake-arctic-embed-m` | 110M | 768 | Better |
-| `nomic-embed-text-v1.5` | 137M | 768 | Better |
+**Default: `snowflake-arctic-embed-m`** — best balance of quality, size, and GPU performance.
 
 Switch models by setting the environment variable:
 
