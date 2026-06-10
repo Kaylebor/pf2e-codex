@@ -10,6 +10,7 @@ dependencies = [
     "huggingface-hub>=0.23",
     "peft>=0.10",
     "safetensors>=0.4",
+    "sentence-transformers>=5.5.1",
 ]
 
 [tool.uv]

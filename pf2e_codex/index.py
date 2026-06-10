@@ -588,3 +588,5 @@ class SearchIndex:
         except Exception as e:
             import sys as _sys  # noqa: PLC0415
             print(f"Background warmup failed: {e}", file=_sys.stderr)
+        finally:
+            self.warmup_ready.set()
