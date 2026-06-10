@@ -110,6 +110,27 @@ exec /usr/bin/python3 -S -m pf2e_codex.cli "$@"
 WRAPPER
     chmod 755 "$pkgdir/usr/bin/pf2e-codex"
 
+    # Pre-built embedding databases (from GitHub Releases)
+    local db_dir="$pkgdir/usr/share/pf2e-codex/db"
+    mkdir -p "$db_dir"
+    local release="${DEFAULT_RELEASE:-pf2e-8.2.0}"
+    local models=(
+        "Snowflake/snowflake-arctic-embed-xs"
+        "Snowflake/snowflake-arctic-embed-s"
+        "Snowflake/snowflake-arctic-embed-m"
+        "all-MiniLM-L6-v2"
+        "intfloat/e5-small-v2"
+        "BAAI/bge-m3"
+    )
+    for model in "${models[@]}"; do
+        local safe=$(echo "$model" | tr '/' '--')
+        local db_name="pf2e_${safe}.db"
+        echo "==> Downloading pre-built DB: $model"
+        curl -sL -o "$db_dir/$db_name" \
+            "https://github.com/Kaylebor/pf2e-codex/releases/download/$release/$db_name" \
+            || echo "    (unavailable, user can run 'pf2e-codex pull' later)"
+    done
+
     # SystemD user service (disabled by default)
     install -Dm644 "$startdir/pf2e-codex.service" "$pkgdir/usr/lib/systemd/user/pf2e-codex.service"
 }

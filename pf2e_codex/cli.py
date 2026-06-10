@@ -505,7 +505,7 @@ def pull(
     for i, m in enumerate(model_list):
         from .config import _model_safe_name
         db_name = f"pf2e_{_model_safe_name(m)}.db"
-        url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/v{rel}/{db_name}"
+        url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/{rel}/{db_name}"
         dest = target_dir / db_name
 
         if dest.exists():
