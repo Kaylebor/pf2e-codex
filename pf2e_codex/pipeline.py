@@ -24,7 +24,24 @@ def build_chunks(settings: Settings) -> list[dict[str, Any]]:
     all_entries = extract_all_packs(zip_path, cache_extract)
     print(f"Loaded {len(all_entries)} packs")
 
-    _localizer = extract_lang(zip_path, cache_extract)
+    # Merge translations for configured languages
+    if settings.languages:
+        for lang in settings.languages:
+            if lang == "en":
+                continue
+            print(f"Loading {lang} translations...")
+            try:
+                from .translate import (  # noqa: PLC0415
+                    build_pack_map, fetch_translations, merge_entries,
+                )
+                translations = fetch_translations(settings.cache_dir, lang=lang)
+                pack_map = build_pack_map(translations, set(all_entries.keys()))
+                print(f"  Matched {len(pack_map)}/{len(translations)} packs")
+                for en_name, es_name in pack_map.items():
+                    if en_name in all_entries and es_name in translations:
+                        merge_entries(all_entries[en_name], translations[es_name])
+            except Exception as e:
+                print(f"  Failed to load {lang} translations: {e}")
     resolver = UUIDResolver(all_entries)
     builder = ChunkBuilder(resolver)
 
@@ -115,8 +132,8 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
     start = time.time()
     for chunk, emb in zip(chunks, embeddings):
         conn.execute("""
-            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster, translations)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
             chunk.get("slug", ""),
@@ -126,6 +143,7 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
             chunk.get("source_hash"),
             chunk.get("license", "NONE"),
             1 if chunk.get("remaster") else (0 if chunk.get("remaster") is not None else None),
+            json.dumps(chunk.get("translations")) if chunk.get("translations") else None,
         ))
         conn.execute(
             "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",
@@ -201,6 +219,10 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
         conn.execute("ALTER TABLE chunks ADD COLUMN remaster INTEGER DEFAULT NULL")
     except Exception:
         pass  # already exists
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN translations TEXT DEFAULT NULL")
+    except Exception:
+        pass  # already exists
 
     if current_release == settings.release:
         print(f"Already indexed version {settings.release}")
@@ -271,8 +293,8 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
 
         # Insert new chunk
         conn.execute("""
-            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster, translations)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
             chunk.get("slug", ""),
@@ -282,6 +304,7 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
             chunk.get("source_hash"),
             chunk.get("license", "NONE"),
             1 if chunk.get("remaster") else (0 if chunk.get("remaster") is not None else None),
+            json.dumps(chunk.get("translations")) if chunk.get("translations") else None,
         ))
         conn.execute(
             "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",

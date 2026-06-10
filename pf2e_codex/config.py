@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     reranker_model: str = Field(default="Kaylebor/pf2e-codex-reranker-minilm", description="Fine-tuned reranker model on HuggingFace. Empty = use built-in bge-reranker-v2-m3.")
     warmup_threads: int = Field(default=2, description="ONNX intra-op threads during 'pf2e-codex warmup'. Lower = less GPU power draw.")
+    languages: list[str] = Field(default=["en"], description="Languages to index (e.g. ['en', 'es'])")
     transport: str = Field(default="stdio", description="MCP transport: stdio, sse, or streamable-http")
 
     @property

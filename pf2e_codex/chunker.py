@@ -524,11 +524,15 @@ class ChunkBuilder:
             chunks = self._build_journal_chunks(entry, pack_name)
             for c in chunks:
                 c["source_hash"] = h
+                if "translations" in entry:
+                    c["translations"] = entry["translations"]
             return chunks
         chunk = self._build_single(entry, pack_name)
         if chunk:
             chunk["id"] = f"{pack_name}:{chunk['id']}"
             chunk["source_hash"] = h
+            if "translations" in entry:
+                chunk["translations"] = entry["translations"]
             return [chunk]
         return []
 

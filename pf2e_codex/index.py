@@ -41,7 +41,8 @@ def init_db(db_path: Path, dim: int) -> None:
             raw_rules_count INTEGER,
             source_hash TEXT,
             license TEXT DEFAULT 'NONE',
-            remaster INTEGER DEFAULT NULL
+            remaster INTEGER DEFAULT NULL,
+            translations TEXT DEFAULT NULL
         )
     """)
     conn.execute(f"""
