@@ -156,6 +156,8 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         Tip: 'refs' lists entries this result references — useful for chaining.
         'legacy_name' shows the pre-remaster name (e.g. 'flat-footed' for 'Off-Guard').
         """
+        if not search.warmup_ready.is_set():
+            return json.dumps({"error": "Server is warming up (8-10 min on first start). Retry shortly."})
         top_k = max(1, min(top_k, 20))
         results = search.search(query, top_k, hybrid=hybrid, rerank=rerank,
                                 license=license, content_type=content_type,
@@ -224,6 +226,8 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         Returns:
             JSON with the full entry text.
         """
+        if not search.warmup_ready.is_set():
+            return json.dumps({"error": "Server is warming up (8-10 min on first start). Retry shortly."})
         result = search.fetch_by_id(entry_id)
         if result:
             return json.dumps(result, indent=2)
@@ -259,6 +263,8 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         Returns:
             JSON with prioritized results from journal pages and conditions.
         """
+        if not search.warmup_ready.is_set():
+            return json.dumps({"error": "Server is warming up (8-10 min on first start). Retry shortly."})
         top_k = max(1, min(top_k, 10))
         results = search.rules_explain(topic, top_k, license=license, content_type=content_type, remaster=remaster)
         return json.dumps({"topic": topic, "results": results}, indent=2)
@@ -277,6 +283,8 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         Returns:
             JSON with "outgoing" and "incoming" lists of related entries.
         """
+        if not search.warmup_ready.is_set():
+            return json.dumps({"error": "Server is warming up (8-10 min on first start). Retry shortly."})
         limit = max(1, min(limit, 50))
         results = search.related(entry_id, direction, limit)
         return json.dumps({"entry_id": entry_id, "direction": direction, "results": results}, indent=2)
@@ -292,11 +300,15 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
             JSON with total_chunks, types (feat, spell, condition, etc.),
             licenses (ORC, OGL, NONE), and packs (spells, feats, etc.).
         """
+        if not search.warmup_ready.is_set():
+            return json.dumps({"error": "Server is warming up (8-10 min on first start). Retry shortly."})
         return json.dumps(search.catalog(), indent=2)
 
     @mcp.tool()
     def pf2e_index_status() -> str:
         """Check the status of the PF2E index (model, chunk count, date)."""
+        if not search.warmup_ready.is_set():
+            return json.dumps({"error": "Server is warming up (8-10 min on first start). Retry shortly."})
         meta = search.status()
         return json.dumps(meta, indent=2)
 

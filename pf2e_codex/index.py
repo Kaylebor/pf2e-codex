@@ -132,6 +132,7 @@ class SearchIndex:
 
     def __init__(self, db_path: Path | str, model_name: str, provider: str = "auto", onnx_provider: str | None = None, reranker_model: str = ""):
         import sqlite3
+        import threading as _threading
 
         self.db_path = Path(db_path)
         self.model_name = model_name
@@ -143,32 +144,37 @@ class SearchIndex:
         self._dim: int | None = None
         self._conn: sqlite3.Connection | None = None
         self._fts_ready: bool = False
+        self._lock = _threading.Lock()
+        self.warmup_ready = _threading.Event()
 
     def _ensure_loaded(self) -> None:
         if self._conn is not None:
             return
-        import sqlite3
+        with self._lock:
+            if self._conn is not None:
+                return  # double-check after acquiring lock
+            import sqlite3
 
-        if not self.db_path.exists():
-            # Auto-download pre-built DB from GitHub Releases
-            from .config import DEFAULT_RELEASE
-            from .config import _model_safe_name
-            import urllib.request as _req
-            db_name = f"pf2e_{_model_safe_name(self.model_name)}.db"
-            release = DEFAULT_RELEASE
-            url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/{release}/{db_name}"
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            print(f"Downloading pre-computed DB ({db_name})...", end=" ", flush=True)
-            try:
-                _req.urlretrieve(url, self.db_path)
-                size_mb = self.db_path.stat().st_size / 1024**2
-                print(f"{size_mb:.0f}MB")
-            except Exception as e:
-                raise FileNotFoundError(
-                    f"Database not found: {self.db_path}. "
-                    f"Auto-download failed.\n"
-                    f"Run 'pf2e-codex embed' to build from scratch"
-                )
+            if not self.db_path.exists():
+                # Auto-download pre-built DB from GitHub Releases
+                from .config import DEFAULT_RELEASE
+                from .config import _model_safe_name
+                import urllib.request as _req
+                db_name = f"pf2e_{_model_safe_name(self.model_name)}.db"
+                release = DEFAULT_RELEASE
+                url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/{release}/{db_name}"
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                print(f"Downloading pre-computed DB ({db_name})...", end=" ", flush=True)
+                try:
+                    _req.urlretrieve(url, self.db_path)
+                    size_mb = self.db_path.stat().st_size / 1024**2
+                    print(f"{size_mb:.0f}MB")
+                except Exception:
+                    raise FileNotFoundError(
+                        f"Database not found: {self.db_path}. "
+                        f"Auto-download failed.\n"
+                        f"Run 'pf2e-codex embed' to build from scratch"
+                    )
         self._conn = sqlite3.connect(str(self.db_path))
         load_vec_extension(self._conn)
         row = self._conn.execute(
@@ -217,11 +223,13 @@ class SearchIndex:
     @property
     def provider(self) -> EmbeddingProvider:
         if self._provider is None:
-            self._provider = get_provider(
-                self.model_name,
-                provider=self._provider_type,
-                onnx_provider=self._onnx_provider,
-            )
+            with self._lock:
+                if self._provider is None:
+                    self._provider = get_provider(
+                        self.model_name,
+                        provider=self._provider_type,
+                        onnx_provider=self._onnx_provider,
+                    )
         return self._provider
 
     def _encode(self, text: str) -> list[float]:
