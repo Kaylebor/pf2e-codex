@@ -29,10 +29,11 @@ def run_validation(
     onnx_provider: str | None = None,
     top_k: int = 10,
     rerank: bool = True,
+    reranker_model: str = "",
 ) -> dict:
     """Run the query suite and return metrics."""
     from .index import SearchIndex
-    search = SearchIndex(db_path, model_name, provider=provider, onnx_provider=onnx_provider, reranker_model="")
+    search = SearchIndex(db_path, model_name, provider=provider, onnx_provider=onnx_provider, reranker_model=reranker_model)
 
     queries = load_queries()
     results = []

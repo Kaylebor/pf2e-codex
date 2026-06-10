@@ -308,6 +308,8 @@ def validate(
     typer.echo(f"Model: {settings.model}")
     typer.echo(f"DB:    {settings.db}")
     typer.echo(f"Mode:  {mode}")
+    if rerank:
+        typer.echo(f"Reranker: {settings.reranker_model}")
     typer.echo(f"Suite: {len(queries)} queries\n")
 
     result = run_validation(
@@ -316,6 +318,7 @@ def validate(
         provider=settings.provider,
         onnx_provider=onnx_provider,
         rerank=rerank,
+        reranker_model=settings.reranker_model,
     )
 
     print_validation(result)
