@@ -45,16 +45,28 @@ _MIGRAPHX_USER_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "migraph
 def _migraphx_cache_dir() -> Path:
     """Return active MIGraphX cache dir.
 
-    Priority: PF2E_MIGRAPHX_CACHE_DIR env var > system dir (if .mxr present) > user dir.
+    Priority: PF2E_MIGRAPHX_CACHE_DIR env var > user dir (with system dir seed).
+    System dir .mxr files are copied to user dir on first use — MIGraphX
+    needs write access for new compilations.
     """
     import os as _os
+    import shutil as _shutil
     env_override = _os.environ.get("PF2E_MIGRAPHX_CACHE_DIR")
     if env_override:
         p = Path(env_override)
         p.mkdir(parents=True, exist_ok=True)
         return p
+    # Seed user dir from system dir (if .mxr exists in system but not user)
     if list(_MIGRAPHX_SYSTEM_CACHE.glob("*.mxr")):
-        return _MIGRAPHX_SYSTEM_CACHE
+        _MIGRAPHX_USER_CACHE.mkdir(parents=True, exist_ok=True)
+        for f in _MIGRAPHX_SYSTEM_CACHE.glob("*.mxr"):
+            dest = _MIGRAPHX_USER_CACHE / f.name
+            if not dest.exists():
+                try:
+                    _shutil.copy2(f, dest)
+                except Exception:
+                    pass
+        return _MIGRAPHX_USER_CACHE
     _MIGRAPHX_USER_CACHE.mkdir(parents=True, exist_ok=True)
     return _MIGRAPHX_USER_CACHE
 

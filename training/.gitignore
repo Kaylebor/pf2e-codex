@@ -1,6 +1,5 @@
 .venv/
-reranker-finetuned/
-reranker-finetuned-onnx/
+reranker*/
 __pycache__/
 *.pyc
 uv.lock
