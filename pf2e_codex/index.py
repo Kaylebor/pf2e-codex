@@ -223,15 +223,14 @@ class SearchIndex:
 
     @property
     def provider(self) -> EmbeddingProvider:
-        if self._provider is None:
-            with self._lock:
-                if self._provider is None:
-                    self._provider = get_provider(
-                        self.model_name,
-                        provider=self._provider_type,
-                        onnx_provider=self._onnx_provider,
-                    )
-        return self._provider
+        with self._lock:
+            if self._provider is None:
+                self._provider = get_provider(
+                    self.model_name,
+                    provider=self._provider_type,
+                    onnx_provider=self._onnx_provider,
+                )
+            return self._provider
 
     def _encode(self, text: str) -> list[float]:
         return self.provider.embed_query(text)
@@ -324,11 +323,10 @@ class SearchIndex:
         # Optional second-stage cross-encoder reranking
         if rerank and len(results) > 1:
             try:
-                if self._reranker is None:
-                    with self._lock:
-                        if self._reranker is None:
-                            from .reranker import Reranker
-                            self._reranker = Reranker(model_repo=self._reranker_model)
+                with self._lock:
+                    if self._reranker is None:
+                        from .reranker import Reranker
+                        self._reranker = Reranker(model_repo=self._reranker_model)
                 # Use RRF top 50 as candidates, rerank to top_k
                 results = self._reranker.rerank(query, results, top_k=top_k)
             except Exception as e:
