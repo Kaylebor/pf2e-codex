@@ -96,6 +96,11 @@ def search(
             typer.echo(f"Daemon: {result['error']}", err=True)
             typer.echo("Wait for the daemon to finish warming up, then retry.", err=True)
             return
+    # Only fall back to local if no daemon is registered
+    from .daemon_proxy import _server_json_path
+    if _server_json_path().exists():
+        typer.echo("Daemon is registered but not responding. Restart it and retry.", err=True)
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
     results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
