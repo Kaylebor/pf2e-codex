@@ -224,13 +224,17 @@ class ONNXProvider(EmbeddingProvider):
         return self._dim
 
     def _tokenize(self, texts: list[str]) -> dict:
-        return self._tokenizer(
+        result = self._tokenizer(
             texts,
             padding="max_length",
             truncation=True,
             max_length=512,
             return_tensors="np",
         )
+        # Some ONNX exports (e5-small, XLM-RoBERTa) expect token_type_ids
+        if "token_type_ids" not in result:
+            result["token_type_ids"] = result["input_ids"] * 0
+        return result
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if self._doc_prefix:
