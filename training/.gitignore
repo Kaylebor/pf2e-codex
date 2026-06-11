@@ -1,5 +1,7 @@
 .venv/
 reranker*/
+bge-*-quantized*/
+embed-*-finetuned*/
 __pycache__/
 *.pyc
 uv.lock
