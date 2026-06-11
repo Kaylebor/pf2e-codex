@@ -2,6 +2,76 @@
 
 > **Update this file** whenever you change architecture, add/remove modules, switch deps, or alter design decisions. Keep ROADMAP.md and README.md in sync too. Stale docs are worse than no docs.
 
+## Hard Lessons (don't repeat these)
+
+### Thread safety: always lock, never check-then-act outside lock
+Python threads can see stale values without synchronization. Every lazy-init pattern must
+use `with self._lock:` wrapping BOTH the check AND the assignment. A double-checked locking
+pattern where the first check is outside the lock is still broken — the first check can see
+a stale cached value from another thread's write.
+
+```python
+# BROKEN — first check outside lock can see stale None
+if self._provider is None:
+    with self._lock:
+        if self._provider is None:
+            self._provider = get_provider(...)
+return self._provider
+
+# CORRECT — lock acquired before first check
+with self._lock:
+    if self._provider is None:
+        self._provider = get_provider(...)
+    return self._provider
+```
+
+Applies to: `_provider`, `_reranker`, `_conn` (connection setup must be INSIDE the lock).
+
+### MIGraphX global state is not thread-safe
+Even different ONNX sessions using MIGraphXExecutionProvider can't run inference
+simultaneously. MIGraphX shares global GPU state. If the warmup thread loads the reranker
+while a search thread uses the embedding model, one of them crashes with an assertion
+failure in `migraphx::module_impl::contains`.
+
+**Fix**: `warmup_ready` must not be set until ALL models (embedding + reranker) are fully
+initialized. The daemon refuses queries until warmup completes.
+
+### CLI must never fall back to local inference when daemon exists
+If the daemon is registered (server.json exists), the CLI must NEVER create its own
+SearchIndex. Doing so triggers a separate MIGraphX compile that competes with the
+daemon's warmup, causing crashes or OOM.
+
+```python
+# Check: if daemon registered, don't fall back
+from .daemon_proxy import _server_json_path
+if _server_json_path().exists():
+    typer.echo("Daemon is registered but not responding.", err=True)
+    return
+```
+
+### CLI fallback SearchIndex must use config values
+When the CLI runs without a daemon, all SearchIndex constructors must receive
+`settings.reranker_model` — otherwise the reranker defaults to the untuned base model
+(empty repo name).
+
+### Always validate before blaming dependencies
+When a crash trace points into a dependency (MIGraphX, PyTorch, etc.), assume our code
+is at fault first. Validate with a controlled test before reporting upstream.
+
+### Logging for systemd
+Systemd services capture stderr reliably. `print(flush=True)` to stdout may not reach
+the journal depending on the service type. Use `sys.stderr.write()` for daemon logs.
+
+### System cache dir is a development artifact
+Only the user cache at `~/.cache/pf2e-codex/onnx/migraphx_cache/` should exist. System
+dirs like `/usr/share/pf2e-codex/migraphx_cache/` are stale PKGBUILD artifacts and
+must be removed.
+
+### Root warmup is wasted
+During PKGBUILD install, `post_install` runs as root. `Path.home()` resolves to
+`/root/`, so warmup writes .mxr to `/root/.cache/` which the user's daemon never sees.
+Warmup should be removed from PKGBUILD entirely; it happens on first daemon start.
+
 ## What This Is
 
 A standalone tool for Pathfinder 2E rules lookup. It downloads PF2E data from the official FoundryVTT system releases, chunks and enriches it, embeds it, and stores it in a local sqlite-vec database. Then it exposes that database via:
