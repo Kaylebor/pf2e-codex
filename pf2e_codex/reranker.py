@@ -105,7 +105,7 @@ class Reranker:
                 opts.intra_op_num_threads = int(warmup_threads)
             cache_dir = _migraphx_cache_dir()
             provider_opts = [{"migraphx_model_cache_dir": str(cache_dir)}]
-            _sys.stderr.write(f"[reranker] Creating ONNX session: {self._model_repo} @ {','.join(providers)}\n")
+            _sys.stderr.write(f"[reranker] Creating ONNX session: {self.model_name} @ {','.join(providers)}\n")
             _sys.stderr.flush()
             return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=provider_opts)
 
