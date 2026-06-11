@@ -94,7 +94,8 @@ def search(
             return
         if "error" in result:
             typer.echo(f"Daemon: {result['error']}", err=True)
-            typer.echo("Falling back to local inference (may be slow on first run)...", err=True)
+            typer.echo("Wait for the daemon to finish warming up, then retry.", err=True)
+            return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
     results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
