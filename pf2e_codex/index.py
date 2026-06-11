@@ -579,9 +579,15 @@ class SearchIndex:
             self._conn = None
 
     def warmup(self) -> None:
-        """Eagerly initialize providers (background thread at daemon start)."""
+        """Eagerly initialize providers (background thread at daemon start).
+
+        Sets warmup_ready immediately so queries are never blocked — models
+        compile in background. First query may still pay compile cost if
+        warmup hasn't finished (same as no-warmup compile-on-first-query).
+        """
         import sys as _sys
         import time as _time
+        self.warmup_ready.set()
         t0 = _time.monotonic()
         _sys.stderr.write(f"[warmup] Starting ({self.model_name}, reranker={self._reranker_model})\n")
         try:
@@ -598,5 +604,3 @@ class SearchIndex:
             _sys.stderr.write(f"[warmup] Done ({_time.monotonic() - t0:.0f}s)\n")
         except Exception as e:
             _sys.stderr.write(f"[warmup] FAILED: {e}\n")
-        finally:
-            self.warmup_ready.set()
