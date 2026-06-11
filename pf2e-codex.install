@@ -10,10 +10,7 @@ post_install() {
     echo ""
     echo "Pre-compiling ONNX models for GPU..."
     echo "  (This may take several minutes — safe to interrupt, will resume on first query)"
-    pf2e-codex warmup \
-      --model-dir /usr/share/pf2e-codex/models \
-      --cache-dir /usr/share/pf2e-codex/migraphx_cache \
-      --threads 2 2>&1 || true
+    pf2e-codex warmup --threads 2 2>&1 || true
 }
 
 post_upgrade() {
