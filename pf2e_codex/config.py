@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     provider: str = Field(default="auto", description="Embedding provider: auto, onnx")
     onnx_provider: str = Field(default="auto", description="ONNX execution provider: auto, migraphx, rocm, cuda, cpu, none")
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
-    reranker_model: str = Field(default="Kaylebor/pf2e-codex-reranker-minilm", description="Fine-tuned reranker model on HuggingFace. Empty = use built-in bge-reranker-v2-m3.")
+    reranker_model: str = Field(default="Kaylebor/pf2e-codex-reranker-quantized", description="Fine-tuned reranker model on HuggingFace. Leave at default for best results (int8 quantized, 0.55GB, multilingual).")
     warmup_threads: int = Field(default=2, description="ONNX intra-op threads during 'pf2e-codex warmup'. Lower = less GPU power draw.")
     languages: list[str] = Field(default=["en"], description="Languages to index (e.g. ['en', 'es'])")
     transport: str = Field(default="stdio", description="MCP transport: stdio, sse, or streamable-http")
