@@ -583,19 +583,20 @@ class SearchIndex:
     def warmup(self) -> None:
         """Eagerly initialize providers (background thread at daemon start).
 
-        Sets warmup_ready immediately so queries are never blocked — models
-        compile in background. First query may still pay compile cost if
-        warmup hasn't finished (same as no-warmup compile-on-first-query).
+        Sets warmup_ready after embedding model is loaded (queries work
+        immediately, reranker compiles in background). Gate opens once
+        the embedding provider exists — first query won't race with
+        warmup's MIGraphX compile.
         """
         import sys as _sys
         import time as _time
-        self.warmup_ready.set()
         t0 = _time.monotonic()
         _sys.stderr.write(f"[warmup] Starting ({self.model_name}, reranker={self._reranker_model})\n")
         try:
             _sys.stderr.write("[warmup] Loading embedding provider...\n")
             _ = self.provider.embed_query("warmup")
             _sys.stderr.write(f"[warmup] Embedding ready ({_time.monotonic() - t0:.0f}s)\n")
+            self.warmup_ready.set()  # Gate: embedding ready, queries can proceed
             if self._reranker_model:
                 from .reranker import Reranker  # noqa: PLC0415
                 t1 = _time.monotonic()
