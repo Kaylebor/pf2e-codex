@@ -176,29 +176,30 @@ class SearchIndex:
                         f"Auto-download failed.\n"
                         f"Run 'pf2e-codex embed' to build from scratch"
                     )
-        self._conn = sqlite3.connect(str(self.db_path))
-        load_vec_extension(self._conn)
-        row = self._conn.execute(
-            "SELECT value FROM _meta WHERE key = 'embedding_model'"
-        ).fetchone()
-        db_model = row[0] if row else None
-        if db_model and db_model != self.model_name:
-            print(f"Warning: DB model {db_model} != config model {self.model_name}")
-        row = self._conn.execute(
-            "SELECT value FROM _meta WHERE key = 'embedding_dim'"
-        ).fetchone()
-        self._dim = int(row[0]) if row else 384
-        # Lazy-create refs table for DBs built before this feature
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS refs (
-                source_id TEXT,
-                target_uuid TEXT,
-                target_name TEXT,
-                context TEXT
-            )
-        """)
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)")
+        with self._lock:
+            self._conn = sqlite3.connect(str(self.db_path))
+            load_vec_extension(self._conn)
+            row = self._conn.execute(
+                "SELECT value FROM _meta WHERE key = 'embedding_model'"
+            ).fetchone()
+            db_model = row[0] if row else None
+            if db_model and db_model != self.model_name:
+                print(f"Warning: DB model {db_model} != config model {self.model_name}")
+            row = self._conn.execute(
+                "SELECT value FROM _meta WHERE key = 'embedding_dim'"
+            ).fetchone()
+            self._dim = int(row[0]) if row else 384
+            # Lazy-create refs table for DBs built before this feature
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS refs (
+                    source_id TEXT,
+                    target_uuid TEXT,
+                    target_name TEXT,
+                    context TEXT
+                )
+            """)
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)")
 
     def _ensure_fts(self) -> None:
         if self._fts_ready:
@@ -326,6 +327,8 @@ class SearchIndex:
                 with self._lock:
                     if self._reranker is None:
                         from .reranker import Reranker
+                        import sys as _sys
+                        _sys.stderr.write(f"[search] Initializing reranker ({self._reranker_model})\n")
                         self._reranker = Reranker(model_repo=self._reranker_model)
                 # Use RRF top 50 as candidates, rerank to top_k
                 results = self._reranker.rerank(query, results, top_k=top_k)

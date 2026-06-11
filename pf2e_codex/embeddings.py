@@ -322,5 +322,5 @@ def get_provider(
     force = onnx_provider if onnx_provider != "auto" else None
     prov = ONNXProvider(model_name, force_provider=force)
     detected = prov._session.get_providers()[0] if hasattr(prov, '_session') else _detect_onnx_provider()
-    print(f"Using ONNX with {detected}")
+    print(f"Using ONNX with {detected} (model={model_name})")
     return prov
