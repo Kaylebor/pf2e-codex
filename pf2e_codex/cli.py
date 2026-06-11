@@ -97,7 +97,7 @@ def search(
             typer.echo("Wait for the daemon to finish warming up, then retry.", err=True)
             return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
     results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
     print_search_results(results, query)
 
@@ -121,7 +121,7 @@ def get(
         typer.echo(result["text"])
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
     result = search_idx.fetch_by_id(entry_id)
     if result:
         typer.echo(f"[{result['type']}] {result['name']} ({result['pack']})")
@@ -158,7 +158,7 @@ def related(
             typer.echo("No related entries found.")
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
     results = search_idx.related(entry_id, direction, limit)
     if results.get("outgoing"):
         typer.echo(f"\n{entry_id} references:")
@@ -185,7 +185,7 @@ def status(
         print_status(meta)
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
     meta = search_idx.status()
     meta["model"] = settings.model
     meta["db"] = str(settings.db)
@@ -204,7 +204,7 @@ def catalog(
         print_catalog(cat)
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider)
+    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
     cat = search_idx.catalog()
     print_catalog(cat)
 
