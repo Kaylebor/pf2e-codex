@@ -325,8 +325,10 @@ class SearchIndex:
         if rerank and len(results) > 1:
             try:
                 if self._reranker is None:
-                    from .reranker import Reranker
-                    self._reranker = Reranker(model_repo=self._reranker_model)
+                    with self._lock:
+                        if self._reranker is None:
+                            from .reranker import Reranker
+                            self._reranker = Reranker(model_repo=self._reranker_model)
                 # Use RRF top 50 as candidates, rerank to top_k
                 results = self._reranker.rerank(query, results, top_k=top_k)
             except Exception as e:
@@ -598,7 +600,9 @@ class SearchIndex:
                 from .reranker import Reranker  # noqa: PLC0415
                 t1 = _time.monotonic()
                 _sys.stderr.write(f"[warmup] Loading reranker ({self._reranker_model})...\n")
-                self._reranker = Reranker(model_repo=self._reranker_model)
+                with self._lock:
+                    if self._reranker is None:
+                        self._reranker = Reranker(model_repo=self._reranker_model)
                 self._reranker.rerank("warmup", [{"text": "warmup", "id": "_warmup"}], top_k=1)
                 _sys.stderr.write(f"[warmup] Reranker ready ({_time.monotonic() - t1:.0f}s)\n")
             _sys.stderr.write(f"[warmup] Done ({_time.monotonic() - t0:.0f}s)\n")
