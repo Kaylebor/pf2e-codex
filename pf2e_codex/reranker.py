@@ -59,6 +59,13 @@ class Reranker:
         model_path = self._cache_dir / "model.onnx"
         quant_path = self._cache_dir / "model_quantized.onnx"
         if model_path.exists() or quant_path.exists():
+            # Pin shapes on already-cached models (in case they were downloaded
+            # before the _pin_onnx_shapes fix was added).
+            from .embeddings import _pin_onnx_shapes  # noqa: PLC0415
+            for f in ("model_quantized.onnx", "model.onnx"):
+                p = self._cache_dir / f
+                if p.exists():
+                    _pin_onnx_shapes(p, seq_len=512)
             return
 
         print(f"Downloading reranker model {self.model_name}...")
@@ -78,6 +85,12 @@ class Reranker:
             self.model_name, export=False, force_download=True, file_name=file_name
         )
         model.save_pretrained(self._cache_dir)
+        # Pin dynamic sequence-length axis to prevent MIGraphX re-compiles
+        from .embeddings import _pin_onnx_shapes  # noqa: PLC0415
+        for f in ("model_quantized.onnx", "model.onnx"):
+            p = self._cache_dir / f
+            if p.exists():
+                _pin_onnx_shapes(p, seq_len=512)
         tokenizer = AutoTokenizer.from_pretrained(self.model_name, fix_mistral_regex=False)
         tokenizer.save_pretrained(self._cache_dir)
         print(f"Downloaded in {time.time() - start:.1f}s -> {self._cache_dir}")

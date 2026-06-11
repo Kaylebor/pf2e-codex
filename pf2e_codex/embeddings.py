@@ -12,6 +12,35 @@ from typing import Any
 from .models import get_model_info
 
 
+def _pin_onnx_shapes(model_path: Path, seq_len: int = 512) -> None:
+    """Pin dynamic sequence-length axes to fixed values in an ONNX model.
+
+    MIGraphX compares compiled-program parameter shapes against actual input
+    shapes before every inference.  When the ONNX model uses dynamic axes
+    (\"batch_size\", \"sequence_length\"), the compiled shape representation
+    can differ from the actual input tensor lengths, triggering a full re-compile
+    on every query.
+
+    Pinning the sequence-length dim to a fixed value (512, matching the tokenizer
+    max_length) makes every query produce the same shape and eliminates
+    spurrious re-compiles.
+
+    Batch size (dim 0) is left dynamic so bulk indexing (batch=32) still works.
+    """
+    import onnx
+
+    m = onnx.load(str(model_path))
+    changed = False
+    for inp in m.graph.input:
+        dims = inp.type.tensor_type.shape.dim
+        if len(dims) >= 2 and dims[1].dim_param:
+            dims[1].dim_value = seq_len
+            dims[1].ClearField("dim_param")
+            changed = True
+    if changed:
+        onnx.save(m, str(model_path))
+
+
 class EmbeddingProvider(ABC):
     """Abstract base for embedding providers."""
 
@@ -148,6 +177,9 @@ class ONNXProvider(EmbeddingProvider):
     def _export_if_needed(self, local_path: str | None = None) -> None:
         model_path = self._cache_dir / "model.onnx"
         if model_path.exists():
+            # Pin shapes on already-cached model (in case it was exported before
+            # the _pin_onnx_shapes fix was added).
+            _pin_onnx_shapes(model_path)
             return
 
         export_path = local_path or self.model_name
@@ -176,6 +208,10 @@ class ONNXProvider(EmbeddingProvider):
                 model = ORTModelForFeatureExtraction.from_pretrained(export_path, **kwargs)
             transformers.utils.logging.set_verbosity_warning()
             model.save_pretrained(self._cache_dir)
+            # Pin ONNX input shapes to static — prevents MIGraphX shape mismatch
+            # recompiles caused by dynamic axes ("batch_size", "sequence_length")
+            # comparing differently after compilation.
+            _pin_onnx_shapes(self._cache_dir / "model.onnx")
             print(f"Exported in {time.time() - start:.1f}s -> {self._cache_dir}")
         except Exception as e:
             for f in self._cache_dir.glob("*"):
