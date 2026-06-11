@@ -56,7 +56,8 @@ class Reranker:
     def _ensure_model(self) -> None:
         """Download pre-exported ONNX model if not cached."""
         model_path = self._cache_dir / "model.onnx"
-        if model_path.exists():
+        quant_path = self._cache_dir / "model_quantized.onnx"
+        if model_path.exists() or quant_path.exists():
             return
 
         print(f"Downloading reranker model {self.model_name}...")
@@ -77,8 +78,15 @@ class Reranker:
         import onnxruntime as ort
 
         model_path = self._cache_dir / "model.onnx"
+        quant_path = self._cache_dir / "model_quantized.onnx"
+        if quant_path.exists() and not model_path.exists():
+            model_path = quant_path
         if not model_path.exists():
-            raise RuntimeError(f"Model not found at {model_path}")
+            # Check for quantized variant
+            if quant_path.exists():
+                model_path = quant_path
+            else:
+                raise RuntimeError(f"Model not found at {model_path} or {quant_path}")
 
         def _session(providers):
             opts = ort.SessionOptions()
