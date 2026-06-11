@@ -62,14 +62,22 @@ class Reranker:
 
         print(f"Downloading reranker model {self.model_name}...")
         start = time.time()
+        from huggingface_hub import hf_hub_download as _dl
         from optimum.onnxruntime import ORTModelForSequenceClassification
+        from transformers import AutoTokenizer
+        
+        # Try model_quantized.onnx first (int8), fall back to model.onnx
+        file_name = "model_quantized.onnx"
+        try:
+            _dl(repo_id=self.model_name, filename=file_name)
+        except Exception:
+            file_name = "model.onnx"
+        
         model = ORTModelForSequenceClassification.from_pretrained(
-            self.model_name, export=False, force_download=True
+            self.model_name, export=False, force_download=True, file_name=file_name
         )
         model.save_pretrained(self._cache_dir)
-        # Also save tokenizer
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name, fix_mistral_regex=False)
         tokenizer.save_pretrained(self._cache_dir)
         print(f"Downloaded in {time.time() - start:.1f}s -> {self._cache_dir}")
 
