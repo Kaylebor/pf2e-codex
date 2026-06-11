@@ -245,6 +245,8 @@ class SearchIndex:
         rerank: bool = False,
     ) -> list[dict]:
         self._ensure_loaded()
+        import sys as _sys
+        _sys.stderr.write(f"[search] search() called (hash={id(self):x}, _provider={'SET' if self._provider else 'NONE'})\n")
 
         # Build WHERE clauses for filters
         where_clauses = ["1=1"]
