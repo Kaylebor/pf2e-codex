@@ -601,8 +601,10 @@ class SearchIndex:
             _sys.stderr.write("[warmup] Loading embedding provider...\n")
             _ = self.provider.embed_query("warmup")
             _sys.stderr.write(f"[warmup] Embedding ready ({_time.monotonic() - t0:.0f}s)\n")
-            self.warmup_ready.set()  # Gate: embedding ready, queries can proceed
             if self._reranker_model:
+                # Reranker needs MIGraphX too; it shares global state with
+                # the embedding provider. Gate stays closed until both are
+                # initialized — prevents MIGraphX concurrency crash.
                 from .reranker import Reranker  # noqa: PLC0415
                 t1 = _time.monotonic()
                 _sys.stderr.write(f"[warmup] Loading reranker ({self._reranker_model})...\n")
@@ -610,6 +612,10 @@ class SearchIndex:
                     if self._reranker is None:
                         self._reranker = Reranker(model_repo=self._reranker_model)
                 self._reranker.rerank("warmup", [{"text": "warmup", "id": "_warmup"}], top_k=1)
+                _sys.stderr.write(f"[warmup] Reranker ready ({_time.monotonic() - t1:.0f}s)\n")
+            # Gate opens after ALL models initialized (MIGraphX global state
+            # is not thread-safe — can't run embedding + reranker concurrently)
+            self.warmup_ready.set()
                 _sys.stderr.write(f"[warmup] Reranker ready ({_time.monotonic() - t1:.0f}s)\n")
             _sys.stderr.write(f"[warmup] Done ({_time.monotonic() - t0:.0f}s)\n")
         except Exception as e:
