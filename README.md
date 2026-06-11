@@ -207,6 +207,87 @@ The tool proactively tries ONNX Runtime for faster inference. It works out of th
 If ONNX fails for any reason, the tool silently falls back to sentence-transformers.
 
 To force the fallback:
+
+```bash
+PF2E_PROVIDER=sentence_transformers pf2e-codex index
+```
+
+To force ONNX (fail if unavailable):
+```bash
+PF2E_PROVIDER=onnx pf2e-codex index
+```
+
+**Provider priority:** ROCm → CUDA → CPU. ZLUDA (CUDA-on-AMD emulation) is correctly deprioritized — native ROCm is preferred.
+
+## Multilingual Search
+
+For Spanish (and other languages), pf2e-codex supports fetching a community-maintained
+Babele translation module at index time.
+
+### Configuration
+
+```toml
+# Enables Spanish translations at index time
+languages = ["en", "es"]
+
+# Use multilingual embedding model (supports 100+ languages)
+model = "intfloat/multilingual-e5-small"
+reranker_model = "Kaylebor/pf2e-codex-reranker-minilm"
+```
+
+When `languages` includes non-English languages, `pf2e-codex build` or `pf2e-codex index`
+will download the corresponding translation module and merge translations into chunks.
+Each chunk gains a `translations` field with per-language name/text.
+
+### Searching in a language
+
+```bash
+# Return results with Spanish names/descriptions
+pf2e-codex search "bola de fuego" --lang es
+
+# Keep English as default
+pf2e-codex search "fireball"
+```
+
+If `--lang es` is set and no Spanish translation exists for an entry, the English text
+is shown as fallback.
+
+### Candidate models (under evaluation)
+
+| Model | Type | Size | Languages | Status |
+|-------|------|------|-----------|--------|
+| `intfloat/multilingual-e5-small` | Embedding | 118M, 384d | 100+ | Recommended |
+| `Kaylebor/pf2e-codex-reranker` | Cross-encoder reranker | 2.2GB | 100+ | Works but large |
+| `Kaylebor/pf2e-codex-reranker-minilm` | Cross-encoder reranker | 88MB | EN only | Default |
+
+For a lightweight multilingual setup, use the e5-small embedding (handles cross-lingual
+retrieval natively) without a reranker. For optimal quality, use the 2.2GB reranker
+(compile once, cached). Future work includes quantizing the 2.2GB model to ~1.1GB.
+
+The tool proactively tries ONNX Runtime for faster inference. It works out of the box on CPU.
+
+**For GPU acceleration, install the matching `onnxruntime` variant:**
+
+| GPU | Install | Source |
+|-----|---------|-------|
+| AMD (ROCm) | `pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/` | AMD official repo |
+| NVIDIA (CUDA) | `pip install onnxruntime-gpu` | PyPI (official) |
+| CPU | `pip install onnxruntime` | PyPI (official) |
+
+> **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
+
+**Performance (steady-state, 7900 XTX):**
+
+| Model | PyTorch CPU (batch=100) | ONNX GPU (batch=100) | Speedup |
+|-------|----------------------:|---------------------:|-------:|
+| all-MiniLM-L6-v2 | 520ms | 8.3ms | 63× |
+| snowflake-arctic-embed-xs | 612ms | 8.3ms | 74× |
+| intfloat/e5-small-v2 | 1212ms | 13.4ms | 90× |
+| Single query (any) | ~5ms | ~1ms | 5× |
+
+If ONNX fails for any reason, the tool silently falls back to sentence-transformers.
+
+To force the fallback:
 ```bash
 PF2E_PROVIDER=sentence_transformers pf2e-codex index
 ```

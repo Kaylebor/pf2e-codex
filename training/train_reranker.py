@@ -124,7 +124,12 @@ def train(args):
             batch_size = batch["batch_size"]
 
             # Single forward pass — batch pos and neg together (ROCm LayerNorm fix)
-            all_scores = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
+            all_scores = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            # Handle both num_labels=1 (regression) and num_labels=2 (classification)
+            if all_scores.shape[-1] == 1:
+                all_scores = all_scores.squeeze(-1)
+            elif all_scores.shape[-1] == 2:
+                all_scores = all_scores[:, 1] - all_scores[:, 0]
             pos_score = all_scores[:batch_size]
             neg_score = all_scores[batch_size:]
 
@@ -157,7 +162,11 @@ def train(args):
                 batch_size = batch["batch_size"]
 
                 with torch.no_grad():
-                    all_scores = model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
+                    all_scores = model(input_ids=input_ids, attention_mask=attention_mask).logits
+                    if all_scores.shape[-1] == 1:
+                        all_scores = all_scores.squeeze(-1)
+                    elif all_scores.shape[-1] == 2:
+                        all_scores = all_scores[:, 1] - all_scores[:, 0]
                     pos_score = all_scores[:batch_size]
                     neg_score = all_scores[batch_size:]
 
