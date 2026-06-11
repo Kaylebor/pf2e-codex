@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys as _sys
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -109,6 +110,8 @@ class ONNXProvider(EmbeddingProvider):
             warmup_threads = os.environ.get("PF2E_WARMUP_THREADS")
             if warmup_threads:
                 opts.intra_op_num_threads = int(warmup_threads)
+            _sys.stderr.write(f"[provider] Creating ONNX session: {self.model_name} @ {','.join(providers)}\n")
+            _sys.stderr.flush()
             return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=p_opts or [])
 
         if force_provider and force_provider not in ("auto", ""):

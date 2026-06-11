@@ -7,6 +7,7 @@ them using a cross-encoder model that sees query and document jointly.
 from __future__ import annotations
 
 import os
+import sys as _sys
 import time
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,8 @@ class Reranker:
                 opts.intra_op_num_threads = int(warmup_threads)
             cache_dir = _migraphx_cache_dir()
             provider_opts = [{"migraphx_model_cache_dir": str(cache_dir)}]
+            _sys.stderr.write(f"[reranker] Creating ONNX session: {self._model_repo} @ {','.join(providers)}\n")
+            _sys.stderr.flush()
             return ort.InferenceSession(str(model_path), opts, providers=providers, provider_options=provider_opts)
 
         if force_provider and force_provider not in ("auto", ""):
