@@ -226,6 +226,8 @@ class SearchIndex:
     def provider(self) -> EmbeddingProvider:
         with self._lock:
             if self._provider is None:
+                import sys as _sys
+                _sys.stderr.write(f"[provider] Creating new provider (model={self.model_name})\n")
                 self._provider = get_provider(
                     self.model_name,
                     provider=self._provider_type,
