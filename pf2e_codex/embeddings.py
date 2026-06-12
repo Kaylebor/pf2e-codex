@@ -61,9 +61,11 @@ class EmbeddingProvider(ABC):
 # ── ONNX ────────────────────────────────────────────────────────────────
 
 _ONNX_EXEC_PROVIDERS = [
+    # CUDA EP via SCALE (handles dynamic shapes natively, no per-shape compile)
+    # Prefer over MIGraphX when available — use with onnxruntime-gpu + SCALE.
+    "CUDAExecutionProvider",
     "MIGraphXExecutionProvider",
     "ROCMExecutionProvider",
-    "CUDAExecutionProvider",
     "CPUExecutionProvider",
 ]
 
