@@ -27,8 +27,11 @@ def _search() -> object | None:
         return None
     from pf2e_codex.config import Settings
     from pf2e_codex.index import SearchIndex
+    from pf2e_codex.model_manager import ModelManager
     s = Settings(model=DEFAULT_MODEL, data_dir=str(DATA_DIR))
-    return SearchIndex(s.db, s.model, s.provider, s.onnx_provider)
+    manager = ModelManager(s.model, s.reranker_model, onnx_provider=s.query_provider)
+    manager.start()
+    return SearchIndex(s.db, manager)
 
 
 needs_db = pytest.mark.skipif(
