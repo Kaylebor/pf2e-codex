@@ -192,7 +192,7 @@ class Reranker:
         pair_inputs = self._tokenizer(
             [query] * len(texts),
             texts,
-            padding=True,
+            padding="max_length",
             truncation="only_second",
             max_length=512,
             return_tensors="np",
