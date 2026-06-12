@@ -21,7 +21,7 @@ def _local_index(settings: Settings, *, model: str | None = None) -> SearchIndex
         model_name=model or settings.model,
         reranker_model=settings.reranker_model,
         provider=settings.provider,
-        onnx_provider=settings.onnx_provider,
+        onnx_provider=settings.query_provider,
     )
     manager.start()
     return SearchIndex(settings.db, manager)
@@ -243,7 +243,8 @@ def config(
     typer.echo(f"  data_dir: {s.data_dir}")
     typer.echo(f"  db: {s.db}  (derived)")
     typer.echo(f"  provider: {s.provider}")
-    typer.echo(f"  onnx_provider: {s.onnx_provider}")
+    typer.echo(f"  onnx_provider: {s.onnx_provider}  (embedding/indexing)")
+    typer.echo(f"  query_provider: {s.query_provider}  (daemon queries)")
     typer.echo(f"  release: {s.release}")
     typer.echo(f"  cache_dir: {s.cache_dir}")
     typer.echo(f"  transport: {s.transport}")

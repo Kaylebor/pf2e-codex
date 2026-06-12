@@ -117,7 +117,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         model_name=settings.model,
         reranker_model=settings.reranker_model,
         provider=settings.provider,
-        onnx_provider=settings.onnx_provider,
+        onnx_provider=settings.query_provider,
     )
     manager.start()  # synchronous — server won't accept requests until ready
 
