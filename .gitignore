@@ -26,3 +26,4 @@ uv.lock
 venv/
 # Virtual environments
 .vscode/
+.scale-test/

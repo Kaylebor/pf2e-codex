@@ -12,11 +12,17 @@ doesn't have this issue.
 
 ## Setup
 
-1. Download SCALE from https://scale-lang.com/ (tarball)
-2. Extract to /opt/scale
-3. Activate: source /opt/scale/bin/scaleenv gfx1100
-4. Install CUDA onnxruntime:
-   uv pip install onnxruntime-gpu
+```bash
+# Download and extract (all architectures bundled)
+wget https://pkgs.scale-lang.com/tar/scale-latest-amd64.tar.xz
+tar xf scale-latest-amd64.tar.xz
+
+# Activate for your GPU (7900 XTX = gfx1100)
+source ./scale/bin/scaleenv gfx1100
+
+# Install CUDA onnxruntime
+uv pip install onnxruntime-gpu
+```
 
 ## Test
 

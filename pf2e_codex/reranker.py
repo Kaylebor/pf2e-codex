@@ -90,7 +90,7 @@ class Reranker:
         for f in ("model_quantized.onnx", "model.onnx"):
             p = self._cache_dir / f
             if p.exists():
-                _pin_onnx_shapes(p, seq_len=512)
+                _pin_onnx_shapes(p, seq_len=256)
         tokenizer = AutoTokenizer.from_pretrained(self.model_name, fix_mistral_regex=False)
         tokenizer.save_pretrained(self._cache_dir)
         print(f"Downloaded in {time.time() - start:.1f}s -> {self._cache_dir}")
