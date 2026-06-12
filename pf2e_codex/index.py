@@ -334,6 +334,9 @@ class SearchIndex:
         for r in results:
             r["refs"] = refs_by_source.get(r["id"], [])
 
+            # NONE license → OGL (missing metadata, but pre-ORC content)
+            if r.get("license") in ("NONE", None, ""):
+                r["license"] = "OGL"
             # Extract legacy name from alias pattern: "X (formerly Y)"
             name = r.get("name", "")
             if " (formerly " in name:

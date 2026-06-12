@@ -569,7 +569,7 @@ class ChunkBuilder:
                 "has_description": bool(plain),
                 "refs": refs,
                 "source_hash": None,
-                "license": entry.get("system", {}).get("publication", {}).get("license", "NONE"),
+                "license": entry.get("system", {}).get("publication", {}).get("license", "OGL"),
             })
         return chunks
 
@@ -658,7 +658,7 @@ class ChunkBuilder:
             if parts:
                 lines += ["", f"Source: {' '.join(parts)}"]
 
-        license_val = pub.get("license", "NONE")
+        license_val = pub.get("license", "OGL")
         remaster_val = pub.get("remaster", None)  # True/False/None
 
         return {
