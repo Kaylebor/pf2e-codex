@@ -65,7 +65,7 @@ class Reranker:
             for f in ("model_quantized.onnx", "model.onnx"):
                 p = self._cache_dir / f
                 if p.exists():
-                    _pin_onnx_shapes(p, seq_len=512)
+                    _pin_onnx_shapes(p, seq_len=256)
             return
 
         print(f"Downloading reranker model {self.model_name}...")
@@ -194,7 +194,7 @@ class Reranker:
             texts,
             padding="max_length",
             truncation="only_second",
-            max_length=512,
+            max_length=256,
             return_tensors="np",
         )
 
