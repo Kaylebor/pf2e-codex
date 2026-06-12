@@ -223,7 +223,7 @@ class SearchIndex:
         self, query: str, top_k: int = 5, hybrid: bool = True,
         license: str | None = None, content_type: str | None = None,
         pack: str | None = None, remaster: bool | None = None,
-        rerank: bool = False, rerank_candidates: int = 25,
+        rerank: bool = False, rerank_candidates: int = 15,
     ) -> list[dict]:
         self._ensure_loaded()
         import sys as _sys

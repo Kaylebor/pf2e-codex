@@ -132,7 +132,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         top_k: int = 5,
         hybrid: bool = False,
         rerank: bool = True,
-        rerank_candidates: int = 25,
+        rerank_candidates: int = 15,
         license: str | None = None,
         content_type: str | None = None,
         pack: str | None = None,
