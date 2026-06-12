@@ -564,6 +564,47 @@ def pull(
     typer.echo(f"Done. DBs in: {target_dir}")
 
 
+@app.command()
+def rules_explain(
+    topic: str = typer.Argument(..., help="Topic to explain (e.g. 'flanking', 'cover rules')"),
+    top_k: int = typer.Option(3, "--top-k", "-k", help="Number of results"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+) -> None:
+    """Get core rules explanations (prioritizes journal pages and conditions)."""
+    from .daemon_proxy import proxy_rules_explain
+    result = proxy_rules_explain(topic, top_k=top_k)
+    if result and "results" in result:
+        for r in result["results"]:
+            typer.echo(f"\n  [{r['type']}] {r['name']} ({r['pack']})")
+            typer.echo(f"  {r['text'][:300]}...")
+        return
+    if result and "error" in result:
+        typer.echo(f"Daemon: {result['error']}", err=True)
+        return
+    # Local fallback
+    settings = _settings(data_dir=data_dir, model=model)
+    search_idx = _local_index(settings)
+    results = search_idx.rules_explain(topic, top_k)
+    for r in results:
+        typer.echo(f"\n  [{r.get('type','?')}] {r.get('name','?')} ({r.get('pack','?')})")
+        typer.echo(f"  {r.get('text','')[:300]}...")
+
+
+@app.command()
+def flag(
+    result_index: int = typer.Argument(..., help="1-based index of the bad result"),
+    note: str = typer.Option("", "--note", "-n", help="Description of what's wrong"),
+) -> None:
+    """Flag a previous search result as incorrect (for quality tracking)."""
+    from .daemon_proxy import proxy_flag_result
+    result = proxy_flag_result(result_index, note)
+    if result:
+        typer.echo(result.get("message", "Flagged."))
+    else:
+        typer.echo("Daemon not running — flag stored locally is not supported.", err=True)
+
+
 def main() -> None:
     app(prog_name="pf2e-codex")
 

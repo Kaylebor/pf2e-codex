@@ -189,3 +189,23 @@ def proxy_catalog() -> dict | None:
     if not endpoint or not _check_server(endpoint):
         return None
     return _call_tool(endpoint, "pf2e_catalog", {})
+
+
+def proxy_rules_explain(topic: str, top_k: int = 3, license: str | None = None, content_type: str | None = None, remaster: bool | None = None) -> dict | None:
+    """Try to proxy a rules_explain query to the running MCP server."""
+    endpoint = _read_endpoint()
+    if not endpoint or not _check_server(endpoint):
+        return None
+    args = {"topic": topic, "top_k": top_k}
+    if license: args["license"] = license
+    if content_type: args["content_type"] = content_type
+    if remaster is not None: args["remaster"] = remaster
+    return _call_tool(endpoint, "pf2e_rules_explain", args)
+
+
+def proxy_flag_result(result_index: int, note: str = "") -> dict | None:
+    """Try to proxy a flag_result call to the running MCP server."""
+    endpoint = _read_endpoint()
+    if not endpoint or not _check_server(endpoint):
+        return None
+    return _call_tool(endpoint, "pf2e_flag_result", {"result_index": result_index, "note": note})
