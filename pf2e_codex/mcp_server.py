@@ -310,6 +310,70 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         meta = search.status()
         return json.dumps(meta, indent=2)
 
+    @mcp.tool()
+    def pf2e_query_db(sql: str, limit: int = 50) -> str:
+        """Run a read-only SQL query on the PF2E database.
+
+        The database has these tables:
+
+        **chunks** — every PF2E entry as one row:
+          id TEXT PRIMARY KEY ("pack:entry_id")
+          name TEXT — entry name (e.g. "Fireball", "Blinded")
+          type TEXT — "feat", "spell", "condition", "hazard", "npc", "action", 
+                     "equipment", "feat-effects", "journal_page", "script",
+                     "background", "deity", "familiar", "class-features", etc.
+          pack TEXT — compendium pack name (e.g. "spells", "feats", "conditions")
+          text TEXT — full entry text (may be long — use LIMIT or length())
+          license TEXT — "ORC", "OGL"
+          remaster INTEGER — 1 (remaster), 0 (legacy), or NULL
+
+        **refs** — cross-references between entries:
+          source_id TEXT — id of the entry that references
+          target_uuid TEXT — uuid of the referenced entry
+          target_name TEXT — name of the referenced entry
+          context TEXT — how it's referenced
+
+        **fts_chunks** (FTS5 virtual table):
+          name TEXT, text TEXT — full-text search via MATCH ?
+          Example: SELECT id, name, text FROM fts_chunks JOIN chunks
+                   ON chunks.rowid = fts_chunks.rowid
+                   WHERE fts_chunks MATCH '"fire" AND "ball"' ORDER BY rank
+
+        **vec_chunks** (vec0 virtual table for vector similarity):
+          id TEXT, embedding float[384]
+          Example: SELECT id, distance FROM vec_chunks
+                   WHERE embedding MATCH vec_f32(?)
+                   AND k = 10 ORDER BY distance
+          NOTE: you need the embedding vector (vec_f32 blob) — prefer
+                using pf2e_search with hybrid=True instead.
+
+        Constraints:
+        - SELECT only — INSERT/UPDATE/DELETE/DROP/CREATE/ALTER rejected
+        - Result limited to `limit` rows (max 100, default 50)
+        - Truncated to 5000 characters
+        - Best for structured queries: counts, lists, cross-references
+        - For free-text or fuzzy queries, use pf2e_search instead
+        """
+        sql_stripped = sql.strip()
+        if not sql_stripped.upper().startswith("SELECT"):
+            return json.dumps({"error": "Only SELECT queries are allowed"})
+        limit = max(1, min(limit, 100))
+        import sqlite3
+        try:
+            cur = search._conn_ro.execute(sql)
+            rows = cur.fetchmany(limit + 1)
+            truncated = len(rows) > limit
+            if truncated:
+                rows = rows[:limit]
+            cols = [d[0] for d in cur.description] if cur.description else []
+            result = {"columns": cols, "rows": rows, "truncated": truncated}
+            result_str = json.dumps(result, default=str, ensure_ascii=False)
+            if len(result_str) > 5000:
+                result_str = result_str[:5000] + "... (truncated)"
+            return result_str
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
     return mcp
 
 

@@ -142,6 +142,7 @@ class SearchIndex:
         self.db_path = Path(db_path)
         self._manager: ModelManager = manager
         self._conn: sqlite3.Connection | None = None
+        self._conn_ro: sqlite3.Connection | None = None
         self._fts_ready: bool = False
         self._db_lock = _threading.Lock()
 
@@ -174,14 +175,16 @@ class SearchIndex:
                         f"Run 'pf2e-codex embed' to build from scratch"
                     )
             self._conn = sqlite3.connect(str(self.db_path))
+            self._conn_ro = sqlite3.connect(f"file:{self.db_path}?mode=rw", uri=True, check_same_thread=False)
+            load_vec_extension(self._conn_ro)
             load_vec_extension(self._conn)
-            row = self._conn.execute(
+            row = self._conn_ro.execute(
                 "SELECT value FROM _meta WHERE key = 'embedding_model'"
             ).fetchone()
             db_model = row[0] if row else None
             if db_model and db_model != self._manager.model_name:
                 print(f"Warning: DB model {db_model} != config model {self._manager.model_name}")
-            row = self._conn.execute(
+            row = self._conn_ro.execute(
                 "SELECT value FROM _meta WHERE key = 'embedding_model'"
             ).fetchone()
             self._conn.execute("""
@@ -198,7 +201,7 @@ class SearchIndex:
     def _ensure_fts(self) -> None:
         if self._fts_ready:
             return
-        row = self._conn.execute(
+        row = self._conn_ro.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
         ).fetchone()
         if not row:
@@ -252,7 +255,7 @@ class SearchIndex:
         # 1. Semantic search (filtered)
         emb = self._encode(query)
         q_blob = vec_blob(emb)
-        semantic_raw = self._conn.execute(f"""
+        semantic_raw = self._conn_ro.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
@@ -278,7 +281,7 @@ class SearchIndex:
                 try:
                     self._ensure_fts()
                     fts_query = " AND ".join(f'"{w}"' for w in words)
-                    fts_raw = self._conn.execute(f"""
+                    fts_raw = self._conn_ro.execute(f"""
                         SELECT c.id, c.name, c.type, c.pack, c.text, c.license, c.remaster, rank
                         FROM fts_chunks
                         JOIN chunks c ON c.rowid = fts_chunks.rowid
@@ -323,7 +326,7 @@ class SearchIndex:
         # Batch-fetch outgoing refs for all results
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
-        refs_rows = self._conn.execute(f"""
+        refs_rows = self._conn_ro.execute(f"""
             SELECT source_id, target_name, target_uuid FROM refs
             WHERE source_id IN ({placeholders})
         """, ids).fetchall()
@@ -395,7 +398,7 @@ class SearchIndex:
         search_topic = f"{topic} condition" if " " not in topic.strip() else topic
         emb = self._encode(search_topic)
         q_blob = vec_blob(emb)
-        results = self._conn.execute(f"""
+        results = self._conn_ro.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
             FROM vec_chunks
             JOIN chunks ON vec_chunks.id = chunks.id
@@ -426,30 +429,30 @@ class SearchIndex:
         self._ensure_loaded()
 
         # Content type breakdown
-        types = self._conn.execute(
+        types = self._conn_ro.execute(
             "SELECT type, COUNT(*) FROM chunks GROUP BY type ORDER BY COUNT(*) DESC"
         ).fetchall()
 
         # License breakdown
-        licenses = self._conn.execute(
+        licenses = self._conn_ro.execute(
             "SELECT license, COUNT(*) FROM chunks GROUP BY license ORDER BY COUNT(*) DESC"
         ).fetchall()
 
         # Remaster breakdown (NULL grouped with legacy)
-        remaster_counts = self._conn.execute(
+        remaster_counts = self._conn_ro.execute(
             "SELECT CASE WHEN remaster = 1 THEN 'remaster' ELSE 'legacy' END as label, COUNT(*) FROM chunks GROUP BY label ORDER BY COUNT(*) DESC"
         ).fetchall()
 
         # Pack breakdown (top 20)
-        packs = self._conn.execute(
+        packs = self._conn_ro.execute(
             "SELECT pack, COUNT(*) FROM chunks GROUP BY pack ORDER BY COUNT(*) DESC LIMIT 20"
         ).fetchall()
 
         # Total chunks
-        total = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        total = self._conn_ro.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
 
         # Refs count
-        refs_count = self._conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
+        refs_count = self._conn_ro.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
 
         return {
             "total_chunks": total,
@@ -470,7 +473,7 @@ class SearchIndex:
             ("SELECT id, name, type, pack, text FROM chunks WHERE id = ?", (normalized,)),
             ("SELECT id, name, type, pack, text FROM chunks WHERE id LIKE ?", (f"%:{normalized}",)),
         ]:
-            row = self._conn.execute(sql, param).fetchone()
+            row = self._conn_ro.execute(sql, param).fetchone()
             if row:
                 return {
                     "id": row[0], "name": row[1], "type": row[2],
@@ -478,7 +481,7 @@ class SearchIndex:
                 }
 
         # 2. Slug match (e.g. "fury-instinct")
-        row = self._conn.execute(
+        row = self._conn_ro.execute(
             "SELECT id, name, type, pack, text FROM chunks WHERE slug = ?",
             (normalized,),
         ).fetchone()
@@ -489,7 +492,7 @@ class SearchIndex:
             }
 
         # 3. Exact name match (case-insensitive)
-        row = self._conn.execute(
+        row = self._conn_ro.execute(
             "SELECT id, name, type, pack, text FROM chunks WHERE LOWER(name) = LOWER(?)",
             (normalized,),
         ).fetchone()
@@ -524,7 +527,7 @@ class SearchIndex:
         source_id = chunk["id"] if chunk else normalized
 
         if direction in ("outgoing", "both"):
-            rows = self._conn.execute("""
+            rows = self._conn_ro.execute("""
                 SELECT chunks.id, chunks.name, chunks.type, chunks.pack, refs.context
                 FROM refs
                 JOIN chunks ON refs.target_uuid = chunks.id OR chunks.id LIKE '%:' || refs.target_uuid
@@ -546,7 +549,7 @@ class SearchIndex:
                     bare_uuid = chunk["id"].rsplit(":", 1)[-1]
                 else:
                     bare_uuid = chunk["id"]
-            rows = self._conn.execute("""
+            rows = self._conn_ro.execute("""
                 SELECT chunks.id, chunks.name, chunks.type, chunks.pack, refs.context
                 FROM refs
                 JOIN chunks ON refs.source_id = chunks.id
@@ -563,9 +566,9 @@ class SearchIndex:
     def status(self) -> dict:
         self._ensure_loaded()
         meta = {}
-        for row in self._conn.execute("SELECT key, value FROM _meta"):
+        for row in self._conn_ro.execute("SELECT key, value FROM _meta"):
             meta[row[0]] = row[1]
-        meta["actual_chunks"] = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        meta["actual_chunks"] = self._conn_ro.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         meta["db_path"] = str(self.db_path)
         return meta
 
