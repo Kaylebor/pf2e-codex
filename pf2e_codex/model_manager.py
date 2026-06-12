@@ -68,7 +68,7 @@ class ModelManager:
                 if self._reranker_model:
                     _sys.stderr.write(f"[manager] Loading reranker ({self._reranker_model})...\n")
                     _sys.stderr.flush()
-                    self._reranker = Reranker(model_repo=self._reranker_model)
+                    self._reranker = Reranker(model_repo=self._reranker_model, force_provider=self._onnx_provider)
                     # Warmup inference.
                     self._reranker.rerank("warmup", [{"text": "warmup", "id": "_w"}], top_k=1)
                     _sys.stderr.write(f"[manager] Reranker ready ({_time.monotonic() - t0:.0f}s)\n")
