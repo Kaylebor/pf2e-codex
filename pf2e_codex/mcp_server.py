@@ -311,7 +311,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         return json.dumps(meta, indent=2)
 
     @mcp.tool()
-    def pf2e_query_db(sql: str, limit: int = 50) -> str:
+    def pf2e_query_db(sql: str, limit: int = 50, query_text: str = "") -> str:
         """Run a read-only SQL query on the PF2E database.
 
         The database has these tables:
@@ -341,8 +341,12 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
 
         **vec_chunks** (vec0 virtual table for vector similarity):
           id TEXT, embedding float[384]
+          To search by similarity, provide ``query_text`` (your search query).
+          The tool auto-embeds it with the configured model and binds the
+          blob as ``:query_emb``:
           Example: SELECT id, distance FROM vec_chunks
-                   WHERE embedding MATCH vec_f32(?)
+                   WHERE embedding MATCH :query_emb AND k = 10
+          If ``query_text`` is empty, ``:query_emb`` is not bound.
                    AND k = 10 ORDER BY distance
           NOTE: you need the embedding vector (vec_f32 blob) — prefer
                 using pf2e_search with hybrid=True instead.
@@ -360,7 +364,12 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         limit = max(1, min(limit, 100))
         import sqlite3
         try:
-            cur = search._conn_ro.execute(sql)
+            params: dict[str, object] = {}
+            if query_text:
+                from .index import vec_blob  # noqa: PLC0415
+                emb = search._manager.embed_query(query_text)
+                params["query_emb"] = vec_blob(emb)
+            cur = search._conn_ro.execute(sql, params)
             rows = cur.fetchmany(limit + 1)
             truncated = len(rows) > limit
             if truncated:
