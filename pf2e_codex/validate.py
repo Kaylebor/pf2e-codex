@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from .embeddings import get_provider
+from .model_manager import ModelManager
 from .index import load_vec_extension
 
 
@@ -32,8 +32,10 @@ def run_validation(
     reranker_model: str = "",
 ) -> dict:
     """Run the query suite and return metrics."""
+    manager = ModelManager(model_name=model_name, reranker_model=reranker_model, provider=provider, onnx_provider=onnx_provider)
+    manager.start()
     from .index import SearchIndex
-    search = SearchIndex(db_path, model_name, provider=provider, onnx_provider=onnx_provider, reranker_model=reranker_model)
+    search = SearchIndex(db_path, manager)
 
     queries = load_queries()
     results = []

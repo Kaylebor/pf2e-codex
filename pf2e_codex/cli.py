@@ -8,6 +8,23 @@ import typer
 
 from .config import Settings, get_settings
 from .index import SearchIndex
+
+
+def _local_index(settings: Settings, *, model: str | None = None) -> SearchIndex:
+    """Create a SearchIndex backed by a local ModelManager.
+
+    Only used when no daemon is registered.  The ModelManager compiles
+    ONNX models on first use and is process-scoped.
+    """
+    from .model_manager import ModelManager  # noqa: PLC0415
+    manager = ModelManager(
+        model_name=model or settings.model,
+        reranker_model=settings.reranker_model,
+        provider=settings.provider,
+        onnx_provider=settings.onnx_provider,
+    )
+    manager.start()
+    return SearchIndex(settings.db, manager)
 from .models import list_models, recommend
 from .pipeline import build_chunks, embed_and_index, index_all, save_chunks
 from .cli_rich import print_search_results, print_catalog, print_status, print_validation
@@ -102,7 +119,7 @@ def search(
         typer.echo("Daemon is registered but not responding. Restart it and retry.", err=True)
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
+    search_idx = _local_index(settings)
     results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
     print_search_results(results, query)
 
@@ -126,7 +143,7 @@ def get(
         typer.echo(result["text"])
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
+    search_idx = _local_index(settings)
     result = search_idx.fetch_by_id(entry_id)
     if result:
         typer.echo(f"[{result['type']}] {result['name']} ({result['pack']})")
@@ -163,7 +180,7 @@ def related(
             typer.echo("No related entries found.")
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
+    search_idx = _local_index(settings)
     results = search_idx.related(entry_id, direction, limit)
     if results.get("outgoing"):
         typer.echo(f"\n{entry_id} references:")
@@ -190,7 +207,7 @@ def status(
         print_status(meta)
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
+    search_idx = _local_index(settings)
     meta = search_idx.status()
     meta["model"] = settings.model
     meta["db"] = str(settings.db)
@@ -209,7 +226,7 @@ def catalog(
         print_catalog(cat)
         return
     settings = _settings(data_dir=data_dir, model=model)
-    search_idx = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
+    search_idx = _local_index(settings)
     cat = search_idx.catalog()
     print_catalog(cat)
 
