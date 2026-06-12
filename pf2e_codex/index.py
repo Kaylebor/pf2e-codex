@@ -363,7 +363,11 @@ class SearchIndex:
     def rules_explain(self, topic: str, top_k: int = 3,
                       license: str | None = None, content_type: str | None = None,
                       remaster: bool | None = None) -> list[dict]:
-        """Search with boosted journal pages and conditions for core rules."""
+        """Search with boosted journal pages and conditions for core rules.
+
+        Uses query rewriting: prepends "pf2e rule for" to the topic so the
+        semantic embedding lands closer to rule text than to generic entries.
+        """
         self._ensure_loaded()
 
         where_clauses = ["1=1"]
@@ -381,7 +385,11 @@ class SearchIndex:
                 where_clauses.append("(chunks.remaster = 0 OR chunks.remaster IS NULL)")
         where = " AND ".join(where_clauses)
 
-        emb = self._encode(topic)
+        # Rewrite query: "flanking" → "flanking condition"
+        # Helps the semantic embedding land near the actual condition
+        # or journal page text instead of generic entries.
+        rewritten = f"{topic} condition"
+        emb = self._encode(rewritten)
         q_blob = vec_blob(emb)
         results = self._conn.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
