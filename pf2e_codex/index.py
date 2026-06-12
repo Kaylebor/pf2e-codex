@@ -145,10 +145,6 @@ class SearchIndex:
         self._fts_ready: bool = False
         self._db_lock = _threading.Lock()
 
-    @property
-    def warmup_ready(self):
-        return self._manager._ready  # delegate to manager's Event
-
     def _ensure_loaded(self) -> None:
         if self._conn is not None:
             return
