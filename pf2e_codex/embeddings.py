@@ -359,6 +359,11 @@ def get_provider(
         )
 
     force = onnx_provider if onnx_provider != "auto" else None
+    import traceback as _tb
+    import sys as _sys
+    _stack = ''.join(_tb.format_stack()[-4:-1])
+    _sys.stderr.write(f"[provider] get_provider() called from:\n{_stack}")
+    _sys.stderr.flush()
     prov = ONNXProvider(model_name, force_provider=force)
     detected = prov._session.get_providers()[0] if hasattr(prov, '_session') else _detect_onnx_provider()
     print(f"Using ONNX with {detected} (model={model_name})")
