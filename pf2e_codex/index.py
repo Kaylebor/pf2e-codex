@@ -8,8 +8,6 @@ from pathlib import Path
 
 import sqlite_vec  # type: ignore[import-untyped]
 
-from .embeddings import EmbeddingProvider, get_provider
-
 
 def load_vec_extension(conn) -> None:
     conn.enable_load_extension(True)
@@ -129,29 +127,32 @@ def _rrf_fuse(
 
 
 class SearchIndex:
-    """Search index backed by sqlite-vec with optional FTS5 hybrid blending."""
+    """Search index backed by sqlite-vec with optional FTS5 hybrid blending.
 
-    def __init__(self, db_path: Path | str, model_name: str, provider: str = "auto", onnx_provider: str | None = None, reranker_model: str = ""):
+    Model inference is delegated to a ModelManager — SearchIndex never creates
+    ONNX providers or sessions directly.
+    """
+
+    def __init__(self, db_path: Path | str, manager: "ModelManager"):
         import sqlite3
         import threading as _threading
 
+        from .model_manager import ModelManager  # noqa: PLC0415
+
         self.db_path = Path(db_path)
-        self.model_name = model_name
-        self._provider_type = provider
-        self._onnx_provider = onnx_provider
-        self._reranker_model = reranker_model
-        self._provider: EmbeddingProvider | None = None
-        self._reranker: Any | None = None
-        self._dim: int | None = None
+        self._manager: ModelManager = manager
         self._conn: sqlite3.Connection | None = None
         self._fts_ready: bool = False
-        self._lock = _threading.Lock()
-        self.warmup_ready = _threading.Event()
+        self._db_lock = _threading.Lock()
+
+    @property
+    def warmup_ready(self):
+        return self._manager._ready  # delegate to manager's Event
 
     def _ensure_loaded(self) -> None:
         if self._conn is not None:
             return
-        with self._lock:
+        with self._db_lock:
             if self._conn is not None:
                 return  # double-check after acquiring lock
             import sqlite3
@@ -161,7 +162,7 @@ class SearchIndex:
                 from .config import DEFAULT_RELEASE
                 from .config import _model_safe_name
                 import urllib.request as _req
-                db_name = f"pf2e_{_model_safe_name(self.model_name)}.db"
+                db_name = f"pf2e_{_model_safe_name(self._manager.model_name)}.db"
                 release = DEFAULT_RELEASE
                 url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/{release}/{db_name}"
                 self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,20 +177,17 @@ class SearchIndex:
                         f"Auto-download failed.\n"
                         f"Run 'pf2e-codex embed' to build from scratch"
                     )
-        with self._lock:
             self._conn = sqlite3.connect(str(self.db_path))
             load_vec_extension(self._conn)
             row = self._conn.execute(
                 "SELECT value FROM _meta WHERE key = 'embedding_model'"
             ).fetchone()
             db_model = row[0] if row else None
-            if db_model and db_model != self.model_name:
-                print(f"Warning: DB model {db_model} != config model {self.model_name}")
+            if db_model and db_model != self._manager.model_name:
+                print(f"Warning: DB model {db_model} != config model {self._manager.model_name}")
             row = self._conn.execute(
-                "SELECT value FROM _meta WHERE key = 'embedding_dim'"
+                "SELECT value FROM _meta WHERE key = 'embedding_model'"
             ).fetchone()
-            self._dim = int(row[0]) if row else 384
-            # Lazy-create refs table for DBs built before this feature
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS refs (
                     source_id TEXT,
@@ -222,21 +220,8 @@ class SearchIndex:
             print("FTS5 index ready")
         self._fts_ready = True
 
-    @property
-    def provider(self) -> EmbeddingProvider:
-        with self._lock:
-            if self._provider is None:
-                import sys as _sys
-                _sys.stderr.write(f"[provider] Creating new provider (model={self.model_name})\n")
-                self._provider = get_provider(
-                    self.model_name,
-                    provider=self._provider_type,
-                    onnx_provider=self._onnx_provider,
-                )
-            return self._provider
-
     def _encode(self, text: str) -> list[float]:
-        return self.provider.embed_query(text)
+        return self._manager.embed_query(text)
 
     def search(
         self, query: str, top_k: int = 5, hybrid: bool = True,
@@ -246,7 +231,7 @@ class SearchIndex:
     ) -> list[dict]:
         self._ensure_loaded()
         import sys as _sys
-        _sys.stderr.write(f"[search] search() called (hash={id(self):x}, _provider={'SET' if self._provider else 'NONE'})\n")
+        _sys.stderr.write(f"[search] search() called (hash={id(self):x})\n")
 
         # Build WHERE clauses for filters
         where_clauses = ["1=1"]
@@ -328,14 +313,7 @@ class SearchIndex:
         # Optional second-stage cross-encoder reranking
         if rerank and len(results) > 1:
             try:
-                with self._lock:
-                    if self._reranker is None:
-                        from .reranker import Reranker
-                        import sys as _sys
-                        _sys.stderr.write(f"[search] Initializing reranker ({self._reranker_model})\n")
-                        self._reranker = Reranker(model_repo=self._reranker_model)
-                # Use RRF top 50 as candidates, rerank to top_k
-                results = self._reranker.rerank(query, results, top_k=top_k)
+                results = self._manager.rerank(query, results, top_k=top_k)
             except Exception as e:
                 print(f"Reranker failed: {e}")
 
@@ -584,35 +562,3 @@ class SearchIndex:
         if self._conn:
             self._conn.close()
             self._conn = None
-
-    def warmup(self) -> None:
-        """Eagerly initialize providers (background thread at daemon start).
-
-        Sets warmup_ready after embedding model is loaded (queries work
-        immediately, reranker compiles in background). Gate opens once
-        the embedding provider exists — first query won't race with
-        warmup's MIGraphX compile.
-        """
-        import sys as _sys
-        import time as _time
-        t0 = _time.monotonic()
-        _sys.stderr.write(f"[warmup] Starting ({self.model_name}, reranker={self._reranker_model})\n")
-        try:
-            _sys.stderr.write("[warmup] Loading embedding provider...\n")
-            _ = self.provider.embed_query("warmup")
-            _sys.stderr.write(f"[warmup] Embedding ready ({_time.monotonic() - t0:.0f}s)\n")
-            if self._reranker_model:
-                from .reranker import Reranker  # noqa: PLC0415
-                t1 = _time.monotonic()
-                _sys.stderr.write(f"[warmup] Loading reranker ({self._reranker_model})...\n")
-                with self._lock:
-                    if self._reranker is None:
-                        self._reranker = Reranker(model_repo=self._reranker_model)
-                self._reranker.rerank("warmup", [{"text": "warmup", "id": "_warmup"}], top_k=1)
-                _sys.stderr.write(f"[warmup] Reranker ready ({_time.monotonic() - t1:.0f}s)\n")
-            # Gate opens after ALL models initialized — MIGraphX global state
-            # is not thread-safe, can't run embedding + reranker concurrently
-            self.warmup_ready.set()
-            _sys.stderr.write(f"[warmup] Done ({_time.monotonic() - t0:.0f}s)\n")
-        except Exception as e:
-            _sys.stderr.write(f"[warmup] FAILED: {e}\n")

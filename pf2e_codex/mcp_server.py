@@ -109,12 +109,20 @@ def _store_recent(query: str, results: list[dict], **params: str | int | bool | 
 
 def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
     settings = settings or get_settings()
-    search = SearchIndex(settings.db, settings.model, settings.provider, settings.onnx_provider, settings.reranker_model)
 
-    # Background warmup: eagerly compile models so first query is fast.
-    # Daemon starts accepting requests immediately; warmup runs in parallel.
+    # Centralized model manager — single owner of all ONNX sessions.
+    # start() blocks until both models are compiled and ready.
+    from .model_manager import ModelManager  # noqa: PLC0415
+    manager = ModelManager(
+        model_name=settings.model,
+        reranker_model=settings.reranker_model,
+        provider=settings.provider,
+        onnx_provider=settings.onnx_provider,
+    )
     import threading as _threading
-    _threading.Thread(target=search.warmup, daemon=True).start()
+    _threading.Thread(target=manager.start, daemon=True).start()
+
+    search = SearchIndex(settings.db, manager)
 
     mcp = FastMCP("pf2e", host=host, port=port)
     mcp._search_index = search  # prevent GC — keep provider alive across requests
