@@ -101,10 +101,11 @@ def search(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
     rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
+    rerank_candidates: int = typer.Option(25, "--rerank-candidates", help="Candidates to feed reranker (more = better quality, slower)"),
 ) -> None:
     """Search the PF2E index."""
     from .daemon_proxy import proxy_search
-    result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank)
+    result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank, rerank_candidates=rerank_candidates)
     if result:
         if "results" in result:
             print_search_results(result["results"], query)

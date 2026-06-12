@@ -132,6 +132,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         top_k: int = 5,
         hybrid: bool = False,
         rerank: bool = True,
+        rerank_candidates: int = 25,
         license: str | None = None,
         content_type: str | None = None,
         pack: str | None = None,
@@ -151,6 +152,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
             top_k: Number of results (default 5, max 20).
             hybrid: If true, boosts exact name matches.
             rerank: If true, applies cross-encoder reranker for better relevance.
+            rerank_candidates: Candidates sent to reranker (more = better quality, slower).
             license: Filter by license: 'ORC' (newer license), 'OGL' (older), or null.
             content_type: Filter by type: 'feat', 'spell', 'condition', 'journal_page', etc.
             pack: Filter by pack name: 'spells', 'feats', 'pathfinder-bestiary', etc.
@@ -164,7 +166,8 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         'legacy_name' shows the pre-remaster name (e.g. 'flat-footed' for 'Off-Guard').
         """
         top_k = max(1, min(top_k, 20))
-        results = search.search(query, top_k, hybrid=hybrid, rerank=rerank,
+        rerank_c = max(1, min(rerank_candidates, 100))
+        results = search.search(query, top_k, hybrid=hybrid, rerank=rerank, rerank_candidates=rerank_c,
                                 license=license, content_type=content_type,
                                 pack=pack, remaster=remaster)
         _store_recent(query, results, top_k=top_k, hybrid=hybrid, rerank=rerank,

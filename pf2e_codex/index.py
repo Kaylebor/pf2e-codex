@@ -223,7 +223,7 @@ class SearchIndex:
         self, query: str, top_k: int = 5, hybrid: bool = True,
         license: str | None = None, content_type: str | None = None,
         pack: str | None = None, remaster: bool | None = None,
-        rerank: bool = False,
+        rerank: bool = False, rerank_candidates: int = 25,
     ) -> list[dict]:
         self._ensure_loaded()
         import sys as _sys
@@ -297,7 +297,7 @@ class SearchIndex:
                     pass
 
         # 3. Build results — hybrid: semantic embeddings + FTS5 full-text
-        rrf_top_k = top_k * 10 if rerank else top_k  # more candidates for reranker
+        rrf_top_k = rerank_candidates if rerank else top_k  # more candidates for reranker
         if not hybrid:
             results = [r for _, r in semantic_results[:rrf_top_k]]
         else:
