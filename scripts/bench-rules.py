@@ -20,6 +20,7 @@ from pf2e_codex.index import SearchIndex
 
 # (topic, expected_type, expected_keyword_in_name_or_text)
 QUERIES = [
+    # Conditions — rules_explain should find the condition page
     ("flanking", "condition", ["off-guard", "flanking"]),
     ("off-guard", "condition", ["off-guard"]),
     ("blinded", "condition", ["blinded"]),
@@ -30,6 +31,10 @@ QUERIES = [
     ("paralyzed", "condition", ["paralyzed"]),
     ("cover", "condition", ["cover"]),
     ("prone", "condition", ["prone"]),
+    # Mixed — general rules questions
+    ("treat wounds", "action", ["treat wounds"]),
+    ("craft magic items", "action", ["craft", "item"]),
+    ("what is the dying condition", "condition", ["dying"]),
 ]
 
 

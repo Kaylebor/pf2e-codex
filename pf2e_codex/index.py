@@ -385,11 +385,15 @@ class SearchIndex:
                 where_clauses.append("(chunks.remaster = 0 OR chunks.remaster IS NULL)")
         where = " AND ".join(where_clauses)
 
-        # Rewrite query: "flanking" → "flanking condition"
-        # Helps the semantic embedding land near the actual condition
-        # or journal page text instead of generic entries.
-        rewritten = f"{topic} condition"
-        emb = self._encode(rewritten)
+        # Rewrite query: "flanking" → "pf2e flanking" to help the
+        # semantic embedding land near actual rule/condition text
+        # regardless of query type (condition name, skill, general question).
+        # Smart rewrite: single-word queries are likely condition names
+        # ("blinded", "flanking") — append "condition" to land near the
+        # right condition page. Multi-word queries ("treat wounds",
+        # "craft magic items") keep the original for general search.
+        search_topic = f"{topic} condition" if " " not in topic.strip() else topic
+        emb = self._encode(search_topic)
         q_blob = vec_blob(emb)
         results = self._conn.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
