@@ -27,14 +27,17 @@ with self._lock:
 
 Applies to: `_provider`, `_reranker`, `_conn` (connection setup must be INSIDE the lock).
 
-### MIGraphX global state is not thread-safe
-Even different ONNX sessions using MIGraphXExecutionProvider can't run inference
-simultaneously. MIGraphX shares global GPU state. If the warmup thread loads the reranker
-while a search thread uses the embedding model, one of them crashes with an assertion
-failure in `migraphx::module_impl::contains`.
+### Warmup removed — models load before the server starts
 
-**Fix**: `warmup_ready` must not be set until ALL models (embedding + reranker) are fully
-initialized. The daemon refuses queries until warmup completes.
+`ModelManager.start()` is synchronous and blocks until both models are
+loaded. The HTTP server does not start listening until `start()` returns,
+so by the time any request arrives, models are ready.
+
+On CPU this takes ~5s; on GPU (cached .mxr) ~10-15s.
+No background thread, no gate, no race conditions.
+
+Models are process-scoped — held by ModelManager, referenced by
+SearchIndex, kept alive for the daemon's lifetime.
 
 ### CLI must never fall back to local inference when daemon exists
 If the daemon is registered (server.json exists), the CLI must NEVER create its own

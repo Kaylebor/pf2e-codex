@@ -347,9 +347,6 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
           Example: SELECT id, distance FROM vec_chunks
                    WHERE embedding MATCH :query_emb AND k = 10
           If ``query_text`` is empty, ``:query_emb`` is not bound.
-                   AND k = 10 ORDER BY distance
-          NOTE: you need the embedding vector (vec_f32 blob) — prefer
-                using pf2e_search with hybrid=True instead.
 
         Constraints:
         - SELECT only — INSERT/UPDATE/DELETE/DROP/CREATE/ALTER rejected
@@ -364,6 +361,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         limit = max(1, min(limit, 100))
         import sqlite3
         try:
+            search._ensure_loaded()  # DB must be loaded before accessing _conn_ro
             params: dict[str, object] = {}
             if query_text:
                 from .index import vec_blob  # noqa: PLC0415
