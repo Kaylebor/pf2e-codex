@@ -95,6 +95,8 @@ class ModelManager:
         """Embed a single query text (thread-safe)."""
         if not self._ready.is_set():
             raise RuntimeError("ModelManager not ready — call start() first")
+        _sys.stderr.write(f"[manager] embed_query({repr(text[:30])})\n")
+        _sys.stderr.flush()
         with self._lock:
             return self._embedding.embed_query(text)
 
@@ -106,6 +108,8 @@ class ModelManager:
             raise RuntimeError("ModelManager not ready — call start() first")
         if self._reranker is None:
             raise RuntimeError("Reranker model not configured")
+        _sys.stderr.write(f"[manager] rerank({repr(query[:30])}, {len(documents)} docs)\n")
+        _sys.stderr.flush()
         with self._lock:
             return self._reranker.rerank(query, documents, top_k=top_k)
 
