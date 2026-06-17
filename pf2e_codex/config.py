@@ -87,6 +87,8 @@ class Settings(BaseSettings):
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     reranker_model: str = Field(default="Kaylebor/pf2e-codex-reranker-quantized", description="Fine-tuned reranker model on HuggingFace. Leave at default for best results (int8 quantized, 0.55GB, multilingual).")
     warmup_threads: int = Field(default=2, description="ONNX intra-op threads during 'pf2e-codex warmup'. Lower = less GPU power draw.")
+    ref_weight: float = Field(default=0.0, description="Weight for ref-count boosting in search (0 = off, 0.3-0.5 = moderate). Entries with more incoming references get boosted.")
+    rerank_candidates: int = Field(default=15, description="Candidates to feed reranker (more = better quality, slower). Default 15.")
     languages: list[str] = Field(default=["en"], description="Languages to index (e.g. ['en', 'es'])")
     transport: str = Field(default="stdio", description="MCP transport: stdio, sse, or streamable-http")
 
