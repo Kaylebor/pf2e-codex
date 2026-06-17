@@ -335,7 +335,7 @@ class SearchIndex:
         if not results:
             return
 
-        # Batch-fetch outgoing refs for all results
+        # Batch-fetch outgoing refs (what this entry references)
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
         refs_rows = self._conn_ro.execute(f"""
@@ -346,16 +346,17 @@ class SearchIndex:
         for src, name, uuid in refs_rows:
             refs_by_source.setdefault(src, []).append({"name": name, "id": uuid})
 
-            # Batch-fetch incoming refs (entries that reference this entry)
-            names = [r["name"] for r in results]
-            name_placeholders = ",".join("?" * len(names))
-            incoming_rows = self._conn_ro.execute(f"""\
-                SELECT target_name, source_id FROM refs
-                WHERE target_name IN ({name_placeholders})
-            """, names).fetchall()
-            incoming_by_target: dict[str, list[dict]] = {}
-            for target, source in incoming_rows:
-                incoming_by_target.setdefault(target, []).append({"id": source})
+        # Batch-fetch incoming refs (entries that reference this entry)
+        names = [r["name"] for r in results]
+        name_placeholders = ",".join("?" * len(names))
+        incoming_rows = self._conn_ro.execute(f"""
+            SELECT target_name, source_id FROM refs
+            WHERE target_name IN ({name_placeholders})
+        """, names).fetchall()
+        incoming_by_target: dict[str, list[dict]] = {}
+        for target, source in incoming_rows:
+            incoming_by_target.setdefault(target, []).append({"id": source})
+
         for r in results:
             r["refs"] = refs_by_source.get(r["id"], [])
             r["incoming_refs"] = incoming_by_target.get(r["name"], [])
@@ -385,7 +386,6 @@ class SearchIndex:
             else:
                 # Semantic: distance is available but we use rrf_score when hybrid
                 r["confidence"] = "medium" if (score or 0) < 0.5 else "low"
-
     def rules_explain(self, topic: str, top_k: int = 3,
                       license: str | None = None, content_type: str | None = None,
                       remaster: bool | None = None) -> list[dict]:

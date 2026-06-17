@@ -79,6 +79,19 @@ def main():
     print(f"{'none':>6} {avg_no:>7.2f}")
     print("\nDone.")
 
+    # Ref-weight test
+    print("\n=== Ref-Weight Test ===")
+    for rw in [0.0, 0.1, 0.3, 0.5]:
+        t0 = time.monotonic()
+        results = search.search("fireball", top_k=5, hybrid=True, rerank=True, ref_weight=rw)
+        dt = time.monotonic() - t0
+        fireball = next((r for r in results if r["name"] == "Fireball"), None)
+        if fireball:
+            refs = len(fireball.get("incoming_refs", []))
+            rank = results.index(fireball) + 1
+            print(f"  ref_weight={rw:.1f}: Fireball rank={rank} dist={fireball['distance']:.3f} refs={refs} time={dt:.2f}s")
+        else:
+            print(f"  ref_weight={rw:.1f}: Fireball not in top 5 (time={dt:.2f}s)")
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
