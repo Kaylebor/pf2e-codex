@@ -227,6 +227,7 @@ class SearchIndex:
         license: str | None = None, content_type: str | None = None,
         pack: str | None = None, remaster: bool | None = None,
         rerank: bool = False, rerank_candidates: int = 15,
+        ref_weight: float = 0.0,
     ) -> list[dict]:
         self._ensure_loaded()
         import sys as _sys
@@ -309,6 +310,17 @@ class SearchIndex:
         # 4. Enrich with refs, legacy names, confidence
         self._enrich_results(results)
 
+        # 5. Ref-count weighting: entries with more incoming references
+        # are structurally more important. Apply before reranking so the
+        # reranker sees the adjusted scores.
+        if ref_weight > 0 and results:
+            max_refs = max((len(r.get("incoming_refs", [])) for r in results), default=1)
+            max_refs = max(max_refs, 1)
+            for r in results:
+                refs_count = len(r.get("incoming_refs", []))
+                factor = 1.0 - (refs_count / max_refs) * ref_weight
+                r["distance"] *= max(factor, 0.1)
+
         # Optional second-stage cross-encoder reranking
         if rerank and len(results) > 1:
             try:
@@ -334,8 +346,19 @@ class SearchIndex:
         for src, name, uuid in refs_rows:
             refs_by_source.setdefault(src, []).append({"name": name, "id": uuid})
 
+            # Batch-fetch incoming refs (entries that reference this entry)
+            names = [r["name"] for r in results]
+            name_placeholders = ",".join("?" * len(names))
+            incoming_rows = self._conn_ro.execute(f"""\
+                SELECT target_name, source_id FROM refs
+                WHERE target_name IN ({name_placeholders})
+            """, names).fetchall()
+            incoming_by_target: dict[str, list[dict]] = {}
+            for target, source in incoming_rows:
+                incoming_by_target.setdefault(target, []).append({"id": source})
         for r in results:
             r["refs"] = refs_by_source.get(r["id"], [])
+            r["incoming_refs"] = incoming_by_target.get(r["name"], [])
 
             # NONE license → OGL (missing metadata, but pre-ORC content)
             if r.get("license") in ("NONE", None, ""):

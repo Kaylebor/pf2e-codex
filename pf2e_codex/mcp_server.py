@@ -133,6 +133,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         hybrid: bool = False,
         rerank: bool = True,
         rerank_candidates: int = 15,
+        ref_weight: float = 0.0,
         license: str | None = None,
         content_type: str | None = None,
         pack: str | None = None,
@@ -168,6 +169,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         top_k = max(1, min(top_k, 20))
         rerank_c = max(1, min(rerank_candidates, 100))
         results = search.search(query, top_k, hybrid=hybrid, rerank=rerank, rerank_candidates=rerank_c,
+                                    ref_weight=ref_weight,
                                 license=license, content_type=content_type,
                                 pack=pack, remaster=remaster)
         _store_recent(query, results, top_k=top_k, hybrid=hybrid, rerank=rerank,
