@@ -101,7 +101,7 @@ def search(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
     rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
-    rerank_candidates: int = typer.Option(15, "--rerank-candidates", help="Candidates to feed reranker (more = better quality, slower)"),
+    rerank_candidates: int = typer.Option(50, "--rerank-candidates", help="Candidates to feed reranker (more = better quality, slower)"),
         ref_weight: float = typer.Option(None, "--ref-weight", help="Weight for ref-count boosting (overrides config)"),
         content_type: str | None = typer.Option(None, "--content-type", "-t", help="Filter by type: spell, feat, condition, hazard, etc."),
 ) -> None:
