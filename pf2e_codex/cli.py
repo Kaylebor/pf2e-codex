@@ -106,7 +106,7 @@ def search(
 ) -> None:
     """Search the PF2E index."""
     from .daemon_proxy import proxy_search
-    result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank, rerank_candidates=rerank_candidates), ref_weight=ref_weight)
+    result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank, rerank_candidates=rerank_candidates, ref_weight=ref_weight)
     if result:
         if "results" in result:
             print_search_results(result["results"], query)
