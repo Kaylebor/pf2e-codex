@@ -263,7 +263,7 @@ class SearchIndex:
             WHERE vec_chunks.embedding MATCH vec_f32(?)
               AND k = ? AND {where}
             ORDER BY distance
-        """, [q_blob, top_k * 3] + params).fetchall()
+        """, [q_blob, rerank_candidates] + params).fetchall()
 
         semantic_results = [
             (r[0], {
@@ -289,7 +289,7 @@ class SearchIndex:
                         WHERE fts_chunks MATCH ? AND {where}
                         ORDER BY rank
                         LIMIT ?
-                    """, [fts_query] + params + [top_k * 3]).fetchall()
+                    """, [fts_query] + params + [rerank_candidates]).fetchall()
                     for r in fts_raw:
                         fts_results.append((r[0], {
                             "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
@@ -428,7 +428,7 @@ class SearchIndex:
             WHERE vec_chunks.embedding MATCH vec_f32(?)
               AND k = ? AND {where}
             ORDER BY distance
-        """, [q_blob, top_k * 3] + params).fetchall()
+        """, [q_blob, rerank_candidates] + params).fetchall()
         scored = []
         for r in results:
             ctype = r[2]
