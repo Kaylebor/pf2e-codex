@@ -102,11 +102,18 @@ def search(
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
     rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
     rerank_candidates: int = typer.Option(15, "--rerank-candidates", help="Candidates to feed reranker (more = better quality, slower)"),
-        ref_weight: float = typer.Option(0.0, "--ref-weight", help="Weight for ref-count boosting (0 = off, 0.3-0.5 = moderate)"),
+        ref_weight: float = typer.Option(None, "--ref-weight", help="Weight for ref-count boosting (overrides config)"),
         content_type: str | None = typer.Option(None, "--content-type", "-t", help="Filter by type: spell, feat, condition, hazard, etc."),
 ) -> None:
     """Search the PF2E index."""
     from .daemon_proxy import proxy_search
+    # Resolve config defaults for None values
+    from .config import get_settings
+    settings = get_settings()
+    if rerank_candidates is None:
+        rerank_candidates = settings.rerank_candidates
+    if ref_weight is None:
+        ref_weight = settings.ref_weight
     result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank, rerank_candidates=rerank_candidates, ref_weight=ref_weight, content_type=content_type)
     if result:
         if "results" in result:
