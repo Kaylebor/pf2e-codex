@@ -22,6 +22,9 @@ Ordered by impact. Check items off as completed.
 - [x] **Safe query and lazy-index access**
   - Done: SearchIndex initialization/FTS creation is locked, query connections are read-only, and MCP SQL rejects writes, attachment, pragma changes, extension loading, and runaway VM work.
 
+- [x] **Natural-language entity retrieval**
+  - Done: Hybrid search removes question filler, matches lexical terms with OR, balances lexical and semantic candidates, and keeps explicitly named entries such as Fireball in the final results even when reranking is enabled.
+
 - [x] **MCP Python SDK 2 compatibility**
   - Done: Streamable HTTP serves modern stateless requests and legacy stateful sessions on the same endpoint while the CLI proxy retains its existing session flow.
 

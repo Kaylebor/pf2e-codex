@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import struct
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -135,12 +136,57 @@ def _normalize_id(raw: str) -> str:
     return raw
 
 
+_SEARCH_STOP_WORDS = frozenset({
+    "about", "after", "also", "and", "are", "because", "before", "between",
+    "can", "could", "does", "for", "from", "have", "how", "into", "its",
+    "mean", "means", "that", "the", "their", "them", "then", "this", "use",
+    "using", "what", "when", "where", "which", "with", "would", "your",
+})
+
+
+def _normalized_terms(text: str) -> list[str]:
+    """Return lowercase alphanumeric terms suitable for FTS and phrase matching."""
+    return re.findall(r"[^\W_]+", text.casefold())
+
+
+def _search_terms(query: str) -> list[str]:
+    """Extract stable lexical terms from a natural-language query."""
+    return list(dict.fromkeys(
+        term for term in _normalized_terms(query)
+        if len(term) > 2 and term not in _SEARCH_STOP_WORDS
+    ))
+
+
+def _query_contains_name(query: str, name: str) -> bool:
+    """Return whether a complete entry name appears as consecutive query terms."""
+    query_terms = _normalized_terms(query)
+    name_terms = _normalized_terms(name)
+    if not name_terms or len(name_terms) > len(query_terms):
+        return False
+    width = len(name_terms)
+    return any(
+        query_terms[offset:offset + width] == name_terms
+        for offset in range(len(query_terms) - width + 1)
+    )
+
+
+def _promote_explicit_results(
+    results: list[dict], explicit_results: list[dict], top_k: int,
+) -> list[dict]:
+    """Keep explicitly named entries ahead of inferred search results."""
+    current = {result["id"]: result for result in results}
+    explicit_ids = [result["id"] for result in explicit_results]
+    promoted = [current.get(result["id"], result) for result in explicit_results]
+    promoted.extend(result for result in results if result["id"] not in explicit_ids)
+    return promoted[:top_k]
+
+
 def _rrf_fuse(
     semantic_results: list[tuple[str, dict]],
     fts_results: list[tuple[str, dict]],
     k: int = 60,
     top_k: int = 5,
-    weight_semantic: float = 0.85,
+    weight_semantic: float = 0.5,
 ) -> list[dict]:
     """Reciprocal Rank Fusion of semantic and FTS result lists with weighting.
 
@@ -375,20 +421,27 @@ class SearchIndex:
             for r in semantic_raw
         ]
 
-        # 2. FTS5 full-text search (replaces name bag-of-words LIKE)
+        # 2. FTS5 full-text search plus explicit entity-name detection.
+        # Natural questions rarely repeat every word in a source chunk, so an
+        # AND query effectively disables the lexical branch. OR terms recover
+        # partial evidence, while the name-only pass recognizes entries named
+        # directly in the question (for example, "How do I use Fireball?").
         fts_results: list[tuple[str, dict]] = []
+        explicit_name_results: list[dict] = []
         if hybrid:
-            words = [w.strip().lower() for w in query.split() if len(w.strip()) > 2]
-            if words:
+            terms = _search_terms(query)
+            if terms:
                 try:
                     self._ensure_fts()
-                    fts_query = " AND ".join(f'"{w}"' for w in words)
+                    fts_query = " OR ".join(f'"{term}"' for term in terms)
                     fts_raw = self._conn_ro.execute(f"""
-                        SELECT c.id, c.name, c.type, c.pack, c.text, c.license, c.remaster, rank
+                        SELECT chunks.id, chunks.name, chunks.type, chunks.pack,
+                               chunks.text, chunks.license, chunks.remaster,
+                               bm25(fts_chunks, 10.0, 1.0)
                         FROM fts_chunks
-                        JOIN chunks c ON c.rowid = fts_chunks.rowid
+                        JOIN chunks ON chunks.rowid = fts_chunks.rowid
                         WHERE fts_chunks MATCH ? AND {where}
-                        ORDER BY rank
+                        ORDER BY bm25(fts_chunks, 10.0, 1.0)
                         LIMIT ?
                     """, [fts_query] + params + [rerank_candidates]).fetchall()
                     for r in fts_raw:
@@ -398,6 +451,35 @@ class SearchIndex:
                             "remaster": bool(r[6]) if r[6] is not None else None,
                             "distance": r[7],
                         }))
+
+                    name_query = f"name : ({fts_query})"
+                    name_raw = self._conn_ro.execute(f"""
+                        SELECT chunks.id, chunks.name, chunks.type, chunks.pack,
+                               chunks.text, chunks.license, chunks.remaster,
+                               bm25(fts_chunks, 10.0, 0.0)
+                        FROM fts_chunks
+                        JOIN chunks ON chunks.rowid = fts_chunks.rowid
+                        WHERE fts_chunks MATCH ? AND {where}
+                        ORDER BY bm25(fts_chunks, 10.0, 0.0)
+                        LIMIT ?
+                    """, [name_query] + params + [rerank_candidates * 2]).fetchall()
+                    explicit_name_results = [
+                        {
+                            "id": r[0], "name": r[1], "type": r[2], "pack": r[3],
+                            "text": r[4], "license": r[5],
+                            "remaster": bool(r[6]) if r[6] is not None else None,
+                            "distance": r[7],
+                        }
+                        for r in name_raw
+                        if _query_contains_name(query, r[1])
+                    ]
+                    explicit_name_results.sort(
+                        key=lambda result: (
+                            len(_normalized_terms(result["name"])),
+                            len(result["name"]),
+                        ),
+                        reverse=True,
+                    )
                 except Exception:
                     pass
 
@@ -410,9 +492,16 @@ class SearchIndex:
             results = [r for _, r in semantic_results[:rrf_top_k]]
         else:
             results = _rrf_fuse(semantic_results, fts_results, top_k=rrf_top_k)
+            results = _promote_explicit_results(
+                results, explicit_name_results, top_k=rrf_top_k,
+            )
 
         # 4. Enrich with refs, legacy names, confidence
         self._enrich_results(results)
+        explicit_ids = {result["id"] for result in explicit_name_results}
+        enriched_explicit_results = [
+            result for result in results if result["id"] in explicit_ids
+        ]
 
         # Optional second-stage cross-encoder reranking. Keep all candidates
         # when reference weighting is enabled so a highly referenced result
@@ -428,6 +517,11 @@ class SearchIndex:
             results = _apply_ref_weight(results, ref_weight, top_k=top_k)
         else:
             results = results[:top_k]
+
+        if hybrid and enriched_explicit_results:
+            results = _promote_explicit_results(
+                results, enriched_explicit_results, top_k=top_k,
+            )
 
         return results
 

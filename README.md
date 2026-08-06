@@ -175,7 +175,7 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 
 | Tool | Description |
 |---|---|
-| `pf2e_search(query, top_k)` | Semantic + FTS5 search with filters, reranking, and references |
+| `pf2e_search(query, top_k)` | Semantic + sentence-tolerant FTS5 search with named-entry anchoring, filters, reranking, and references |
 | `pf2e_flag_result(result_index, note)` | Record an incorrect or low-quality result |
 | `pf2e_get_entry(entry_id)` | Fetch full entry by ID, slug, name, or Foundry UUID |
 | `pf2e_related(entry_id, direction, limit)` | Cross-reference graph: outgoing/incoming/both |

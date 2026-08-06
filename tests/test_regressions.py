@@ -101,6 +101,124 @@ def test_reference_weight_keeps_candidate_pool_without_reranking() -> None:
     assert fake._conn_ro.calls[0][1][1] == 50
 
 
+def test_natural_language_fts_terms_use_or_and_drop_question_filler() -> None:
+    terms = index_module._search_terms(
+        "Do I roll a spell attack for Fireball, or does the target make a saving throw?",
+    )
+
+    assert "fireball" in terms
+    assert "saving" in terms
+    assert "throw" in terms
+    assert "does" not in terms
+    assert "the" not in terms
+
+
+def test_explicit_name_matching_uses_complete_terms() -> None:
+    query = "Does Fireball hurt my allies?"
+
+    assert index_module._query_contains_name(query, "Fireball")
+    assert not index_module._query_contains_name(query, "Fire")
+    assert not index_module._query_contains_name(query, "Fireball Rune")
+
+
+def test_rrf_keeps_a_top_lexical_only_candidate() -> None:
+    semantic = [
+        (f"semantic:{i}", {"id": f"semantic:{i}"})
+        for i in range(1, 6)
+    ]
+    lexical = [("spells:fireball", {"id": "spells:fireball"})]
+
+    results = index_module._rrf_fuse(semantic, lexical, top_k=5)
+
+    assert "spells:fireball" in {result["id"] for result in results}
+
+
+class _HybridSearchConnection:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def execute(self, sql: str, params: object = ()) -> _Cursor:
+        self.calls.append((sql, params))
+        if "FROM vec_chunks" in sql:
+            return _Cursor([
+                (
+                    f"spells:unrelated-{i}", f"Unrelated {i}", "spell", "spells",
+                    "Unrelated spell text", "ORC", 1, i / 10,
+                )
+                for i in range(1, 6)
+            ])
+        if "bm25(fts_chunks, 10.0, 0.0)" in sql:
+            return _Cursor([
+                (
+                    "spells:fireball", "Fireball", "spell", "spells",
+                    "Save: reflex (basic)", "ORC", 1, -10.0,
+                ),
+            ])
+        if "FROM fts_chunks" in sql:
+            return _Cursor([
+                (
+                    "spells:fireball", "Fireball", "spell", "spells",
+                    "Save: reflex (basic)", "ORC", 1, -10.0,
+                ),
+            ])
+        return _Cursor([])
+
+
+def _hybrid_search_index() -> index_module.SearchIndex:
+    fake = index_module.SearchIndex.__new__(index_module.SearchIndex)
+    fake._ensure_loaded = lambda: None
+    fake._ensure_fts = lambda: None
+    fake._encode = lambda _query: [0.0]
+    fake._enrich_results = lambda _results: None
+    fake._conn_ro = _HybridSearchConnection()
+    return fake
+
+
+def test_named_entity_is_promoted_for_a_novice_question() -> None:
+    fake = _hybrid_search_index()
+
+    results = fake.search(
+        "Do I roll a spell attack for Fireball, or does the target make a saving throw?",
+        top_k=3,
+        hybrid=True,
+        rerank=False,
+    )
+
+    assert results[0]["id"] == "spells:fireball"
+    lexical_call = next(
+        (sql, params) for sql, params in fake._conn_ro.calls
+        if "bm25(fts_chunks, 10.0, 1.0)" in sql
+    )
+    fts_query = lexical_call[1][0]
+    assert " OR " in fts_query
+    assert '"fireball"' in fts_query
+    assert '"does"' not in fts_query
+
+
+def test_reranker_cannot_drop_an_explicitly_named_entity() -> None:
+    class DroppingReranker:
+        def rerank(
+            self, _query: str, documents: list[dict], top_k: int,
+        ) -> list[dict]:
+            return [
+                document for document in documents
+                if document["id"] != "spells:fireball"
+            ][:top_k]
+
+    fake = _hybrid_search_index()
+    fake._manager = DroppingReranker()
+
+    results = fake.search(
+        "Does Fireball hurt my allies?",
+        top_k=3,
+        hybrid=True,
+        rerank=True,
+    )
+
+    assert results[0]["id"] == "spells:fireball"
+    assert len(results) == 3
+
+
 def test_incoming_refs_use_stable_ids_when_names_duplicate() -> None:
     fake = index_module.SearchIndex.__new__(index_module.SearchIndex)
     fake._conn_ro = _EnrichmentConnection()
