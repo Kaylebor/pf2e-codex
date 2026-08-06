@@ -17,6 +17,13 @@ Ordered by impact. Check items off as completed.
 
 - [x] **Incremental updates**
   - Done: Content-hash diffing via `pf2e-codex index --update`. Only re-processes changed entries.
+  - Correctness hardening: journal pages are replaced as a group, deletion-only releases are applied, external FTS5 is rebuilt, and the update commits atomically.
+
+- [x] **Safe query and lazy-index access**
+  - Done: SearchIndex initialization/FTS creation is locked, query connections are read-only, and MCP SQL rejects writes, attachment, pragma changes, extension loading, and runaway VM work.
+
+- [x] **MCP Python SDK 2 compatibility**
+  - Done: Streamable HTTP serves modern stateless requests and legacy stateful sessions on the same endpoint while the CLI proxy retains its existing session flow.
 
 - [x] **UUID fetch tool**
   - Done: `pf2e_get_entry` accepts IDs, slugs, names, UUIDs. `pf2e-codex get` CLI.

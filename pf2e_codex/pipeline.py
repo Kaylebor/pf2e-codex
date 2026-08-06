@@ -11,8 +11,34 @@ from typing import Any
 from .chunker import ChunkBuilder, UUIDResolver, entry_hash
 from .config import Settings
 from .embeddings import EmbeddingProvider, get_provider
-from .fetcher import extract_all_packs, extract_lang, get_cached_zip
-from .index import init_db, load_vec_extension, rebuild_fts, vec_blob
+from .fetcher import extract_all_packs, get_cached_zip
+from .index import (
+    ensure_ambiguous_ref_targets,
+    init_db,
+    load_vec_extension,
+    rebuild_fts,
+    vec_blob,
+)
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE metacharacters for exact page-prefix matching."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _entry_page_pattern(base_id: str) -> str:
+    """Return an escaped LIKE pattern matching only an entry's page chunks."""
+    return f"{_like_escape(base_id)}\\_page\\_%"
+
+
+def _delete_entry_rows(conn: Any, base_id: str) -> None:
+    """Delete a base chunk and its journal pages without wildcard overreach."""
+    page_pattern = _entry_page_pattern(base_id)
+    for table, column in (("vec_chunks", "id"), ("chunks", "id"), ("refs", "source_id")):
+        conn.execute(
+            f"DELETE FROM {table} WHERE {column} = ? OR {column} LIKE ? ESCAPE '\\'",
+            (base_id, page_pattern),
+        )
 
 
 def build_chunks(settings: Settings) -> list[dict[str, Any]]:
@@ -98,6 +124,7 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
         conn.execute("DELETE FROM chunks")
         conn.execute("DELETE FROM refs")
         conn.execute("DELETE FROM _meta")
+        conn.execute("DELETE FROM ambiguous_ref_targets")
         conn.execute(f"""
             CREATE VIRTUAL TABLE vec_chunks USING vec0(
                 id TEXT PRIMARY KEY,
@@ -155,6 +182,9 @@ def embed_and_index(chunks: list[dict[str, Any]], settings: Settings, rebuild: b
                 INSERT OR IGNORE INTO refs (source_id, target_uuid, target_name, context)
                 VALUES (?, ?, ?, ?)
             """, (chunk["id"], ref["uuid"], ref["name"], ref.get("context", "")[:200]))
+    # Mark duplicate IDs introduced by this inserted snapshot. Incremental
+    # updates use INSERT OR IGNORE so prior ambiguity tombstones persist.
+    ensure_ambiguous_ref_targets(conn)
     conn.commit()
     print(f"Inserted {len(chunks)} chunks and refs in {time.time() - start:.1f}s")
 
@@ -223,6 +253,11 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
         conn.execute("ALTER TABLE chunks ADD COLUMN translations TEXT DEFAULT NULL")
     except Exception:
         pass  # already exists
+    # Persist duplicate-ID tombstones before any incremental deletions. The
+    # markers intentionally survive ordinary updates to prevent a former
+    # sibling's legacy bare refs from boosting the remaining target.
+    ensure_ambiguous_ref_targets(conn)
+    conn.commit()
 
     if current_release == settings.release:
         print(f"Already indexed version {settings.release}")
@@ -248,6 +283,10 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
     builder = ChunkBuilder(resolver)
 
     changed: list[dict] = []
+    # Track changed source entries independently of emitted chunks. A valid
+    # source entry can now produce zero chunks; its old rows still need to be
+    # removed and the release advanced atomically.
+    changed_entry_ids: set[str] = set()
     unchanged = 0
     all_new_ids: set[str] = set()
 
@@ -261,80 +300,100 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
             if existing and existing == h:
                 unchanged += 1
                 continue
+            changed_entry_ids.add(packed_id)
             # New or changed — rebuild chunks
             for chunk in builder.build_all(entry, pack_name):
                 changed.append(chunk)
 
     orphan_ids = set(existing_hashes.keys()) - all_new_ids
 
-    print(f"Unchanged: {unchanged}, Changed/New: {len(changed)} entries ({len(changed)} chunks), Orphaned (removed): {len(orphan_ids)}")
+    print(
+        f"Unchanged: {unchanged}, Changed/New: {len(changed_entry_ids)} entries "
+        f"({len(changed)} chunks), Orphaned (removed): {len(orphan_ids)}"
+    )
 
-    if not changed:
-        print("Nothing to update")
-        conn.close()
-        return
-
-    # Embed and index only changed chunks
-    texts = [c["text"] for c in changed]
-    print(f"Embedding {len(changed)} changed chunks...")
-    import time
-    start = time.time()
-    embeddings = _provider.embed(texts)
-    print(f"Embedded in {time.time() - start:.1f}s")
+    # Embed only changed chunks. Deletions and metadata updates still need to
+    # run when a release contains no changed entries.
+    embeddings: list[list[float]] = []
+    if changed:
+        texts = [c["text"] for c in changed]
+        print(f"Embedding {len(changed)} changed chunks...")
+        start = time.time()
+        embeddings = _provider.embed(texts)
+        print(f"Embedded in {time.time() - start:.1f}s")
 
     print("Updating database...")
     start = time.time()
-    for chunk, emb in zip(changed, embeddings):
-        # Delete old chunks for this entry (all pages)
-        base_id = chunk["id"].split("_page_")[0] if "_page_" in chunk["id"] else chunk["id"]
-        conn.execute("DELETE FROM vec_chunks WHERE id LIKE ?", (f"{base_id}%",))
-        conn.execute("DELETE FROM chunks WHERE id LIKE ?", (f"{base_id}%",))
-        conn.execute("DELETE FROM refs WHERE source_id LIKE ?", (f"{base_id}%",))
+    try:
+        conn.execute("BEGIN")
 
-        # Insert new chunk
-        conn.execute("""
-            INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster, translations)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
-            chunk.get("slug", ""),
-            chunk.get("level") if chunk.get("level") is not None else None,
-            json.dumps(chunk.get("traits", [])),
-            chunk["text"], chunk["raw_rules_count"],
-            chunk.get("source_hash"),
-            chunk.get("license", "NONE"),
-            1 if chunk.get("remaster") else (0 if chunk.get("remaster") is not None else None),
-            json.dumps(chunk.get("translations")) if chunk.get("translations") else None,
-        ))
-        conn.execute(
-            "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",
-            (chunk["id"], vec_blob(emb)),
-        )
-        for ref in chunk.get("refs", []):
-            conn.execute(
-                "INSERT OR IGNORE INTO refs (source_id, target_uuid, target_name, context) VALUES (?, ?, ?, ?)",
-                (chunk["id"], ref["uuid"], ref["name"], ref.get("context", "")[:200]),
-            )
+        embedded_by_entry: dict[str, list[tuple[dict, list[float]]]] = {}
+        for chunk, emb in zip(changed, embeddings, strict=True):
+            base_id = chunk["id"].split("_page_", 1)[0]
+            embedded_by_entry.setdefault(base_id, []).append((chunk, emb))
 
-    # Remove orphaned entries (deleted from source)
-    for oid in orphan_ids:
-        conn.execute("DELETE FROM vec_chunks WHERE id LIKE ?", (f"{oid}%",))
-        conn.execute("DELETE FROM chunks WHERE id LIKE ?", (f"{oid}%",))
-        conn.execute("DELETE FROM refs WHERE source_id LIKE ?", (f"{oid}%",))
+        # Delete each changed entry once, then insert all of its replacement
+        # chunks. This preserves journal pages when an entry has many pages.
+        for base_id in changed_entry_ids:
+            entry_chunks = embedded_by_entry.get(base_id, [])
+            _delete_entry_rows(conn, base_id)
 
-    # Update meta — refresh total_chunks after deletions
-    actual = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
-        ("total_chunks", str(actual)))
-    conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
-        ("pf2e_release", settings.release))
-    conn.commit()
+            for chunk, emb in entry_chunks:
+                conn.execute("""
+                    INSERT OR REPLACE INTO chunks (id, name, type, pack, slug, level, traits, text, raw_rules_count, source_hash, license, remaster, translations)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
+                    chunk.get("slug", ""),
+                    chunk.get("level") if chunk.get("level") is not None else None,
+                    json.dumps(chunk.get("traits", [])),
+                    chunk["text"], chunk["raw_rules_count"],
+                    chunk.get("source_hash"),
+                    chunk.get("license", "NONE"),
+                    1 if chunk.get("remaster") else (0 if chunk.get("remaster") is not None else None),
+                    json.dumps(chunk.get("translations")) if chunk.get("translations") else None,
+                ))
+                conn.execute(
+                    "INSERT INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",
+                    (chunk["id"], vec_blob(emb)),
+                )
+                for ref in chunk.get("refs", []):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO refs (source_id, target_uuid, target_name, context) VALUES (?, ?, ?, ?)",
+                        (chunk["id"], ref["uuid"], ref["name"], ref.get("context", "")[:200]),
+                    )
+
+        # Remove orphaned entries (deleted from source) and their outgoing
+        # references. Legacy bare-target incoming refs are retained because
+        # they may belong to another pack with the same ID.
+        for oid in orphan_ids:
+            _delete_entry_rows(conn, oid)
+
+        if changed_entry_ids or orphan_ids:
+            # External-content FTS5 indexes do not automatically follow direct
+            # writes to chunks, so rebuild after every data mutation.
+            rebuild_fts(conn)
+
+        # Mark duplicates introduced by replacement chunks; INSERT OR IGNORE
+        # preserves tombstones recorded before orphan/deletion processing.
+        ensure_ambiguous_ref_targets(conn)
+
+        actual = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            ("total_chunks", str(actual)))
+        conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            ("pf2e_release", settings.release))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     print(f"Updated in {time.time() - start:.1f}s")
     print(f"  Changed: {len(changed)} chunks")
     print(f"  Removed: {len(orphan_ids)} entries")
     print(f"  DB: {settings.db}")
-    conn.close()
 
 
 def embed_all_models(

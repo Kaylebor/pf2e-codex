@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import struct
-import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import sqlite_vec  # type: ignore[import-untyped]
 
+if TYPE_CHECKING:
+    from .model_manager import ModelManager
+
 
 def load_vec_extension(conn) -> None:
+    """Load sqlite-vec, then leave extension loading disabled."""
     conn.enable_load_extension(True)
-    conn.load_extension(sqlite_vec.loadable_path())
+    try:
+        conn.load_extension(sqlite_vec.loadable_path())
+    finally:
+        conn.enable_load_extension(False)
 
 
 def init_db(db_path: Path, dim: int) -> None:
@@ -71,6 +78,7 @@ def init_db(db_path: Path, dim: int) -> None:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)
     """)
+    ensure_ambiguous_ref_targets(conn)
     conn.commit()
     conn.close()
 
@@ -78,6 +86,40 @@ def init_db(db_path: Path, dim: int) -> None:
 def rebuild_fts(conn) -> None:
     """Rebuild the FTS5 index from the chunks table."""
     conn.execute("INSERT INTO fts_chunks(fts_chunks) VALUES ('rebuild')")
+
+
+def ensure_ambiguous_ref_targets(conn) -> None:
+    """Record bare IDs that have ever been ambiguous across packs.
+
+    Incremental updates retain these tombstones even after one duplicate is
+    removed. A full rebuild may clear and recompute the table because all
+    references then come from one consistent snapshot.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ambiguous_ref_targets (
+            bare_id TEXT PRIMARY KEY
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO ambiguous_ref_targets (bare_id)
+        SELECT substr(id, instr(id, ':') + 1)
+        FROM chunks
+        WHERE id <> ''
+        GROUP BY substr(id, instr(id, ':') + 1)
+        HAVING COUNT(*) > 1
+    """)
+
+
+def _current_ambiguous_ref_targets(conn) -> set[str]:
+    """Return duplicate bare IDs present in the current chunks snapshot."""
+    rows = conn.execute("""
+        SELECT substr(id, instr(id, ':') + 1)
+        FROM chunks
+        WHERE id <> ''
+        GROUP BY substr(id, instr(id, ':') + 1)
+        HAVING COUNT(*) > 1
+    """).fetchall()
+    return {bare_id for (bare_id,) in rows}
 
 
 def vec_blob(vec: list[float]) -> bytes:
@@ -126,6 +168,41 @@ def _rrf_fuse(
     ]
 
 
+def _apply_ref_weight(results: list[dict], ref_weight: float, top_k: int) -> list[dict]:
+    """Blend relevance and incoming-reference scores, then return top results."""
+    weight = max(0.0, min(float(ref_weight), 1.0))
+    if not results or weight <= 0:
+        return results[:top_k]
+
+    base_scores: list[float] = []
+    for result in results:
+        if result.get("rerank_score") is not None:
+            score = float(result["rerank_score"])
+        elif result.get("rrf_score") is not None:
+            score = float(result["rrf_score"])
+        else:
+            # sqlite-vec distance is lower-is-better, so invert its ordering.
+            score = -float(result.get("distance", 0.0))
+        base_scores.append(score)
+
+    low, high = min(base_scores), max(base_scores)
+    span = high - low
+    max_refs = max((len(r.get("incoming_refs", [])) for r in results), default=0)
+
+    for result, base in zip(results, base_scores, strict=True):
+        relevance = (base - low) / span if span else 1.0
+        ref_score = len(result.get("incoming_refs", [])) / max_refs if max_refs else 0.0
+        adjusted = (1.0 - weight) * relevance + weight * ref_score
+        result["ref_score"] = round(ref_score, 4)
+        result["adjusted_score"] = round(adjusted, 4)
+
+    results.sort(
+        key=lambda result: (result["adjusted_score"], result["ref_score"]),
+        reverse=True,
+    )
+    return results[:top_k]
+
+
 class SearchIndex:
     """Search index backed by sqlite-vec with optional FTS5 hybrid blending.
 
@@ -133,25 +210,22 @@ class SearchIndex:
     ONNX providers or sessions directly.
     """
 
-    def __init__(self, db_path: Path | str, manager: "ModelManager"):
+    def __init__(self, db_path: Path | str, manager: ModelManager):
         import sqlite3
         import threading as _threading
-
-        from .model_manager import ModelManager  # noqa: PLC0415
 
         self.db_path = Path(db_path)
         self._manager: ModelManager = manager
         self._conn: sqlite3.Connection | None = None
         self._conn_ro: sqlite3.Connection | None = None
         self._fts_ready: bool = False
+        self._ambiguous_tombstones: set[str] = set()
         self._db_lock = _threading.Lock()
 
     def _ensure_loaded(self) -> None:
-        if self._conn is not None:
-            return
         with self._db_lock:
             if self._conn is not None:
-                return  # double-check after acquiring lock
+                return
             import sqlite3
 
             if not self.db_path.exists():
@@ -174,50 +248,77 @@ class SearchIndex:
                         f"Auto-download failed.\n"
                         f"Run 'pf2e-codex embed' to build from scratch"
                     )
-            self._conn = sqlite3.connect(str(self.db_path))
-            self._conn_ro = sqlite3.connect(f"file:{self.db_path}?mode=rw", uri=True, check_same_thread=False)
-            load_vec_extension(self._conn_ro)
-            load_vec_extension(self._conn)
-            row = self._conn_ro.execute(
-                "SELECT value FROM _meta WHERE key = 'embedding_model'"
-            ).fetchone()
-            db_model = row[0] if row else None
-            if db_model and db_model != self._manager.model_name:
-                print(f"Warning: DB model {db_model} != config model {self._manager.model_name}")
-            row = self._conn_ro.execute(
-                "SELECT value FROM _meta WHERE key = 'embedding_model'"
-            ).fetchone()
-            self._conn.execute("""
-                CREATE TABLE IF NOT EXISTS refs (
-                    source_id TEXT,
-                    target_uuid TEXT,
-                    target_name TEXT,
-                    context TEXT
+            try:
+                self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+                self._conn_ro = sqlite3.connect(
+                    f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
                 )
-            """)
-            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)")
-            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)")
+                load_vec_extension(self._conn_ro)
+                load_vec_extension(self._conn)
+                row = self._conn_ro.execute(
+                    "SELECT value FROM _meta WHERE key = 'embedding_model'"
+                ).fetchone()
+                db_model = row[0] if row else None
+                if db_model and db_model != self._manager.model_name:
+                    print(f"Warning: DB model {db_model} != config model {self._manager.model_name}")
+                self._conn.execute("""
+                    CREATE TABLE IF NOT EXISTS refs (
+                        source_id TEXT,
+                        target_uuid TEXT,
+                        target_name TEXT,
+                        context TEXT
+                    )
+                """)
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)")
+                self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)")
+                tombstone_table_available = False
+                try:
+                    ensure_ambiguous_ref_targets(self._conn)
+                    tombstone_table_available = True
+                except sqlite3.OperationalError as exc:
+                    if "readonly" not in str(exc).lower():
+                        raise
+                    # Published/prebuilt DBs may be intentionally read-only.
+                    # Keep a current-snapshot fallback in memory; writable
+                    # indexes persist the durable tombstone table instead.
+                    self._ambiguous_tombstones = _current_ambiguous_ref_targets(self._conn_ro)
+                self._conn.commit()
+                if tombstone_table_available:
+                    self._ambiguous_tombstones = {
+                        bare_id for (bare_id,) in self._conn_ro.execute(
+                            "SELECT bare_id FROM ambiguous_ref_targets"
+                        ).fetchall()
+                    }
+            except Exception:
+                if self._conn_ro is not None:
+                    self._conn_ro.close()
+                    self._conn_ro = None
+                if self._conn is not None:
+                    self._conn.close()
+                    self._conn = None
+                raise
 
     def _ensure_fts(self) -> None:
-        if self._fts_ready:
-            return
-        row = self._conn_ro.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
-        ).fetchone()
-        if not row:
-            print("Creating FTS5 index...")
-            self._conn.execute("""
-                CREATE VIRTUAL TABLE fts_chunks USING fts5(
-                    name,
-                    text,
-                    content='chunks',
-                    content_rowid='rowid'
-                )
-            """)
-            self._conn.execute("INSERT INTO fts_chunks(fts_chunks) VALUES ('rebuild')")
-            self._conn.commit()
-            print("FTS5 index ready")
-        self._fts_ready = True
+        with self._db_lock:
+            if self._fts_ready:
+                return
+            row = self._conn_ro.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
+            ).fetchone()
+            if not row:
+                print("Creating FTS5 index...")
+                self._conn.execute("""
+                    CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                        name,
+                        text,
+                        content='chunks',
+                        content_rowid='rowid'
+                    )
+                """)
+                self._conn.execute("INSERT INTO fts_chunks(fts_chunks) VALUES ('rebuild')")
+                self._conn.commit()
+                print("FTS5 index ready")
+            self._fts_ready = True
 
     def _encode(self, text: str) -> list[float]:
         return self._manager.embed_query(text)
@@ -301,7 +402,10 @@ class SearchIndex:
                     pass
 
         # 3. Build results — hybrid: semantic embeddings + FTS5 full-text
-        rrf_top_k = rerank_candidates if rerank else top_k  # more candidates for reranker
+        # Reference weighting needs the larger candidate pool even when the
+        # cross-encoder reranker is disabled; otherwise highly referenced
+        # entries outside the initial top_k can never be boosted into view.
+        rrf_top_k = rerank_candidates if (rerank or ref_weight > 0) else top_k
         if not hybrid:
             results = [r for _, r in semantic_results[:rrf_top_k]]
         else:
@@ -310,23 +414,20 @@ class SearchIndex:
         # 4. Enrich with refs, legacy names, confidence
         self._enrich_results(results)
 
-        # 5. Ref-count weighting: entries with more incoming references
-        # are structurally more important. Apply before reranking so the
-        # reranker sees the adjusted scores.
-        if ref_weight > 0 and results:
-            max_refs = max((len(r.get("incoming_refs", [])) for r in results), default=1)
-            max_refs = max(max_refs, 1)
-            for r in results:
-                refs_count = len(r.get("incoming_refs", []))
-                factor = 1.0 - (refs_count / max_refs) * ref_weight
-                r["distance"] *= max(factor, 0.1)
-
-        # Optional second-stage cross-encoder reranking
+        # Optional second-stage cross-encoder reranking. Keep all candidates
+        # when reference weighting is enabled so a highly referenced result
+        # cannot be discarded before its boost is applied.
         if rerank and len(results) > 1:
             try:
-                results = self._manager.rerank(query, results, top_k=top_k)
+                rerank_top_k = len(results) if ref_weight > 0 else top_k
+                results = self._manager.rerank(query, results, top_k=rerank_top_k)
             except Exception as e:
                 print(f"Reranker failed: {e}")
+
+        if ref_weight > 0:
+            results = _apply_ref_weight(results, ref_weight, top_k=top_k)
+        else:
+            results = results[:top_k]
 
         return results
 
@@ -346,20 +447,79 @@ class SearchIndex:
         for src, name, uuid in refs_rows:
             refs_by_source.setdefault(src, []).append({"name": name, "id": uuid})
 
-        # Batch-fetch incoming refs (entries that reference this entry)
-        names = [r["name"] for r in results]
-        name_placeholders = ",".join("?" * len(names))
+        # Batch-fetch incoming refs by stable target UUID/internal ID. Names
+        # are mutable (and can be duplicated), so they must not determine
+        # reference counts or merge unrelated entries.
+        target_ids: list[str] = []
+        target_aliases: dict[str, list[str]] = {}
+        bare_ids: list[str] = []
+        for result in results:
+            internal_id = result["id"]
+            bare_id = internal_id.rsplit(":", 1)[-1]
+            target_ids.append(internal_id)
+            bare_ids.append(bare_id)
+
+        # Older indexes stored bare Foundry IDs in refs. Those IDs are not
+        # globally unique across packs, so only retain a bare alias when the
+        # chunks table proves it has one owner. Recovering ambiguous legacy
+        # refs requires a reindex/schema migration; guessing would apply a
+        # wrong incoming-reference boost to one or more duplicate entries.
+        bare_ids = list(dict.fromkeys(bare_ids))
+        bare_placeholders = ",".join("?" * len(bare_ids))
+        chunk_rows = self._conn_ro.execute(f"""
+            SELECT id FROM chunks
+            WHERE substr(id, instr(id, ':') + 1) IN ({bare_placeholders})
+        """, bare_ids).fetchall()
+        bare_counts: dict[str, int] = {}
+        for (chunk_id,) in chunk_rows:
+            bare_counts[chunk_id.rsplit(":", 1)[-1]] = bare_counts.get(
+                chunk_id.rsplit(":", 1)[-1], 0
+            ) + 1
+        import sqlite3
+        try:
+            tombstone_rows = self._conn_ro.execute(f"""
+                SELECT bare_id FROM ambiguous_ref_targets
+                WHERE bare_id IN ({bare_placeholders})
+            """, bare_ids).fetchall()
+            ambiguous_tombstones = {bare_id for (bare_id,) in tombstone_rows}
+        except sqlite3.OperationalError:
+            # Read-only prebuilt DBs cannot be migrated in place; loading
+            # computes current duplicate ownership into this memory fallback.
+            ambiguous_tombstones = set(getattr(self, "_ambiguous_tombstones", set()))
+
+        for result in results:
+            internal_id = result["id"]
+            bare_id = internal_id.rsplit(":", 1)[-1]
+            if bare_counts.get(bare_id) == 1 and bare_id not in ambiguous_tombstones:
+                aliases = [internal_id, bare_id] if internal_id != bare_id else [bare_id]
+            elif ":" in internal_id:
+                # An exact pack-qualified target remains safe even when its
+                # legacy bare counterpart is ambiguous.
+                aliases = [internal_id]
+            else:
+                aliases = []
+            target_aliases[internal_id] = aliases
+            target_ids.extend(alias for alias in aliases if alias not in target_ids)
+        target_ids = list(dict.fromkeys(target_ids))
+        target_placeholders = ",".join("?" * len(target_ids))
         incoming_rows = self._conn_ro.execute(f"""
-            SELECT target_name, source_id FROM refs
-            WHERE target_name IN ({name_placeholders})
-        """, names).fetchall()
+            SELECT target_uuid, source_id FROM refs
+            WHERE target_uuid IN ({target_placeholders})
+        """, target_ids).fetchall()
         incoming_by_target: dict[str, list[dict]] = {}
         for target, source in incoming_rows:
             incoming_by_target.setdefault(target, []).append({"id": source})
 
         for r in results:
             r["refs"] = refs_by_source.get(r["id"], [])
-            r["incoming_refs"] = incoming_by_target.get(r["name"], [])
+            incoming: list[dict] = []
+            seen_sources: set[str] = set()
+            for alias in target_aliases[r["id"]]:
+                for ref in incoming_by_target.get(alias, []):
+                    if ref["id"] not in seen_sources:
+                        incoming.append(ref)
+                        seen_sources.add(ref["id"])
+            r["incoming_refs"] = incoming
 
             # NONE license → OGL (missing metadata, but pre-ORC content)
             if r.get("license") in ("NONE", None, ""):
@@ -421,6 +581,7 @@ class SearchIndex:
         search_topic = f"{topic} condition" if " " not in topic.strip() else topic
         emb = self._encode(search_topic)
         q_blob = vec_blob(emb)
+        candidate_k = max(top_k, 50)
         results = self._conn_ro.execute(f"""
             SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text, chunks.license, chunks.remaster, distance
             FROM vec_chunks
@@ -428,7 +589,7 @@ class SearchIndex:
             WHERE vec_chunks.embedding MATCH vec_f32(?)
               AND k = ? AND {where}
             ORDER BY distance
-        """, [q_blob, rerank_candidates] + params).fetchall()
+        """, [q_blob, candidate_k] + params).fetchall()
         scored = []
         for r in results:
             ctype = r[2]
@@ -596,6 +757,11 @@ class SearchIndex:
         return meta
 
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._db_lock:
+            if self._conn_ro:
+                self._conn_ro.close()
+                self._conn_ro = None
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+            self._fts_ready = False

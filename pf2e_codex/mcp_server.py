@@ -1,4 +1,4 @@
-"""FastMCP server for PF2E rules knowledge base."""
+"""MCP server for PF2E rules knowledge base."""
 
 from __future__ import annotations
 
@@ -6,16 +6,17 @@ import atexit
 import json
 import signal
 import socket
+import sqlite3
 import sys
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP  # type: ignore[import-untyped]
+from mcp.server import MCPServer  # type: ignore[import-untyped]
 
 from .config import Settings, get_settings
-from .index import SearchIndex
-
+from .index import SearchIndex, load_vec_extension
 
 # Server endpoint file — CLI reads this to detect running server
 _SERVER_JSON: Path | None = None
@@ -29,6 +30,61 @@ def _check_port_free(host: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _read_only_sql_authorizer(action: int, arg1: str | None, arg2: str | None,
+                              _db: str | None, _source: str | None) -> int:
+    """Reject SQL operations that can mutate or escape the database."""
+    denied = {
+        sqlite3.SQLITE_ATTACH,
+        sqlite3.SQLITE_DETACH,
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_CREATE_VTABLE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_PRAGMA,
+        sqlite3.SQLITE_UPDATE,
+    }
+    if action in denied:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION:
+        function_name = (arg2 or arg1 or "").lower()
+        if function_name == "load_extension":
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+_SQL_PROGRESS_INTERVAL = 1_000
+_SQL_VM_STEP_BUDGET = 100_000
+_SQL_DEADLINE_SECONDS = 2.0
+
+
+def _open_readonly_sql_connection(db_path: Path) -> sqlite3.Connection:
+    """Open a disposable read-only SQL connection with sqlite-vec loaded."""
+    conn = sqlite3.connect(
+        f"file:{db_path}?mode=ro", uri=True, check_same_thread=False,
+    )
+    try:
+        load_vec_extension(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _find_free_port(host: str) -> int:
+    """Ask the OS for an available TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
 
 
 def _pick_port(host: str, preferred: int) -> int:
@@ -107,7 +163,7 @@ def _store_recent(query: str, results: list[dict], **params: str | int | bool | 
     })
 
 
-def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", port: int = 8000) -> FastMCP:
+def create_mcp_app(settings: Settings | None = None) -> MCPServer:
     settings = settings or get_settings()
 
     # Centralized model manager — single owner of all ONNX sessions.
@@ -123,8 +179,9 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
 
     search = SearchIndex(settings.db, manager)
 
-    mcp = FastMCP("pf2e", host=host, port=port)
-    mcp._search_index = search  # prevent GC — keep provider alive across requests
+    # MCP 2 keeps transport configuration on ``run()`` rather than the server
+    # constructor.  The tool closures retain ``search`` for the daemon lifetime.
+    mcp = MCPServer("pf2e")
 
     @mcp.tool()
     def pf2e_search(
@@ -214,7 +271,6 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
             f.write(json.dumps(flagged) + "\n")
 
         return json.dumps({"ok": True, "flagged": flagged["flagged_result"]["name"]}, indent=2)
-        return json.dumps({"query": query, "results": results}, indent=2)
 
     @mcp.tool()
     def pf2e_get_entry(entry_id: str) -> str:
@@ -321,7 +377,7 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         **chunks** — every PF2E entry as one row:
           id TEXT PRIMARY KEY ("pack:entry_id")
           name TEXT — entry name (e.g. "Fireball", "Blinded")
-          type TEXT — "feat", "spell", "condition", "hazard", "npc", "action", 
+          type TEXT — "feat", "spell", "condition", "hazard", "npc", "action",
                      "equipment", "feat-effects", "journal_page", "script",
                      "background", "deity", "familiar", "class-features", etc.
           pack TEXT — compendium pack name (e.g. "spells", "feats", "conditions")
@@ -361,7 +417,6 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
         if not sql_stripped.upper().startswith("SELECT"):
             return json.dumps({"error": "Only SELECT queries are allowed"})
         limit = max(1, min(limit, 100))
-        import sqlite3
         try:
             search._ensure_loaded()  # DB must be loaded before accessing _conn_ro
             params: dict[str, object] = {}
@@ -369,12 +424,43 @@ def create_mcp_app(settings: Settings | None = None, host: str = "127.0.0.1", po
                 from .index import vec_blob  # noqa: PLC0415
                 emb = search._manager.embed_query(query_text)
                 params["query_emb"] = vec_blob(emb)
-            cur = search._conn_ro.execute(sql, params)
-            rows = cur.fetchmany(limit + 1)
-            truncated = len(rows) > limit
-            if truncated:
-                rows = rows[:limit]
-            cols = [d[0] for d in cur.description] if cur.description else []
+
+            # The connection is opened read-only, and the authorizer provides a
+            # second boundary against writes, ATTACH, PRAGMA changes, and
+            # load_extension calls embedded in otherwise SELECT-shaped SQL.
+            # A progress handler bounds VM work even for SELECTs that return
+            # very few rows (for example, an accidental full-table join).
+            deadline = time.monotonic() + _SQL_DEADLINE_SECONDS
+            vm_callbacks = 0
+
+            def _progress() -> int:
+                nonlocal vm_callbacks
+                vm_callbacks += 1
+                if vm_callbacks >= _SQL_VM_STEP_BUDGET // _SQL_PROGRESS_INTERVAL:
+                    return 1
+                return int(time.monotonic() >= deadline)
+
+            sql_conn = _open_readonly_sql_connection(search.db_path)
+            try:
+                try:
+                    sql_conn.set_authorizer(_read_only_sql_authorizer)
+                    sql_conn.set_progress_handler(_progress, _SQL_PROGRESS_INTERVAL)
+                    cur = sql_conn.execute(sql, params)
+                    rows = cur.fetchmany(limit + 1)
+                    truncated = len(rows) > limit
+                    if truncated:
+                        rows = rows[:limit]
+                    cols = [d[0] for d in cur.description] if cur.description else []
+                finally:
+                    # Both callbacks are connection-global; restore them
+                    # before closing this request's disposable connection.
+                    try:
+                        sql_conn.set_progress_handler(None, 0)
+                    finally:
+                        sql_conn.set_authorizer(None)
+            finally:
+                sql_conn.close()
+
             result = {"columns": cols, "rows": rows, "truncated": truncated}
             result_str = json.dumps(result, default=str, ensure_ascii=False)
             if len(result_str) > 5000:
@@ -400,13 +486,13 @@ def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int =
         _SERVER_JSON = _write_server_json(host, port, transport)
         _register_cleanup()
 
-    mcp = create_mcp_app(settings, host=host, port=port)
+    mcp = create_mcp_app(settings)
 
     if transport == "stdio":
         mcp.run(transport="stdio")
     elif transport == "streamable-http":
         print(f"MCP server on http://{host}:{port}/mcp  (streamable-http)", file=sys.stderr)
-        mcp.run(transport="streamable-http")
+        mcp.run(transport="streamable-http", host=host, port=port)
     else:
         print(f"MCP server on http://{host}:{port}/sse  (SSE)", file=sys.stderr)
-        mcp.run(transport="sse")
+        mcp.run(transport="sse", host=host, port=port)

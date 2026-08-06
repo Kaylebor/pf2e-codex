@@ -54,10 +54,13 @@ pf2e-codex/
 │   ├── chunker.py         # Rules-aware chunk builder
 │   ├── models.py          # Embedding model registry & recommendations
 │   ├── embeddings.py      # Pluggable embedding providers
-│   ├── index.py           # sqlite-vec storage + search
-│   ├── pipeline.py        # Orchestration: fetch → chunk → embed → index
-│   ├── mcp_server.py      # FastMCP server
+│   ├── index.py           # sqlite-vec storage + semantic/FTS5 search
+│   ├── pipeline.py        # Orchestration: fetch → chunk → embed → index/update
+│   ├── model_manager.py   # Process-scoped embedding/reranker lifecycle
+│   ├── daemon_proxy.py    # CLI proxy for a running MCP daemon
+│   ├── mcp_server.py      # MCPServer and read-only SQL tool
 │   └── cli.py             # pf2e-codex CLI
+├── scripts/               # Benchmark and data-maintenance tools
 ├── pyproject.toml         # Package config (uv-compatible)
 └── pf2e_v2.db             # sqlite-vec database (generated)
 ```
@@ -95,15 +98,19 @@ rules explanations are retrievable.
 | `pf2e-codex related "off-guard" --direction incoming` | Cross-reference graph |
 | `pf2e-codex models` | List embedding models with recommendations |
 | `pf2e-codex validator` | Validate search quality against 25-query suite |
-| `pf2e-codex warmup` | Pre-compile ONNX models for GPU (--threads, --force) |
+| `pf2e-codex warmup` | Manually precompile models into the current user's cache |
 | `pf2e-codex pull` | Download pre-built embedding DB from GitHub Releases |
 | `pf2e-codex mcp` | Start MCP server (--transport streamable-http for daemon) |
 
 ## Daemon (systemd)
 
 For persistent GPU inference, run the MCP server as a systemd user service.
-The daemon warms up models in background and auto-downloads the embedding DB
-on first query.
+The daemon loads both models synchronously before accepting requests and
+auto-downloads the embedding DB on first query.
+
+The Streamable HTTP endpoint uses MCP Python SDK 2 and accepts both modern
+stateless MCP requests and legacy stateful sessions. The built-in CLI proxy
+currently uses the legacy stateful path.
 
 ```bash
 # Enable and start
@@ -117,19 +124,12 @@ pf2e-codex search "fireball"
 ```
 
 On first start, the daemon downloads the embedding DB (~97MB) and compiles
-ONNX models for MIGraphX GPU (~8 min for reranker, ~1 min for embeddings).
-Subsequent starts use cached `.mxr` files and are instant.
+ONNX models for MIGraphX GPU. Subsequent starts use cached `.mxr` files and
+avoid recompilation.
 
-### Warmup
-
-Pre-compile models at install time so the daemon starts warm:
-
-```bash
-pf2e-codex warmup --threads 2
-```
-
-On AMD GPU + ROCm, this compiles the embedding model and reranker into
-`.mxr` cache files. Subsequent daemon starts skip recompilation.
+`pf2e-codex warmup` can populate that cache for the current user ahead of a
+service restart. Package installation must not run it as root, because the
+result would be written to root's cache rather than the daemon user's cache.
 
 ### First-query auto-download
 
@@ -155,8 +155,7 @@ Create `~/.config/pf2e-codex/config.toml`:
 
 ```toml
 model = "snowflake-arctic-embed-s"
-db = "~/pf2e/pf2e_v2.db"
-release = "pf2e-8.1.2"
+release = "pf2e-8.2.0"
 ```
 
 Or use a project-local `pf2e-codex.toml` (gitignored by default).
@@ -167,19 +166,23 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 |----------|---------|-------------|
 | `PF2E_CACHE_DIR` | `~/.cache/pf2e-codex` | Download cache |
 | `PF2E_DATA_DIR` | `~/.local/share/pf2e-codex` | Data directory |
-| `PF2E_MODEL` | `snowflake-arctic-embed-xs` | Embedding model |
-| `PF2E_PROVIDER` | `auto` | `auto`, `onnx`, `sentence_transformers` |
-| `PF2E_RELEASE` | `pf2e-8.1.2` | PF2E system version |
+| `PF2E_MODEL` | `Snowflake/snowflake-arctic-embed-xs` | Embedding model |
+| `PF2E_PROVIDER` | `auto` | Embedding provider selection |
+| `PF2E_QUERY_PROVIDER` | `cpu` | ONNX provider for daemon queries |
+| `PF2E_RELEASE` | `pf2e-8.2.0` | PF2E system version |
 
 ## MCP Tools
 
 | Tool | Description |
 |---|---|
-| `pf2e_search(query, top_k)` | Hybrid search (semantic + FTS5 name/text matching) |
+| `pf2e_search(query, top_k)` | Semantic + FTS5 search with filters, reranking, and references |
+| `pf2e_flag_result(result_index, note)` | Record an incorrect or low-quality result |
 | `pf2e_get_entry(entry_id)` | Fetch full entry by ID, slug, name, or Foundry UUID |
 | `pf2e_related(entry_id, direction, limit)` | Cross-reference graph: outgoing/incoming/both |
-| `pf2e_rules_explain(topic, top_k)` | Prioritized search favoring journal pages |
-| `pf2e_index_status()` | Show model, chunk count, date |
+| `pf2e_rules_explain(topic, top_k)` | Prioritized search favoring journal pages and conditions |
+| `pf2e_catalog()` | Show type, license, remaster, and pack counts |
+| `pf2e_index_status()` | Show model, chunk count, and release metadata |
+| `pf2e_query_db(sql, limit, query_text)` | Execute bounded, read-only SELECT queries |
 
 ## ONNX Acceleration (automatic)
 
@@ -204,13 +207,8 @@ The tool proactively tries ONNX Runtime for faster inference. It works out of th
 | intfloat/e5-small-v2 | 1212ms | 13.4ms | 90× |
 | Single query (any) | ~5ms | ~1ms | 5× |
 
-If ONNX fails for any reason, the tool silently falls back to sentence-transformers.
-
-To force the fallback:
-
-```bash
-PF2E_PROVIDER=sentence_transformers pf2e-codex index
-```
+ONNX Runtime is the supported inference backend; missing or broken ONNX
+providers produce an explicit startup/indexing error.
 
 To force ONNX (fail if unavailable):
 ```bash
@@ -285,12 +283,8 @@ The tool proactively tries ONNX Runtime for faster inference. It works out of th
 | intfloat/e5-small-v2 | 1212ms | 13.4ms | 90× |
 | Single query (any) | ~5ms | ~1ms | 5× |
 
-If ONNX fails for any reason, the tool silently falls back to sentence-transformers.
-
-To force the fallback:
-```bash
-PF2E_PROVIDER=sentence_transformers pf2e-codex index
-```
+ONNX Runtime is the supported inference backend; missing or broken ONNX
+providers produce an explicit startup/indexing error.
 
 To force ONNX (fail if unavailable):
 ```bash

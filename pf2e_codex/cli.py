@@ -32,6 +32,20 @@ from .cli_rich import print_search_results, print_catalog, print_status, print_v
 app = typer.Typer(name="pf2e-codex", help="PF2E rules knowledge base")
 
 
+def _daemon_registered() -> bool:
+    """Return whether a daemon registration exists for this user."""
+    from .daemon_proxy import _server_json_path
+    return _server_json_path().exists()
+
+
+def _reject_local_fallback() -> bool:
+    """Report an unavailable registered daemon and block local inference."""
+    if not _daemon_registered():
+        return False
+    typer.echo("Daemon is registered but not responding. Restart it and retry.", err=True)
+    return True
+
+
 def _settings(
     data_dir: str | None = None,
     model: str | None = None,
@@ -101,20 +115,28 @@ def search(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     top_k: int = typer.Option(5, "--top-k", "-k", help="Number of results"),
     rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
-    rerank_candidates: int = typer.Option(50, "--rerank-candidates", help="Candidates to feed reranker (more = better quality, slower)"),
-        ref_weight: float = typer.Option(None, "--ref-weight", help="Weight for ref-count boosting (overrides config)"),
-        content_type: str | None = typer.Option(None, "--content-type", "-t", help="Filter by type: spell, feat, condition, hazard, etc."),
+    rerank_candidates: int | None = typer.Option(None, "--rerank-candidates", help="Candidates to feed reranker (overrides config)"),
+    ref_weight: float | None = typer.Option(None, "--ref-weight", help="Weight for ref-count boosting (overrides config)"),
+    content_type: str | None = typer.Option(None, "--content-type", "-t", help="Filter by type: spell, feat, condition, hazard, etc."),
 ) -> None:
     """Search the PF2E index."""
     from .daemon_proxy import proxy_search
-    # Resolve config defaults for None values
-    from .config import get_settings
-    settings = get_settings()
+    # Resolve config defaults for None values before trying either daemon or
+    # local execution, so both paths use identical search options.
+    settings = _settings(data_dir=data_dir, model=model)
     if rerank_candidates is None:
         rerank_candidates = settings.rerank_candidates
     if ref_weight is None:
         ref_weight = settings.ref_weight
-    result = proxy_search(query, top_k=top_k, hybrid=True, rerank=rerank, rerank_candidates=rerank_candidates, ref_weight=ref_weight, content_type=content_type)
+    result = proxy_search(
+        query,
+        top_k=top_k,
+        hybrid=True,
+        rerank=rerank,
+        rerank_candidates=rerank_candidates,
+        ref_weight=ref_weight,
+        content_type=content_type,
+    )
     if result:
         if "results" in result:
             print_search_results(result["results"], query)
@@ -123,14 +145,19 @@ def search(
             typer.echo(f"Daemon: {result['error']}", err=True)
             typer.echo("Wait for the daemon to finish warming up, then retry.", err=True)
             return
-    # Only fall back to local if no daemon is registered
-    from .daemon_proxy import _server_json_path
-    if _server_json_path().exists():
-        typer.echo("Daemon is registered but not responding. Restart it and retry.", err=True)
+    # Only fall back to local if no daemon is registered.
+    if _reject_local_fallback():
         return
-    settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
-    results = search_idx.search(query, top_k, hybrid=True, rerank=rerank)
+    results = search_idx.search(
+        query,
+        top_k,
+        hybrid=True,
+        rerank=rerank,
+        rerank_candidates=rerank_candidates,
+        ref_weight=ref_weight,
+        content_type=content_type,
+    )
     print_search_results(results, query)
 
 
@@ -152,6 +179,8 @@ def get(
         typer.echo()
         typer.echo(result["text"])
         return
+    if _reject_local_fallback():
+        raise typer.Exit(code=1)
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     result = search_idx.fetch_by_id(entry_id)
@@ -189,6 +218,8 @@ def related(
         if not results.get("outgoing") and not results.get("incoming"):
             typer.echo("No related entries found.")
         return
+    if _reject_local_fallback():
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     results = search_idx.related(entry_id, direction, limit)
@@ -216,6 +247,8 @@ def status(
         meta["model"] = meta.get("model", "unknown")
         print_status(meta)
         return
+    if _reject_local_fallback():
+        return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     meta = search_idx.status()
@@ -234,6 +267,8 @@ def catalog(
     cat = proxy_catalog()
     if cat:
         print_catalog(cat)
+        return
+    if _reject_local_fallback():
         return
     settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
@@ -590,6 +625,8 @@ def rules_explain(
         return
     if result and "error" in result:
         typer.echo(f"Daemon: {result['error']}", err=True)
+        return
+    if _reject_local_fallback():
         return
     # Local fallback
     settings = _settings(data_dir=data_dir, model=model)

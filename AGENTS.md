@@ -27,7 +27,7 @@ with self._lock:
 
 Applies to: `_provider`, `_reranker`, `_conn` (connection setup must be INSIDE the lock).
 
-### Warmup removed — models load before the server starts
+### Background warmup removed — models load before the server starts
 
 `ModelManager.start()` is synchronous and blocks until both models are
 loaded. The HTTP server does not start listening until `start()` returns,
@@ -51,6 +51,14 @@ if _server_json_path().exists():
     typer.echo("Daemon is registered but not responding.", err=True)
     return
 ```
+
+### MCP 2 serves both protocol eras
+
+The Streamable HTTP server uses `MCPServer` from MCP Python SDK 2. Its default
+`stateless_http=False` must remain unchanged while `daemon_proxy.py` uses the
+legacy initialize/session flow. MCP 2 still routes modern protocol requests
+statelessly on the same endpoint. Setting `stateless_http=True` would also force
+legacy clients into stateless handling and requires separate proxy validation.
 
 ### CLI fallback SearchIndex must use config values
 When the CLI runs without a daemon, all SearchIndex constructors must receive
@@ -135,12 +143,12 @@ pf2e_codex/
 ├── chunker.py      # Parse PF2E JSON → enriched text chunks, UUID resolution, OGL→ORC aliases
 ├── models.py       # Embedding model registry + hardware recommendations
 ├── embeddings.py   # ONNX-only provider (automatic export via optimum, inference via onnxruntime)
-├── index.py        # sqlite-vec DB init + SearchIndex class (hybrid: semantic + FTS5 name LIKE)
+├── index.py        # sqlite-vec DB init + SearchIndex class (semantic + FTS5 hybrid search)
 ├── pipeline.py     # Orchestration: fetch → extract → chunk → embed → index (+ incremental update)
 ├── benchmark.py    # Cross-model embedding speed benchmarks
 ├── cli_rich.py     # Rich table formatting for CLI output
 ├── validate.py     # Retrieval quality validation suite (25 queries, MRR)
-├── mcp_server.py   # FastMCP server with 6 tools (pf2e_search, pf2e_rules_explain, etc.)
+├── mcp_server.py   # MCPServer with 8 tools (search, fetch, related, SQL, etc.)
 └── cli.py          # Typer CLI entry point (fetch, index, search, serve, export, etc.)
 ```
 
@@ -178,6 +186,21 @@ Ternaries like `ternary(gte(@actor.level,13),4,2)` are simplified to "+4 at leve
 
 ### Pack-prefixed IDs
 Chunk IDs are `pack:entry_id` (e.g. `feats:Fury-Instinct`) because the same `_id` appears across multiple bestiary packs.
+
+### Search and update safety
+`SearchIndex` initializes its writable and read-only SQLite connections under one lock;
+all lazy connection checks happen while holding that lock. The query connection uses
+`mode=ro`, and MCP SQL queries add a SQLite authorizer plus a VM-step/deadline budget
+that rejects writes, attachment, pragma changes, extension loading, and runaway reads.
+
+Incremental updates group all journal pages by entry before replacing them, process
+entry deletions even when there are no changed entries, rebuild the external-content FTS5
+index after data mutations, and commit the complete update atomically.
+
+Legacy references store bare Foundry IDs, which can collide across packs. The
+`ambiguous_ref_targets` table remembers those collisions across incremental updates so a
+deleted duplicate's references are never reassigned to the surviving entry. Full rebuilds
+clear and recompute the table from their single source snapshot.
 
 ### Default model: `snowflake-arctic-embed-xs`
 22M params, 384 dims, ~35s to index 28K chunks on Ryzen 7 7800X3D. Faster and equivalent quality to `all-MiniLM-L6-v2`.
@@ -319,14 +342,35 @@ pf2e-codex mcp -t sse
 
 Test via stdio:
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | pf2e-codex mcp
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"pf2e-codex-smoke","version":"1.0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' |
+  pf2e-codex mcp
 ```
 
-Test via HTTP:
+Test modern stateless MCP via HTTP:
 ```bash
-curl -X POST http://localhost:8080/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+curl -sS -X POST http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/list' \
+  --data '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list",
+    "params": {
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+          "name": "pf2e-codex-smoke",
+          "version": "1.0"
+        }
+      }
+    }
+  }'
 ```
 
 ## Data Source
@@ -455,8 +499,8 @@ systemctl --user start pf2e-codex
 ```
 
 The server writes `~/.local/share/pf2e-codex/server.json` with the endpoint.
-CLI reads this file to detect the server. If server is not responsive, falls back
-to local inference.
+CLI reads this file to detect the server. If the registered server is not
+responsive, query commands report the failure instead of starting local inference.
 
 ## Dependencies
 
@@ -464,7 +508,7 @@ to local inference.
 |---------|---------|
 | `optimum[onnxruntime]` | ONNX model export + runtime inference (bundled in package) |
 | `sqlite-vec` | Vector storage + similarity search |
-| `mcp` | FastMCP server |
+| `mcp` | MCP Python SDK 2 server |
 | `pydantic` + `pydantic-settings` | Config + validation |
 | `typer` + `rich` | CLI framework + formatting |
 
