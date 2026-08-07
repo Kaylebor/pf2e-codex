@@ -29,7 +29,12 @@ def _pin_onnx_shapes(model_path: Path, seq_len: int = 512) -> None:
     """
     import onnx
 
-    m = onnx.load(str(model_path))
+    # Shape pinning only edits graph metadata.  Loading external tensor data
+    # here materializes multi-gigabyte sidecars (for example BGE-M3) into the
+    # ModelProto, then onnx.save() attempts to serialize them inline and hits
+    # protobuf's size limit.  Keep the existing external-data references
+    # untouched instead.
+    m = onnx.load(str(model_path), load_external_data=False)
     changed = False
     for inp in m.graph.input:
         dims = inp.type.tensor_type.shape.dim
@@ -165,6 +170,8 @@ class ONNXProvider(EmbeddingProvider):
                 print(f"{provider} unavailable, falling back to CPU")
                 self._session = _make_session(["CPUExecutionProvider"])
 
+        self._input_names = {model_input.name for model_input in self._session.get_inputs()}
+
         tokenizer_path = local_path or model_name
         self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
         info = get_model_info(model_name)
@@ -266,7 +273,8 @@ class ONNXProvider(EmbeddingProvider):
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             inputs = self._tokenize(batch)
-            outputs = self._session.run(None, dict(inputs))[0]
+            model_inputs = {name: value for name, value in inputs.items() if name in self._input_names}
+            outputs = self._session.run(None, model_inputs)[0]
             attention_mask = inputs["attention_mask"]
             mask_expanded = np.expand_dims(attention_mask, -1).astype(np.float32)
             sum_embeddings = np.sum(outputs * mask_expanded, axis=1)
