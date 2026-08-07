@@ -1,0 +1,31 @@
+{
+  "source_filename": "PZO12002E.pdf",
+  "pages": [
+    {
+      "number": 30,
+      "printed": "28",
+      "lines": [
+        ["GM CORE", 30, 12, "GoodOT", 8],
+        ["BUILDING ENCOUNTERS", 30, 70, "GoodOT-Bold", 16],
+        ["Choose a threat budget.", 30, 110, "GoodOT", 9],
+        ["Add creatures to the budget.", 30, 130, "GoodOT", 9],
+        ["Adjust for the group size.", 30, 150, "GoodOT", 9],
+        ["Difficulty", 330, 110, "GoodOT-CondBold", 9],
+        ["Budget", 430, 110, "GoodOT-CondBold", 9],
+        ["Moderate", 330, 130, "GoodOT", 9],
+        ["Standard value", 430, 130, "GoodOT", 9],
+        ["buyer @example.invalid", 40, 742, "GoodOT", 7]
+      ]
+    },
+    {
+      "number": 31,
+      "printed": "29",
+      "lines": [
+        ["GM CORE", 30, 12, "GoodOT", 8],
+        ["REWARDS", 30, 70, "GoodOT-Bold", 16],
+        ["Award treasure deliberately.", 30, 110, "GoodOT", 9]
+      ]
+    }
+  ],
+  "expected_names": ["BUILDING ENCOUNTERS", "REWARDS"]
+}

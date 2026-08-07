@@ -1,12 +1,16 @@
 #!/bin/bash
 # Build all embedding databases and upload them as a GitHub Release.
-# Usage: ./scripts/release-dbs.sh [version]
+# Usage: ./scripts/release-dbs.sh [version] [pf2e-release]
 #   version: git tag (e.g. "v0.1.0"), defaults to current date
+#   pf2e-release: exact Foundry PF2E release, defaults to pf2e-8.4.0
 
 set -euo pipefail
 
 REPO="Kaylebor/pf2e-codex"
 VERSION="${1:-v$(date +%Y.%m.%d)}"
+PF2E_RELEASE="${2:-pf2e-8.4.0}"
+RELEASE_DIR="${PF2E_RELEASE_DB_DIR:-$PWD/.release-dbs/$VERSION}"
+PF2E_CODEX_BIN="${PF2E_CODEX_BIN:-pf2e-codex}"
 MODELS=(
     "Snowflake/snowflake-arctic-embed-xs"
     "Snowflake/snowflake-arctic-embed-s"
@@ -17,7 +21,9 @@ MODELS=(
 )
 
 echo "=== Building DBs for release $VERSION ==="
+echo "Build directory: $RELEASE_DIR"
 echo ""
+mkdir -p "$RELEASE_DIR"
 
 # Build each DB
 for model in "${MODELS[@]}"; do
@@ -25,15 +31,8 @@ for model in "${MODELS[@]}"; do
     db="pf2e_${safe}.db"
     echo "[$model]"
 
-    # Skip if already built
-    if [ -f "$db" ]; then
-        echo "  Already built, skipping"
-        continue
-    fi
-
-    pf2e-codex embed --model "$model" --latest 2>&1 | tail -3
-    # Move to working dir
-    mv ~/.local/share/pf2e-codex/"$db" . 2>/dev/null || true
+    "$PF2E_CODEX_BIN" embed --models "$model" --release "$PF2E_RELEASE" --rebuild \
+        --corpus-scope redistributable --data-dir "$RELEASE_DIR" 2>&1 | tail -3
     echo ""
 done
 
@@ -44,8 +43,11 @@ assets=()
 for model in "${MODELS[@]}"; do
     safe=$(echo "$model" | tr '/' '--')
     db="pf2e_${safe}.db"
-    if [ -f "$db" ]; then
-        assets+=("$db")
+    db_path="$RELEASE_DIR/$db"
+    if [ -f "$db_path" ]; then
+        "$PF2E_CODEX_BIN" audit-db "$db_path" --strict \
+            --expected-release "$PF2E_RELEASE" --expected-model "$model"
+        assets+=("$db_path")
     fi
 done
 
@@ -65,7 +67,7 @@ gh release create "$VERSION" \
 
 | Model | Size |
 |---|---|
-$(for f in "${assets[@]}"; do printf "| %s | %s |\n" "$(echo $f | sed 's/pf2e_//;s/\.db$//;s/--/\//g')" "$(du -h "$f" | cut -f1)"; done)
+$(for f in "${assets[@]}"; do name=$(basename "$f"); printf "| %s | %s |\n" "$(echo "$name" | sed 's/pf2e_//;s/\.db$//;s/--/\//g')" "$(du -h "$f" | cut -f1)"; done)
 
 Download with \`pf2e-codex pull --all\` or pick specific models." \
     "${assets[@]}"

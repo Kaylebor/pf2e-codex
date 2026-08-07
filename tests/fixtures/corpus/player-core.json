@@ -1,0 +1,30 @@
+{
+  "source_filename": "PZO12001E.pdf",
+  "pages": [
+    {
+      "number": 20,
+      "printed": "18",
+      "lines": [
+        ["PLAYER CORE", 30, 12, "GoodOT", 8],
+        ["DYING AND RECOVERY", 30, 70, "GoodOT-Bold", 16],
+        ["Track the dying value.", 30, 110, "GoodOT", 9],
+        ["Attempt the recovery check.", 30, 130, "GoodOT", 9],
+        ["Outcome", 330, 110, "GoodOT-CondBold", 9],
+        ["Change", 430, 110, "GoodOT-CondBold", 9],
+        ["Success", 330, 130, "GoodOT", 9],
+        ["Reduce the value", 430, 130, "GoodOT", 9]
+      ]
+    },
+    {
+      "number": 21,
+      "printed": "19",
+      "lines": [
+        ["PLAYER CORE", 30, 12, "GoodOT", 8],
+        ["EXPLORATION", 30, 70, "GoodOT-Bold", 16],
+        ["Choose an exploration activity.", 30, 110, "GoodOT", 9],
+        ["Describe how the character proceeds.", 30, 130, "GoodOT", 9]
+      ]
+    }
+  ],
+  "expected_names": ["DYING AND RECOVERY", "EXPLORATION"]
+}

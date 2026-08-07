@@ -6,8 +6,11 @@ from pathlib import Path
 
 import typer
 
-from .config import Settings, get_settings
+from .cli_rich import print_catalog, print_search_results, print_status, print_validation
+from .config import CorpusScope, DatabaseScope, Settings, get_settings
 from .index import SearchIndex
+from .models import list_models, recommend
+from .pipeline import build_chunks, embed_and_index, index_all, save_chunks
 
 
 def _local_index(settings: Settings, *, model: str | None = None) -> SearchIndex:
@@ -24,23 +27,25 @@ def _local_index(settings: Settings, *, model: str | None = None) -> SearchIndex
         onnx_provider=settings.query_provider,
     )
     manager.start()
-    return SearchIndex(settings.db, manager)
-from .models import list_models, recommend
-from .pipeline import build_chunks, embed_and_index, index_all, save_chunks
-from .cli_rich import print_search_results, print_catalog, print_status, print_validation
+    return SearchIndex(
+        settings.db,
+        manager,
+        expected_scope=settings.resolved_database_scope.value,
+        clean_db_path=settings.clean_db,
+    )
 
 app = typer.Typer(name="pf2e-codex", help="PF2E rules knowledge base")
 
 
-def _daemon_registered() -> bool:
+def _daemon_registered(settings: Settings | None = None) -> bool:
     """Return whether a daemon registration exists for this user."""
     from .daemon_proxy import _server_json_path
-    return _server_json_path().exists()
+    return _server_json_path(settings.data_dir if settings is not None else None).exists()
 
 
-def _reject_local_fallback() -> bool:
+def _reject_local_fallback(settings: Settings | None = None) -> bool:
     """Report an unavailable registered daemon and block local inference."""
-    if not _daemon_registered():
+    if not _daemon_registered(settings):
         return False
     typer.echo("Daemon is registered but not responding. Restart it and retry.", err=True)
     return True
@@ -50,14 +55,25 @@ def _settings(
     data_dir: str | None = None,
     model: str | None = None,
     release: str | None = None,
+    corpus_scope: CorpusScope | None = None,
+    database_scope: DatabaseScope | None = None,
 ) -> Settings:
-    kwargs: dict[str, str] = {}
+    kwargs: dict[str, object] = {}
     if data_dir:
         kwargs["data_dir"] = data_dir
     if model:
         kwargs["model"] = model
     if release:
         kwargs["release"] = release
+    if corpus_scope is not None:
+        kwargs["corpus_scope"] = corpus_scope
+        kwargs["database_scope"] = (
+            DatabaseScope.LOCAL
+            if corpus_scope is CorpusScope.LOCAL_FULL
+            else DatabaseScope.CLEAN
+        )
+    if database_scope is not None:
+        kwargs["database_scope"] = database_scope
     return get_settings(**kwargs)
 
 
@@ -76,9 +92,14 @@ def fetch(
 def build(
     output: Path = typer.Option(Path("chunks.json"), "--output", "-o", help="Output JSON file"),
     version: str | None = typer.Option(None, "--version", "-v"),
+    corpus_scope: CorpusScope = typer.Option(
+        CorpusScope.REDISTRIBUTABLE,
+        "--corpus-scope",
+        help="redistributable excludes purchased PDFs; local-full includes them privately",
+    ),
 ) -> None:
     """Build enriched chunks from PF2E pack data."""
-    settings = _settings(release=version)
+    settings = _settings(release=version, corpus_scope=corpus_scope)
     chunks = build_chunks(settings)
     save_chunks(chunks, output)
 
@@ -90,9 +111,14 @@ def index(
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
     rebuild: bool = typer.Option(False, "--rebuild", help="Replace existing index"),
     update: bool = typer.Option(False, "--update", "-u", help="Incremental update (diff vs indexed release)"),
+    corpus_scope: CorpusScope = typer.Option(
+        CorpusScope.REDISTRIBUTABLE,
+        "--corpus-scope",
+        help="redistributable excludes purchased PDFs; local-full includes them privately",
+    ),
 ) -> None:
     """Embed chunks and build sqlite-vec index."""
-    settings = _settings(data_dir=data_dir, model=model)
+    settings = _settings(data_dir=data_dir, model=model, corpus_scope=corpus_scope)
     if update:
         from .pipeline import update_index
         update_index(settings)
@@ -102,7 +128,9 @@ def index(
         chunks: list[dict] = json.loads(chunks_file.read_text())
         typer.echo(f"Loaded {len(chunks)} chunks from {chunks_file}")
         typer.echo(f"Target DB: {settings.db}")
-        embed_and_index(chunks, settings, rebuild=rebuild)
+        # A chunks file represents a complete snapshot. Full snapshots always
+        # use the validated sibling/atomic-replacement path.
+        embed_and_index(chunks, settings, rebuild=True)
     else:
         typer.echo(f"Target DB: {settings.db}")
         index_all(settings, rebuild=rebuild)
@@ -136,6 +164,7 @@ def search(
         rerank_candidates=rerank_candidates,
         ref_weight=ref_weight,
         content_type=content_type,
+        settings=settings,
     )
     if result:
         if "results" in result:
@@ -146,7 +175,7 @@ def search(
             typer.echo("Wait for the daemon to finish warming up, then retry.", err=True)
             return
     # Only fall back to local if no daemon is registered.
-    if _reject_local_fallback():
+    if _reject_local_fallback(settings):
         return
     search_idx = _local_index(settings)
     results = search_idx.search(
@@ -169,7 +198,8 @@ def get(
 ) -> None:
     """Fetch a single entry by its ID or Foundry UUID."""
     from .daemon_proxy import proxy_get_entry
-    result = proxy_get_entry(entry_id)
+    settings = _settings(data_dir=data_dir, model=model)
+    result = proxy_get_entry(entry_id, settings=settings)
     if result:
         if "error" in result:
             typer.echo(result["error"], err=True)
@@ -179,9 +209,8 @@ def get(
         typer.echo()
         typer.echo(result["text"])
         return
-    if _reject_local_fallback():
+    if _reject_local_fallback(settings):
         raise typer.Exit(code=1)
-    settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     result = search_idx.fetch_by_id(entry_id)
     if result:
@@ -204,7 +233,8 @@ def related(
 ) -> None:
     """Find entries related by cross-references."""
     from .daemon_proxy import proxy_related
-    result = proxy_related(entry_id, direction, limit)
+    settings = _settings(data_dir=data_dir, model=model)
+    result = proxy_related(entry_id, direction, limit, settings=settings)
     if result:
         results = result.get("results", {})
         if results.get("outgoing"):
@@ -218,9 +248,8 @@ def related(
         if not results.get("outgoing") and not results.get("incoming"):
             typer.echo("No related entries found.")
         return
-    if _reject_local_fallback():
+    if _reject_local_fallback(settings):
         return
-    settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     results = search_idx.related(entry_id, direction, limit)
     if results.get("outgoing"):
@@ -242,14 +271,14 @@ def status(
 ) -> None:
     """Show index status."""
     from .daemon_proxy import proxy_status
-    meta = proxy_status()
+    settings = _settings(data_dir=data_dir, model=model)
+    meta = proxy_status(settings=settings)
     if meta:
         meta["model"] = meta.get("model", "unknown")
         print_status(meta)
         return
-    if _reject_local_fallback():
+    if _reject_local_fallback(settings):
         return
-    settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     meta = search_idx.status()
     meta["model"] = settings.model
@@ -264,13 +293,13 @@ def catalog(
 ) -> None:
     """Show the structure of the PF2E database."""
     from .daemon_proxy import proxy_catalog
-    cat = proxy_catalog()
+    settings = _settings(data_dir=data_dir, model=model)
+    cat = proxy_catalog(settings=settings)
     if cat:
         print_catalog(cat)
         return
-    if _reject_local_fallback():
+    if _reject_local_fallback(settings):
         return
-    settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     cat = search_idx.catalog()
     print_catalog(cat)
@@ -286,12 +315,27 @@ def config(
     typer.echo("Effective configuration:")
     typer.echo(f"  model: {s.model}")
     typer.echo(f"  data_dir: {s.data_dir}")
-    typer.echo(f"  db: {s.db}  (derived)")
+    typer.echo(
+        f"  database_scope: {s.database_scope.value} -> "
+        f"{s.resolved_database_scope.value}"
+    )
+    typer.echo(f"  db: {s.db}  (selected)")
+    typer.echo(f"  clean_db: {s.clean_db}")
+    typer.echo(f"  local_db: {s.local_db}")
     typer.echo(f"  provider: {s.provider}")
     typer.echo(f"  onnx_provider: {s.onnx_provider}  (embedding/indexing)")
     typer.echo(f"  query_provider: {s.query_provider}  (daemon queries)")
     typer.echo(f"  release: {s.release}")
     typer.echo(f"  cache_dir: {s.cache_dir}")
+    typer.echo(f"  corpus_dir: {s.effective_corpus_dir or '(disabled)'}")
+    typer.echo(f"  corpus_auto_discover: {s.corpus_auto_discover}")
+    typer.echo(f"  corpus_scope: {s.corpus_scope.value}")
+    if s.corpus_include:
+        typer.echo(f"  corpus_include: {', '.join(s.corpus_include)}")
+    if s.corpus_exclude:
+        typer.echo(f"  corpus_exclude: {', '.join(s.corpus_exclude)}")
+    if s.corpus_prefer:
+        typer.echo(f"  corpus_prefer: {s.corpus_prefer}")
     typer.echo(f"  transport: {s.transport}")
     if show_file:
         for path in _CONFIG_PATHS:
@@ -332,12 +376,21 @@ def models(
 def mcp_cmd(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory (overrides XDG default)"),
+    database_scope: DatabaseScope | None = typer.Option(
+        None,
+        "--db-scope",
+        help="auto prefers the private local DB; clean/local force one slot",
+    ),
     transport: str = typer.Option("stdio", "--transport", "-t", help="MCP transport: stdio, sse, or streamable-http"),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind address (streamable-http / sse)"),
     port: int = typer.Option(14141, "--port", "-p", help="Port (streamable-http / sse, default 14141)"),
 ) -> None:
     """Start the MCP server (for Claude, pi, Cursor, etc.)."""
-    settings = _settings(data_dir=data_dir, model=model)
+    settings = _settings(
+        data_dir=data_dir,
+        model=model,
+        database_scope=database_scope,
+    )
     settings.transport = transport
     from .mcp_server import serve as _serve
     _serve(settings, host=host, port=port)
@@ -370,13 +423,22 @@ def benchmark(
 def validate(
     model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+    database_scope: DatabaseScope | None = typer.Option(
+        None,
+        "--db-scope",
+        help="auto prefers the private local DB; clean/local force one slot",
+    ),
     onnx_provider: str = typer.Option("auto", "--onnx-provider", help="ONNX provider override"),
     mode: str = typer.Option("hybrid", "--mode", help="Search mode: hybrid or semantic"),
     rerank: bool = typer.Option(True, "--rerank/--no-rerank", help="Use cross-encoder reranker (default: on)"),
 ) -> None:
     """Validate retrieval quality against standard query suite."""
     from .validate import run_validation, load_queries
-    settings = _settings(data_dir=data_dir, model=model)
+    settings = _settings(
+        data_dir=data_dir,
+        model=model,
+        database_scope=database_scope,
+    )
     queries = load_queries()
     typer.echo(f"Model: {settings.model}")
     typer.echo(f"DB:    {settings.db}")
@@ -415,6 +477,118 @@ def export(
         raise typer.Exit(1)
 
 
+@app.command("corpus-export")
+def corpus_export(
+    source: Path = typer.Argument(..., help="Local PDF with a selectable text layer"),
+    output: Path = typer.Argument(..., help="Destination extracted JSON artifact"),
+    first_page: int = typer.Option(1, "--first-page", help="First physical PDF page (1-based)"),
+    last_page: int | None = typer.Option(
+        None, "--last-page", help="Last physical PDF page (inclusive)"
+    ),
+    force: bool = typer.Option(False, "--force", help="Replace an existing output artifact"),
+) -> None:
+    """Export native PDF words and geometry without OCR or corpus parsing."""
+    from .pdf_export import PdfExportDependencyError, export_pdf
+
+    try:
+        summary = export_pdf(
+            source,
+            output,
+            first_page=first_page,
+            last_page=last_page,
+            overwrite=force,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError, PdfExportDependencyError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(
+        f"Exported {summary.exported_pages}/{summary.source_pages} pages "
+        f"({summary.words:,} words) -> {summary.output_path}"
+    )
+
+
+@app.command("corpus-status")
+def corpus_status(
+    corpus_dir: Path | None = typer.Option(
+        None, "--corpus-dir", help="Local corpus root containing sources/"
+    ),
+) -> None:
+    """Show supported Paizo sources and the persisted active revision choice."""
+    from .corpus import discover_sources, select_revisions
+
+    settings = _settings()
+    if corpus_dir is not None:
+        settings = settings.model_copy(update={"corpus_dir": corpus_dir})
+    root = settings.effective_corpus_dir
+    if root is None:
+        typer.echo("Corpus is disabled: no corpus directory is configured or discovered.")
+        return
+    source_root = root / "sources"
+    try:
+        sources = discover_sources(
+            source_root,
+            include=settings.corpus_include,
+            exclude=settings.corpus_exclude,
+        )
+        revisions = select_revisions(
+            sources,
+            prefer=settings.corpus_prefer,
+            state_root=root,
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"Corpus root: {root}")
+    typer.echo(f"Recognized candidates: {len(sources)}")
+    if not revisions:
+        typer.echo("No supported PZO products selected.")
+        return
+    for revision in revisions:
+        mode = "combined PDF" if revision.combined else f"{len(revision.sources)} split PDFs"
+        printing = f", printing {revision.printing}" if revision.printing else ""
+        names = ", ".join(source.source_name for source in revision.sources[:3])
+        if len(revision.sources) > 3:
+            names += f", and {len(revision.sources) - 3} more"
+        typer.echo(
+            f"  {revision.product.code} {revision.product.title}: {mode}{printing} [{names}]"
+        )
+
+
+@app.command("corpus-sync")
+def corpus_sync(
+    corpus_dir: Path | None = typer.Option(
+        None, "--corpus-dir", help="Local corpus root containing sources/"
+    ),
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+) -> None:
+    """Export, parse, and atomically refresh corpus-owned index sections."""
+    from .pdf_export import PdfExportDependencyError
+    from .pipeline import build_corpus_chunks, sync_corpus_index
+
+    settings = _settings(
+        data_dir=data_dir,
+        model=model,
+        corpus_scope=CorpusScope.LOCAL_FULL,
+    )
+    if corpus_dir is not None:
+        settings = settings.model_copy(update={"corpus_dir": corpus_dir})
+    try:
+        chunks = build_corpus_chunks(settings)
+        summary = sync_corpus_index(settings, chunks)
+    except (FileNotFoundError, RuntimeError, ValueError, PdfExportDependencyError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(
+        "Corpus synchronized: "
+        f"{summary['active']} active, {summary['changed']} changed, "
+        f"{summary['removed']} removed, {summary['unchanged']} unchanged."
+    )
+
+
 @app.command()
 def embed(
     all_models: bool = typer.Option(False, "--all-models", "-A", help="Embed all supported models"),
@@ -423,8 +597,13 @@ def embed(
     update: bool = typer.Option(False, "--update", "-u", help="Incremental update existing DBs instead of skipping"),
     rebuild: bool = typer.Option(False, "--rebuild", "-f", help="Rebuild existing DBs from scratch (for chunker changes)"),
     latest: bool = typer.Option(False, "--latest", "-l", help="Fetch and update to the latest PF2E release from GitHub"),
-    release: str | None = typer.Option(None, "--release", "-r", help="Specific PF2E release version (e.g. pf2e-8.2.0)"),
+    release: str | None = typer.Option(None, "--release", "-r", help="Specific PF2E release version (e.g. pf2e-8.4.0)"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+    corpus_scope: CorpusScope = typer.Option(
+        CorpusScope.REDISTRIBUTABLE,
+        "--corpus-scope",
+        help="redistributable excludes purchased PDFs; local-full includes them privately",
+    ),
 ) -> None:
     """Embed chunks for one or more models (shared fetch + chunk phase)."""
     from .models import ALL_MODEL_NAMES
@@ -441,34 +620,33 @@ def embed(
         typer.echo("--latest and --release are mutually exclusive")
         raise typer.Exit(1)
 
-    settings = _settings(data_dir=data_dir)
+    settings = _settings(data_dir=data_dir, corpus_scope=corpus_scope)
 
     if latest:
         from .fetcher import get_latest_release
         typer.echo(f"Detecting latest PF2E release...")
         latest_rel = get_latest_release()
         typer.echo(f"Latest: {latest_rel}")
-        from .config import Settings as S
-        settings = S(
-            data_dir=str(settings.data_dir),
-            model=settings.model,
-            release=latest_rel,
-            provider=settings.provider,
-            onnx_provider=settings.onnx_provider,
-        )
+        settings = settings.model_copy(update={"release": latest_rel})
 
     if release:
-        from .config import Settings as S
-        settings = S(
-            data_dir=str(settings.data_dir),
-            model=settings.model,
-            release=release,
-            provider=settings.provider,
-            onnx_provider=settings.onnx_provider,
-        )
+        settings = settings.model_copy(update={"release": release})
 
     from .pipeline import embed_all_models
-    embed_all_models(settings, model_list, concurrency=concurrency, update=update, rebuild=rebuild)
+    results = embed_all_models(
+        settings,
+        model_list,
+        concurrency=concurrency,
+        update=update,
+        rebuild=rebuild,
+    )
+    failed = [model_name for model_name, ok in results.items() if not ok]
+    if failed:
+        typer.echo(
+            "Embedding failed for: " + ", ".join(failed),
+            err=True,
+        )
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -539,12 +717,51 @@ def warmup(
 
 
 @app.command()
+def audit_db(
+    database: Path = typer.Argument(..., help="SQLite database to audit"),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Require the explicit redistributable seed marker for publication",
+    ),
+    expected_release: str | None = typer.Option(
+        None,
+        "--expected-release",
+        help="Require this indexed PF2E release",
+    ),
+    expected_model: str | None = typer.Option(
+        None,
+        "--expected-model",
+        help="Require this embedding model",
+    ),
+) -> None:
+    """Fail if a DB contains private corpus data or lacks release provenance."""
+    from .distribution import audit_redistributable_database
+
+    try:
+        audit = audit_redistributable_database(
+            database,
+            require_explicit_marker=strict,
+            expected_release=expected_release,
+            expected_model=expected_model,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    marker = audit.scope or "legacy Foundry-only"
+    typer.echo(
+        f"Clean ownership and provenance audit passed ({marker}). "
+        "Release packaging must still include all required source notices."
+    )
+
+
+@app.command()
 def pull(
     model: str = typer.Option("", "--model", "-m", help="Single model to download (e.g. 'Snowflake/snowflake-arctic-embed-m')"),
     models: str | None = typer.Option(None, "--models", help="Comma-separated list of models"),
     all_models: bool = typer.Option(False, "--all", help="Download all available pre-built DBs"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Target data directory (default: user dir)"),
-    release: str | None = typer.Option(None, "--release", help="PF2E release version (e.g. 'pf2e-8.2.0')"),
+    release: str | None = typer.Option(None, "--release", help="PF2E release version (e.g. 'pf2e-8.4.0')"),
 ) -> None:
     """Download pre-built embedding databases from GitHub Releases.
 
@@ -556,6 +773,8 @@ def pull(
         pf2e-codex pull -m arctic-embed-m  # single model
         pf2e-codex pull --models xs,m,bge  # specific models
     """
+    import os
+    import tempfile
     import urllib.request as _req
 
     settings = _settings(data_dir=data_dir)
@@ -584,6 +803,7 @@ def pull(
         raise typer.Exit(code=1)
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    failed_downloads: list[str] = []
 
     for i, m in enumerate(model_list):
         from .config import _model_safe_name
@@ -592,20 +812,65 @@ def pull(
         dest = target_dir / db_name
 
         if dest.exists():
-            typer.echo(f"  [{i+1}/{len(model_list)}] {m} — already exists, skipping")
-            continue
+            from .distribution import (
+                audit_database_slot,
+                audit_redistributable_database,
+            )
 
-        typer.echo(f"  [{i+1}/{len(model_list)}] {m} — downloading...", nl=False)
+            try:
+                audit_database_slot(dest, "clean")
+                audit_redistributable_database(
+                    dest,
+                    expected_release=rel,
+                    expected_model=m,
+                )
+            except RuntimeError:
+                typer.echo(
+                    f"  [{i+1}/{len(model_list)}] {m} — existing artifact is stale; "
+                    "replacing...",
+                    nl=False,
+                )
+            else:
+                typer.echo(
+                    f"  [{i+1}/{len(model_list)}] {m} — already current, skipping"
+                )
+                continue
+        else:
+            typer.echo(f"  [{i+1}/{len(model_list)}] {m} — downloading...", nl=False)
+
+        temporary: Path | None = None
         try:
-            _req.urlretrieve(url, dest)
+            with tempfile.NamedTemporaryFile(
+                dir=target_dir,
+                prefix=f".{db_name}.download-",
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+            _req.urlretrieve(url, temporary)
+            from .distribution import (
+                audit_database_slot,
+                audit_redistributable_database,
+            )
+
+            audit_database_slot(temporary, "clean")
+            audit_redistributable_database(
+                temporary,
+                expected_release=rel,
+                expected_model=m,
+            )
+            os.replace(temporary, dest)
+            temporary = None
             size_mb = dest.stat().st_size / 1024**2
             typer.echo(f" {size_mb:.0f}MB")
         except Exception as e:
-            if dest.exists():
-                dest.unlink()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
             typer.echo(f" failed: {e}")
+            failed_downloads.append(m)
 
     typer.echo(f"Done. DBs in: {target_dir}")
+    if failed_downloads:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -617,7 +882,8 @@ def rules_explain(
 ) -> None:
     """Get core rules explanations (prioritizes journal pages and conditions)."""
     from .daemon_proxy import proxy_rules_explain
-    result = proxy_rules_explain(topic, top_k=top_k)
+    settings = _settings(data_dir=data_dir, model=model)
+    result = proxy_rules_explain(topic, top_k=top_k, settings=settings)
     if result and "results" in result:
         for r in result["results"]:
             typer.echo(f"\n  [{r['type']}] {r['name']} ({r['pack']})")
@@ -626,10 +892,9 @@ def rules_explain(
     if result and "error" in result:
         typer.echo(f"Daemon: {result['error']}", err=True)
         return
-    if _reject_local_fallback():
+    if _reject_local_fallback(settings):
         return
     # Local fallback
-    settings = _settings(data_dir=data_dir, model=model)
     search_idx = _local_index(settings)
     results = search_idx.rules_explain(topic, top_k)
     for r in results:

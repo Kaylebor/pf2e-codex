@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import struct
 from pathlib import Path
@@ -11,6 +12,19 @@ import sqlite_vec  # type: ignore[import-untyped]
 
 if TYPE_CHECKING:
     from .model_manager import ModelManager
+
+
+SCHEMA_VERSION = 2
+
+
+_CHUNK_PROVENANCE_COLUMNS = {
+    "origin": "TEXT NOT NULL DEFAULT 'foundry'",
+    "source_id": "TEXT",
+    "source_page_start": "INTEGER",
+    "source_page_end": "INTEGER",
+    "printed_page": "TEXT",
+    "section_hash": "TEXT",
+}
 
 
 def load_vec_extension(conn) -> None:
@@ -48,7 +62,13 @@ def init_db(db_path: Path, dim: int) -> None:
             source_hash TEXT,
             license TEXT DEFAULT 'NONE',
             remaster INTEGER DEFAULT NULL,
-            translations TEXT DEFAULT NULL
+            translations TEXT DEFAULT NULL,
+            origin TEXT NOT NULL DEFAULT 'foundry',
+            source_id TEXT,
+            source_page_start INTEGER,
+            source_page_end INTEGER,
+            printed_page TEXT,
+            section_hash TEXT
         )
     """)
     conn.execute(f"""
@@ -73,6 +93,7 @@ def init_db(db_path: Path, dim: int) -> None:
             context TEXT
         )
     """)
+    migrate_db(conn)
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id)
     """)
@@ -80,8 +101,53 @@ def init_db(db_path: Path, dim: int) -> None:
         CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)
     """)
     ensure_ambiguous_ref_targets(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+        ("schema_version", str(SCHEMA_VERSION)),
+    )
     conn.commit()
     conn.close()
+
+
+def migrate_db(conn) -> None:
+    """Bring an existing database forward without discarding indexed rows."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+    for name, declaration in _CHUNK_PROVENANCE_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE chunks ADD COLUMN {name} {declaration}")
+
+    # Older databases consist solely of Foundry content.  Mark those rows as
+    # such rather than letting an update mistake them for locally parsed text.
+    conn.execute("UPDATE chunks SET origin = 'foundry' WHERE origin IS NULL OR origin = ''")
+    conn.execute(
+        "UPDATE chunks SET source_id = 'foundry:legacy' "
+        "WHERE origin = 'foundry' AND (source_id IS NULL OR source_id = '')"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sources (
+            source_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            product TEXT,
+            revision TEXT,
+            parser TEXT,
+            license TEXT,
+            era TEXT,
+            provenance TEXT
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO sources
+            (source_id, source, product, revision, parser, license, era, provenance)
+        SELECT 'foundry:legacy', 'foundry', 'FoundryVTT PF2E', NULL,
+               'foundry-json', 'mixed', 'mixed', NULL
+        WHERE EXISTS (
+            SELECT 1 FROM chunks WHERE source_id = 'foundry:legacy'
+        )
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+        ("schema_version", str(SCHEMA_VERSION)),
+    )
 
 
 def rebuild_fts(conn) -> None:
@@ -139,9 +205,10 @@ def _normalize_id(raw: str) -> str:
 _SEARCH_STOP_WORDS = frozenset({
     "about", "after", "also", "and", "are", "because", "before", "between",
     "can", "could", "does", "for", "from", "have", "how", "into", "its",
-    "mean", "means", "that", "the", "their", "them", "then", "this", "use",
+    "mean", "means", "set", "that", "the", "their", "them", "then", "this", "use",
     "using", "what", "when", "where", "which", "with", "would", "your",
 })
+_SEARCH_SHORT_TERMS = frozenset({"ac", "dc", "hp", "xp"})
 
 
 def _normalized_terms(text: str) -> list[str]:
@@ -153,7 +220,8 @@ def _search_terms(query: str) -> list[str]:
     """Extract stable lexical terms from a natural-language query."""
     return list(dict.fromkeys(
         term for term in _normalized_terms(query)
-        if len(term) > 2 and term not in _SEARCH_STOP_WORDS
+        if (len(term) > 2 or term in _SEARCH_SHORT_TERMS)
+        and term not in _SEARCH_STOP_WORDS
     ))
 
 
@@ -162,6 +230,8 @@ def _query_contains_name(query: str, name: str) -> bool:
     query_terms = _normalized_terms(query)
     name_terms = _normalized_terms(name)
     if not name_terms or len(name_terms) > len(query_terms):
+        return False
+    if len(name_terms) == 1 and name_terms[0] in _SEARCH_STOP_WORDS:
         return False
     width = len(name_terms)
     return any(
@@ -179,6 +249,29 @@ def _promote_explicit_results(
     promoted = [current.get(result["id"], result) for result in explicit_results]
     promoted.extend(result for result in results if result["id"] not in explicit_ids)
     return promoted[:top_k]
+
+
+def _prefer_remaster_overlaps(results: list[dict]) -> list[dict]:
+    """Prefer Remaster only within exact-name legacy/Remaster overlaps.
+
+    The occupied ranks do not change, so unrelated legacy-only rules receive
+    no penalty. This is intentionally narrower than a global era score boost.
+    """
+    positions: dict[str, list[int]] = {}
+    for index, result in enumerate(results):
+        key = " ".join(_normalized_terms(result.get("name", "")))
+        if key:
+            positions.setdefault(key, []).append(index)
+    preferred = list(results)
+    for indexes in positions.values():
+        eras = {results[index].get("remaster") for index in indexes}
+        if True not in eras or False not in eras:
+            continue
+        group = [results[index] for index in indexes]
+        group.sort(key=lambda result: result.get("remaster") is True, reverse=True)
+        for index, result in zip(indexes, group, strict=True):
+            preferred[index] = result
+    return preferred
 
 
 def _rrf_fuse(
@@ -249,6 +342,52 @@ def _apply_ref_weight(results: list[dict], ref_weight: float, top_k: int) -> lis
     return results[:top_k]
 
 
+def _chunk_result(row: tuple) -> dict:
+    """Format a fetched chunk, including its source-owned provenance."""
+    return {
+        "id": row[0], "name": row[1], "type": row[2], "pack": row[3], "text": row[4],
+        "provenance": {
+            "origin": row[5], "source_id": row[6],
+            "source_page_start": row[7], "source_page_end": row[8],
+            "printed_page": row[9], "section_hash": row[10],
+            "source": row[11], "product": row[12], "revision": row[13],
+            "parser": row[14], "license": row[15], "era": row[16],
+            "provenance": _decode_json_object(row[17]),
+        },
+    }
+
+
+def _decode_json_object(value: object) -> object:
+    """Decode stored provenance JSON while tolerating legacy plain text."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
+_FETCH_CHUNK_COLUMNS = """
+    SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text,
+           chunks.origin, chunks.source_id, chunks.source_page_start,
+           chunks.source_page_end, chunks.printed_page, chunks.section_hash,
+           sources.source, sources.product, sources.revision, sources.parser,
+           sources.license, sources.era, sources.provenance
+    FROM chunks LEFT JOIN sources ON sources.source_id = chunks.source_id
+"""
+
+_FETCH_LEGACY_CHUNK_COLUMNS = """
+    SELECT chunks.id, chunks.name, chunks.type, chunks.pack, chunks.text,
+           'foundry', NULL, NULL, NULL, NULL, NULL,
+           'foundry', 'FoundryVTT PF2E', NULL, 'foundry-json',
+           chunks.license,
+           CASE WHEN chunks.remaster = 1 THEN 'remaster'
+                WHEN chunks.remaster = 0 THEN 'legacy' ELSE 'unknown' END,
+           NULL
+    FROM chunks
+"""
+
+
 class SearchIndex:
     """Search index backed by sqlite-vec with optional FTS5 hybrid blending.
 
@@ -256,7 +395,14 @@ class SearchIndex:
     ONNX providers or sessions directly.
     """
 
-    def __init__(self, db_path: Path | str, manager: ModelManager):
+    def __init__(
+        self,
+        db_path: Path | str,
+        manager: ModelManager,
+        *,
+        expected_scope: str | None = None,
+        clean_db_path: Path | str | None = None,
+    ):
         import sqlite3
         import threading as _threading
 
@@ -266,7 +412,10 @@ class SearchIndex:
         self._conn_ro: sqlite3.Connection | None = None
         self._fts_ready: bool = False
         self._ambiguous_tombstones: set[str] = set()
+        self._provenance_available: bool = False
         self._db_lock = _threading.Lock()
+        self._expected_scope = expected_scope
+        self._clean_db_path = Path(clean_db_path) if clean_db_path is not None else None
 
     def _ensure_loaded(self) -> None:
         with self._db_lock:
@@ -275,25 +424,58 @@ class SearchIndex:
             import sqlite3
 
             if not self.db_path.exists():
+                if self._expected_scope == "local":
+                    raise FileNotFoundError(
+                        f"Private local database not found: {self.db_path}. "
+                        "Run 'pf2e-codex index --corpus-scope local-full' first"
+                    )
                 # Auto-download pre-built DB from GitHub Releases
-                from .config import DEFAULT_RELEASE
-                from .config import _model_safe_name
+                import os
+                import tempfile
                 import urllib.request as _req
+
+                from .config import DEFAULT_RELEASE, _model_safe_name
                 db_name = f"pf2e_{_model_safe_name(self._manager.model_name)}.db"
                 release = DEFAULT_RELEASE
                 url = f"https://github.com/Kaylebor/pf2e-codex/releases/download/{release}/{db_name}"
                 self.db_path.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Downloading pre-computed DB ({db_name})...", end=" ", flush=True)
+                temporary: Path | None = None
                 try:
-                    _req.urlretrieve(url, self.db_path)
+                    with tempfile.NamedTemporaryFile(
+                        dir=self.db_path.parent,
+                        prefix=f".{self.db_path.name}.download-",
+                        delete=False,
+                    ) as stream:
+                        temporary = Path(stream.name)
+                    _req.urlretrieve(url, temporary)
+                    from .distribution import (
+                        audit_database_slot,
+                        audit_redistributable_database,
+                    )
+
+                    audit_database_slot(temporary, "clean")
+                    audit_redistributable_database(
+                        temporary,
+                        expected_release=release,
+                        expected_model=self._manager.model_name,
+                    )
+                    os.replace(temporary, self.db_path)
+                    temporary = None
                     size_mb = self.db_path.stat().st_size / 1024**2
                     print(f"{size_mb:.0f}MB")
                 except Exception:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
                     raise FileNotFoundError(
                         f"Database not found: {self.db_path}. "
                         f"Auto-download failed.\n"
                         f"Run 'pf2e-codex embed' to build from scratch"
-                    )
+                    ) from None
+            if self._expected_scope is not None:
+                from .distribution import audit_database_slot
+
+                audit_database_slot(self.db_path, self._expected_scope)
             try:
                 self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
                 self._conn_ro = sqlite3.connect(
@@ -319,6 +501,7 @@ class SearchIndex:
                 self._conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uuid)")
                 tombstone_table_available = False
                 try:
+                    migrate_db(self._conn)
                     ensure_ambiguous_ref_targets(self._conn)
                     tombstone_table_available = True
                 except sqlite3.OperationalError as exc:
@@ -329,6 +512,16 @@ class SearchIndex:
                     # indexes persist the durable tombstone table instead.
                     self._ambiguous_tombstones = _current_ambiguous_ref_targets(self._conn_ro)
                 self._conn.commit()
+                chunk_columns = {
+                    column[1] for column in self._conn_ro.execute("PRAGMA table_info(chunks)")
+                }
+                sources_available = self._conn_ro.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sources'"
+                ).fetchone()
+                self._provenance_available = bool(
+                    sources_available
+                    and set(_CHUNK_PROVENANCE_COLUMNS).issubset(chunk_columns)
+                )
                 if tombstone_table_available:
                     self._ambiguous_tombstones = {
                         bare_id for (bare_id,) in self._conn_ro.execute(
@@ -369,6 +562,22 @@ class SearchIndex:
     def _encode(self, text: str) -> list[float]:
         return self._manager.embed_query(text)
 
+    def _supports_provenance(self) -> bool:
+        """Return schema support, including lightweight test/SDK instances."""
+        known = getattr(self, "_provenance_available", None)
+        if known is not None:
+            return bool(known)
+        try:
+            columns = {
+                row[1] for row in self._conn_ro.execute("PRAGMA table_info(chunks)").fetchall()
+            }
+            sources = self._conn_ro.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sources'"
+            ).fetchone()
+            return bool(sources and set(_CHUNK_PROVENANCE_COLUMNS).issubset(columns))
+        except (AttributeError, IndexError, TypeError):
+            return False
+
     def search(
         self, query: str, top_k: int = 5, hybrid: bool = True,
         license: str | None = None, content_type: str | None = None,
@@ -396,8 +605,7 @@ class SearchIndex:
             if remaster:
                 where_clauses.append("chunks.remaster = 1")
             else:
-                # remaster=False or NULL → both count as legacy
-                where_clauses.append("(chunks.remaster = 0 OR chunks.remaster IS NULL)")
+                where_clauses.append("chunks.remaster = 0")
         where = " AND ".join(where_clauses)
 
         # 1. Semantic search (filtered)
@@ -523,10 +731,12 @@ class SearchIndex:
                 results, enriched_explicit_results, top_k=top_k,
             )
 
+        results = _prefer_remaster_overlaps(results)
+
         return results
 
     def _enrich_results(self, results: list[dict]) -> None:
-        """Add refs, legacy_name, and confidence to search results in-place."""
+        """Add references, provenance, and ranking metadata to results in-place."""
         if not results:
             return
 
@@ -540,6 +750,33 @@ class SearchIndex:
         refs_by_source: dict[str, list[dict]] = {}
         for src, name, uuid in refs_rows:
             refs_by_source.setdefault(src, []).append({"name": name, "id": uuid})
+
+        # Provenance is deliberately fetched independently of search ranking:
+        # the same searchable section can originate in Foundry data or in a
+        # local rulebook, and callers need that distinction to cite it.
+        provenance_rows = []
+        if self._supports_provenance():
+            provenance_rows = self._conn_ro.execute(f"""
+                SELECT chunks.id, chunks.origin, chunks.source_id,
+                       chunks.source_page_start, chunks.source_page_end,
+                       chunks.printed_page, chunks.section_hash,
+                       sources.source, sources.product, sources.revision,
+                       sources.parser, sources.license, sources.era,
+                       sources.provenance
+                FROM chunks LEFT JOIN sources ON sources.source_id = chunks.source_id
+                WHERE chunks.id IN ({placeholders})
+            """, ids).fetchall()
+        provenance_by_id = {
+            row[0]: {
+                "origin": row[1], "source_id": row[2],
+                "source_page_start": row[3], "source_page_end": row[4],
+                "printed_page": row[5], "section_hash": row[6],
+                "source": row[7], "product": row[8], "revision": row[9],
+                "parser": row[10], "license": row[11], "era": row[12],
+                "provenance": _decode_json_object(row[13]),
+            }
+            for row in provenance_rows
+        }
 
         # Batch-fetch incoming refs by stable target UUID/internal ID. Names
         # are mutable (and can be duplicated), so they must not determine
@@ -606,6 +843,19 @@ class SearchIndex:
 
         for r in results:
             r["refs"] = refs_by_source.get(r["id"], [])
+            r["provenance"] = provenance_by_id.get(r["id"], {
+                "origin": "foundry", "source_id": None,
+                "source_page_start": None, "source_page_end": None,
+                "printed_page": None, "section_hash": None,
+                "source": "foundry", "product": "FoundryVTT PF2E", "revision": None,
+                "parser": "foundry-json", "license": r.get("license"),
+                "era": (
+                    "remaster" if r.get("remaster") is True
+                    else "legacy" if r.get("remaster") is False
+                    else "unknown"
+                ),
+                "provenance": None,
+            })
             incoming: list[dict] = []
             seen_sources: set[str] = set()
             for alias in target_aliases[r["id"]]:
@@ -662,7 +912,7 @@ class SearchIndex:
             if remaster:
                 where_clauses.append("chunks.remaster = 1")
             else:
-                where_clauses.append("(chunks.remaster = 0 OR chunks.remaster IS NULL)")
+                where_clauses.append("chunks.remaster = 0")
         where = " AND ".join(where_clauses)
 
         # Rewrite query: "flanking" → "pf2e flanking" to help the
@@ -716,9 +966,11 @@ class SearchIndex:
             "SELECT license, COUNT(*) FROM chunks GROUP BY license ORDER BY COUNT(*) DESC"
         ).fetchall()
 
-        # Remaster breakdown (NULL grouped with legacy)
+        # NULL means the source has not established an era; it is not legacy.
         remaster_counts = self._conn_ro.execute(
-            "SELECT CASE WHEN remaster = 1 THEN 'remaster' ELSE 'legacy' END as label, COUNT(*) FROM chunks GROUP BY label ORDER BY COUNT(*) DESC"
+            "SELECT CASE WHEN remaster = 1 THEN 'remaster' "
+            "WHEN remaster = 0 THEN 'legacy' ELSE 'unknown' END as label, "
+            "COUNT(*) FROM chunks GROUP BY label ORDER BY COUNT(*) DESC"
         ).fetchall()
 
         # Pack breakdown (top 20)
@@ -745,40 +997,36 @@ class SearchIndex:
         """Fetch a single chunk by its internal ID, Foundry UUID, slug, or name."""
         self._ensure_loaded()
         normalized = _normalize_id(entry_id)
+        columns = (
+            _FETCH_CHUNK_COLUMNS
+            if self._supports_provenance()
+            else _FETCH_LEGACY_CHUNK_COLUMNS
+        )
 
         # 1. Exact ID match (pack:id or bare Foundry _id)
         for sql, param in [
-            ("SELECT id, name, type, pack, text FROM chunks WHERE id = ?", (normalized,)),
-            ("SELECT id, name, type, pack, text FROM chunks WHERE id LIKE ?", (f"%:{normalized}",)),
+            (columns + " WHERE chunks.id = ?", (normalized,)),
+            (columns + " WHERE chunks.id LIKE ?", (f"%:{normalized}",)),
         ]:
             row = self._conn_ro.execute(sql, param).fetchone()
             if row:
-                return {
-                    "id": row[0], "name": row[1], "type": row[2],
-                    "pack": row[3], "text": row[4],
-                }
+                return _chunk_result(row)
 
         # 2. Slug match (e.g. "fury-instinct")
         row = self._conn_ro.execute(
-            "SELECT id, name, type, pack, text FROM chunks WHERE slug = ?",
+            columns + " WHERE chunks.slug = ?",
             (normalized,),
         ).fetchone()
         if row:
-            return {
-                "id": row[0], "name": row[1], "type": row[2],
-                "pack": row[3], "text": row[4],
-            }
+            return _chunk_result(row)
 
         # 3. Exact name match (case-insensitive)
         row = self._conn_ro.execute(
-            "SELECT id, name, type, pack, text FROM chunks WHERE LOWER(name) = LOWER(?)",
+            columns + " WHERE LOWER(chunks.name) = LOWER(?)",
             (normalized,),
         ).fetchone()
         if row:
-            return {
-                "id": row[0], "name": row[1], "type": row[2],
-                "pack": row[3], "text": row[4],
-            }
+            return _chunk_result(row)
 
         return None
 
@@ -848,6 +1096,31 @@ class SearchIndex:
             meta[row[0]] = row[1]
         meta["actual_chunks"] = self._conn_ro.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         meta["db_path"] = str(self.db_path)
+        if self._expected_scope is not None:
+            meta["database_scope"] = self._expected_scope
+        if (
+            self._expected_scope == "local"
+            and self._clean_db_path is not None
+            and self._clean_db_path.is_file()
+        ):
+            import sqlite3
+
+            clean = sqlite3.connect(
+                f"file:{self._clean_db_path}?mode=ro",
+                uri=True,
+            )
+            try:
+                row = clean.execute(
+                    "SELECT value FROM _meta WHERE key = 'pf2e_release'"
+                ).fetchone()
+            finally:
+                clean.close()
+            clean_release = row[0] if row else None
+            local_release = meta.get("pf2e_release")
+            meta["clean_pf2e_release"] = clean_release
+            meta["release_mismatch"] = bool(
+                clean_release and local_release and clean_release != local_release
+            )
         return meta
 
     def close(self) -> None:

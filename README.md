@@ -2,7 +2,8 @@
 
 PF2E rules knowledge base with MCP, CLI, and SDK interfaces.
 
-- **Data source**: Official FoundryVTT PF2E system JSON releases (`json-assets.zip`)
+- **Primary data source**: Official FoundryVTT PF2E system JSON releases (`json-assets.zip`)
+- **Optional local source**: User-owned rulebook PDFs exported to ignored native-text JSON
 - **Indexing**: Rules-aware chunking + semantic embeddings in sqlite-vec
 - **Interfaces**: MCP server, CLI commands, Python SDK
 
@@ -27,8 +28,13 @@ makepkg -si
 git clone https://github.com/Kaylebor/pf2e-codex.git
 cd pf2e-codex
 uv venv
-uv pip install -e "."
+uv pip install -e ".[cpu]"             # CPU runtime, Foundry-only use
+uv pip install -e ".[cpu,corpus]"      # CPU runtime plus local rulebook PDFs
+make setup-dev                          # AMD development: MIGraphX + corpus
 ```
+
+The Arch package bundles corpus extraction support because its isolated
+launcher cannot use Python packages installed outside the package directory.
 
 ### First run
 
@@ -51,6 +57,8 @@ pf2e-codex/
 │   ├── __init__.py        # SDK exports
 │   ├── config.py          # Settings (Pydantic + TOML file)
 │   ├── fetcher.py         # Download json-assets.zip from GitHub releases
+│   ├── pdf_export.py      # Native PDF words/geometry → versioned local JSON
+│   ├── corpus.py          # PZO discovery, revision choice, and Paizo parsing
 │   ├── chunker.py         # Rules-aware chunk builder
 │   ├── models.py          # Embedding model registry & recommendations
 │   ├── embeddings.py      # Pluggable embedding providers
@@ -83,12 +91,87 @@ Expression simplification: `ternary(gte(@actor.level,13),...)` → "+X at level 
 Journals (GM Screen, Classes, Domains, etc.) split into per-page chunks so core
 rules explanations are retrievable.
 
+### Local Rulebook Corpus
+
+Place user-owned Paizo PDFs or chapter ZIPs recursively under
+`.local-corpus/sources/`. The built-in catalog currently recognizes `PZO2101`
+(legacy Core Rulebook), `PZO12001` (Player Core), `PZO12002` (GM Core), and
+`PZO12003` (Monster Core), and `PZO12004` (Player Core 2).
+Combined `PZO…E.pdf` files take precedence over their split chapter copies.
+Printing metadata, normalized content revisions, modification time, and a
+deterministic filename tie-break select one active revision per product. A
+persisted choice stabilizes equivalent-content copies only; it never pins an
+older materially different errata revision.
+
+The native-text exporter runs automatically when its ignored JSON artifact is
+missing or stale. It preserves word coordinates, fonts, sizes, action glyphs,
+image bounds, and a local source SHA-256; OCR and secondary PDF tools are never
+used. The Paizo parser removes repeated page furniture and watermark-like email
+text, reconstructs reading order, and emits stable page/heading-anchored rule
+sections. A watermark-independent normalized fingerprint identifies actual
+rules content, while the raw hash is used only to detect changes to that local
+file.
+
+For a manual pip/uv installation, install the optional extraction dependency.
+The Arch package already includes it. Then inspect discovery and build or
+refresh the corpus:
+
+```bash
+uv pip install -e ".[corpus]"
+pf2e-codex corpus-status
+pf2e-codex index                              # clean Foundry-only DB
+pf2e-codex index --corpus-scope local-full   # separate private complete DB
+pf2e-codex corpus-sync                       # refreshes only the private DB
+```
+
+`.local-corpus/` is ignored so purchased sources and extracted text are never
+committed. Full rebuilds use a sibling staging database and replace the live DB
+only after chunk, vector, FTS, integrity, and provenance validation. Corpus-only
+mutation also parses and embeds before one transaction, and refuses to run
+while the daemon registration exists. Stop the daemon before either operation.
+The two scopes never share a physical database. For each model, the clean slot
+is `pf2e_<model>.db` and the private complete slot is
+`pf2e_<model>.local.db`. Queries and the MCP daemon prefer the private slot when
+it exists; use `pf2e-codex mcp --db-scope clean` or
+`pf2e-codex validate --db-scope clean` to force the clean slot. Corpus sync can
+only mutate the private slot, while pull, automatic download, and release
+tooling can only activate an audited clean artifact.
+
+Full seeds default to `--corpus-scope redistributable`, which selects the clean
+slot and excludes all purchased PDFs even when `.local-corpus/` exists.
+`pf2e-codex audit-db DB --strict` requires the explicit redistributable seed
+marker, exclusively Foundry-owned rows, and any requested release/model
+provenance. This is a technical fail-closed boundary, not a blanket legal
+conclusion; an uploaded release must still carry the notices required by its
+source licenses and policies.
+
+Foundry and corpus rows have explicit ownership, so Foundry incremental updates
+cannot remove PDF-derived rules. Legacy and Remaster books coexist; default
+ranking prefers Remaster only when candidates have the same normalized name,
+leaving legacy-only material fully searchable. Search and fetch results include
+book and PDF-page provenance.
+
+No per-book manifest is required. Optional ambiguity controls can be placed in
+`pf2e-codex.toml`:
+
+```toml
+corpus_dir = ".local-corpus"
+database_scope = "auto" # prefer local when present; clean/local force one slot
+corpus_include = ["PZO2101", "PZO12001", "PZO12002", "PZO12003", "PZO12004"]
+corpus_exclude = []
+corpus_prefer = { PZO12001 = "preferred-copy/PZO12001E.pdf" }
+```
+
 ## CLI Commands
 
 | Command | Description |
 |---|---|
 | `pf2e-codex fetch` | Download json-assets.zip |
 | `pf2e-codex build` | Build enriched chunks (JSON output) |
+| `pf2e-codex corpus-export PDF JSON` | Export native PDF words/geometry without OCR |
+| `pf2e-codex corpus-status` | Show discovered products and persisted revision choices |
+| `pf2e-codex corpus-sync` | Export, parse, and atomically refresh the private DB |
+| `pf2e-codex audit-db DB --strict` | Reject private/unmarked DBs before publication |
 | `pf2e-codex index` | Full pipeline: fetch → chunk → embed → index |
 | `pf2e-codex search "query"` | Hybrid search (semantic + FTS5) |
 | `pf2e-codex status` | Show index stats |
@@ -97,7 +180,7 @@ rules explanations are retrievable.
 | `pf2e-codex get "fireball"` | Fetch a single entry by slug, name, or UUID |
 | `pf2e-codex related "off-guard" --direction incoming` | Cross-reference graph |
 | `pf2e-codex models` | List embedding models with recommendations |
-| `pf2e-codex validator` | Validate search quality against 25-query suite |
+| `pf2e-codex validate` | Validate search quality against 25-query suite |
 | `pf2e-codex warmup` | Manually precompile models into the current user's cache |
 | `pf2e-codex pull` | Download pre-built embedding DB from GitHub Releases |
 | `pf2e-codex mcp` | Start MCP server (--transport streamable-http for daemon) |
@@ -105,8 +188,9 @@ rules explanations are retrievable.
 ## Daemon (systemd)
 
 For persistent GPU inference, run the MCP server as a systemd user service.
-The daemon loads both models synchronously before accepting requests and
-auto-downloads the embedding DB on first query.
+The daemon loads both models synchronously before accepting requests. If no
+private or clean database exists, it auto-downloads an audited clean database
+on first query.
 
 The Streamable HTTP endpoint uses MCP Python SDK 2 and accepts both modern
 stateless MCP requests and legacy stateful sessions. The built-in CLI proxy
@@ -134,12 +218,19 @@ result would be written to root's cache rather than the daemon user's cache.
 ### First-query auto-download
 
 When the daemon receives its first search and no embedding DB exists,
-it auto-downloads a pre-computed sqlite-vec DB from GitHub Releases.
+it stages a pre-computed sqlite-vec DB from GitHub Releases, verifies its clean
+ownership plus PF2E release and embedding model, then activates it atomically.
+`pf2e-codex pull --release ...` applies the same checks and replaces an existing
+artifact when it is stale. Automatic downloads never create or overwrite the
+private `.local.db` slot.
 To rebuild from scratch instead:
 
 ```bash
 pf2e-codex embed
 ```
+
+Release builds use `.release-dbs/<tag>/` by default, isolated from the live
+query databases. Set `PF2E_RELEASE_DB_DIR` to choose another staging directory.
 
 ## Configuration
 
@@ -186,15 +277,17 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 
 ## ONNX Acceleration (automatic)
 
-The tool proactively tries ONNX Runtime for faster inference. It works out of the box on CPU.
+ONNX Runtime is selected explicitly so CPU and GPU wheels can never overwrite
+one another. Use the `cpu` extra for CPU, or `make setup-dev` for the supported
+AMD development environment.
 
 **For GPU acceleration, install the matching `onnxruntime` variant:**
 
 | GPU | Install | Source |
 |-----|---------|-------|
-| AMD (ROCm) | `pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/` | AMD official repo |
-| NVIDIA (CUDA) | `pip install onnxruntime-gpu` | PyPI (official) |
-| CPU | `pip install onnxruntime` | PyPI (official) |
+| AMD (ROCm) | `make setup-dev` | AMD official MIGraphX repo |
+| NVIDIA (CUDA) | `uv pip install -e ".[cuda]"` | PyPI (official) |
+| CPU | `uv pip install -e ".[cpu]"` | PyPI (official) |
 
 > **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
 
@@ -262,15 +355,16 @@ For a lightweight multilingual setup, use the e5-small embedding (handles cross-
 retrieval natively) without a reranker. For optimal quality, use the 2.2GB reranker
 (compile once, cached). Future work includes quantizing the 2.2GB model to ~1.1GB.
 
-The tool proactively tries ONNX Runtime for faster inference. It works out of the box on CPU.
+ONNX Runtime is selected explicitly; it is intentionally absent from the core
+dependency set so a normal `uv sync` cannot overwrite a GPU runtime with CPU.
 
 **For GPU acceleration, install the matching `onnxruntime` variant:**
 
 | GPU | Install | Source |
 |-----|---------|-------|
-| AMD (ROCm) | `pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/` | AMD official repo |
-| NVIDIA (CUDA) | `pip install onnxruntime-gpu` | PyPI (official) |
-| CPU | `pip install onnxruntime` | PyPI (official) |
+| AMD (ROCm) | `make setup-dev` | AMD official MIGraphX repo |
+| NVIDIA (CUDA) | `uv pip install -e ".[cuda]"` | PyPI (official) |
+| CPU | `uv pip install -e ".[cpu]"` | PyPI (official) |
 
 > **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
 
@@ -380,5 +474,7 @@ pf2e-codex mcp -t streamable-http --host 0.0.0.0 --port 8080
 ## Legal
 
 - Code: MIT (this repo)
-- PF2E game content: ORC / OGL (not redistributed; user fetches from official releases)
+- Purchased-PDF derivatives: local-only and never included in pre-built DB releases
+- Foundry-derived releases: must retain applicable OGL/ORC/Paizo notices; the
+  distribution audit prevents private-corpus leakage but is not legal advice
 - No pre-computed embeddings or PF2E data shipped

@@ -83,6 +83,71 @@ During PKGBUILD install, `post_install` runs as root. `Path.home()` resolves to
 `/root/`, so warmup writes .mxr to `/root/.cache/` which the user's daemon never sees.
 Warmup should be removed from PKGBUILD entirely; it happens on first daemon start.
 
+### Local rulebook PDFs use native text, never OCR
+
+The purchased rulebook PDFs are born-digital and have a reliable selectable
+text layer. `pf2e_codex/pdf_export.py` is the single PDF extraction path and
+uses the optional `pdfplumber` dependency. It streams versioned JSON containing
+native words, font metadata, coordinates, image bounds, and the source hash.
+
+Do not use Docling, Marker, OCR, Markdown conversion, or a `pdftotext`
+subprocess in the product pipeline. Those either degraded correct source text
+or would make exploration differ from the shipped extractor. PDF export and
+corpus parsing are intentionally separate: first generate the raw JSON, then
+design and test Paizo-specific parsing against that exact artifact.
+
+Paizo source recognition belongs to that parser stage. Preserve original PDF
+basenames such as `PZO12001E.pdf` and match a small explicit catalog of known
+`PZO` product codes and split-PDF filename patterns. Do not identify products
+by a fixed SHA-256: purchased PDFs are personalized with an account watermark,
+so hashes differ by customer. The exported source hash is local integrity and
+provenance metadata only. Treat raw PDF text and exporter JSON as potentially
+containing watermark PII: never commit or log extracted watermark values, and
+strip any detected watermark text before indexing.
+
+Persist parsed legacy and Remaster books in full, with source book, rules era,
+license, and page provenance. Link overlapping or renamed rules for retrieval,
+but do not discard one era as a duplicate. Default search may prefer Remaster
+content while retaining legacy-only rules and explicit legacy lookup.
+
+Revision selection compares normalized native-text fingerprints before using
+mtime. Persisted state may stabilize differently packaged or watermarked copies
+only inside the winning equivalent-content group; it must never pin an older
+same-printing errata revision.
+
+### Purchased corpus is private by default
+
+Seed scope defaults to `redistributable`, which excludes every user-owned PDF
+source even when `.local-corpus/` exists. The clean and private scopes use
+different files for every model: `pf2e_<model>.db` and
+`pf2e_<model>.local.db`. `local-full` is an explicit seed opt-in and must write
+`distribution_scope=local-full` into the private DB metadata. Corpus sync can
+only target that private slot. Query processes use `database_scope=auto`, which
+prefers the private DB when present; MCP and validation accept `--db-scope` to
+force one slot.
+
+Pull, automatic download, and release tooling only write the clean slot. They
+must stage downloads as siblings, audit before atomic activation, and reject a
+DB whose ownership metadata does not match its physical slot. Never convert or
+taint a clean DB in place. A default clean seed and a `local-full` seed may share
+source inputs and model caches, but never their SQLite file.
+
+Pre-built upload and pull paths must call the distribution audit. Publication
+requires an explicit `redistributable` marker and every owned row to have
+`origin='foundry'`. Pull may accept legacy Foundry-only DBs that predate the
+marker. These guards prevent known private-PDF leakage but do not replace the
+required OGL, ORC, Community Use, attribution, and trademark notices.
+
+### Daemon registration owns one configured data directory
+
+HTTP/SSE startup writes `server.json` beneath the exact `Settings.data_dir`
+passed to `serve()`. Registration uses exclusive creation, records its PID and
+unique ownership token, refuses a live owner, and replaces only a confirmed
+stale PID. Cleanup removes only the token it created. Do not reconstruct
+settings inside registration helpers or let a second daemon overwrite a live
+marker. Ancillary daemon state, including `flagged_results.jsonl`, must also use
+the served settings directory rather than a freshly resolved global default.
+
 ## What This Is
 
 A standalone tool for Pathfinder 2E rules lookup. It downloads PF2E data from the official FoundryVTT system releases, chunks and enriches it, embeds it, and stores it in a local sqlite-vec database. Then it exposes that database via:
@@ -125,10 +190,12 @@ else
 fi
 ```
 
-Why `--no-deps`? Because `pf2e-codex` has `onnxruntime>=1.20` as a dependency. Without
-`--no-deps`, pip installs CPU onnxruntime as a transitive dep, then the GPU variant
-installs on top of it — but the cp314-suffixed `.so` files from the CPU variant remain
-and Python loads those instead of the GPU ones.
+Why `--no-deps`? The runtime variants all provide the same Python package and
+must never be layered. Core dependencies intentionally omit ONNX Runtime;
+`cpu`, `rocm`, and `cuda` are explicit extras, while `make setup-dev` installs
+AMD's MIGraphX wheel directly from the official ROCm index. Adding plain
+`onnxruntime` back to core makes `uv sync` silently regress an AMD development
+environment to CPU execution.
 
 If the PKGBUILD ever starts failing with "onnxruntime not installed" or
 "MIGraphX not available", check that CPU onnxruntime was NOT pulled in by the
@@ -140,6 +207,9 @@ deps install step.
 pf2e_codex/
 ├── config.py       # Settings: env vars → TOML file → defaults (Pydantic)
 ├── fetcher.py      # Download json-assets.zip from GitHub releases
+├── pdf_export.py   # Native PDF words/geometry → versioned ignored JSON
+├── corpus.py       # PZO discovery/revision selection + Paizo rulebook parsing
+├── distribution.py # DB seed-scope audit for publication and pull boundaries
 ├── chunker.py      # Parse PF2E JSON → enriched text chunks, UUID resolution, OGL→ORC aliases
 ├── models.py       # Embedding model registry + hardware recommendations
 ├── embeddings.py   # ONNX-only provider (automatic export via optimum, inference via onnxruntime)
@@ -197,6 +267,19 @@ Incremental updates group all journal pages by entry before replacing them, proc
 entry deletions even when there are no changed entries, rebuild the external-content FTS5
 index after data mutations, and commit the complete update atomically.
 
+Every chunk has an explicit `origin` and stable `source_id`. Foundry updates
+select and delete only `origin='foundry'`; corpus errata refreshes select and
+delete only `origin='corpus'`, embed changed section hashes before mutation,
+and commit the source refresh atomically. Full rebuilds write a sibling staging
+database, validate chunks/vectors/FTS/integrity/provenance, and use `os.replace`
+only after validation. Corpus mutation and production rebuilds refuse to run
+while `server.json` indicates a daemon may hold the database.
+
+Clean and private complete databases are physically separate. Search prefers
+the private file when it exists, while clean seed/release paths always select
+the clean file explicitly. Corpus-owned rows must never appear in the clean
+slot; opening a canonical slot validates this ownership boundary.
+
 Legacy references store bare Foundry IDs, which can collide across packs. The
 `ambiguous_ref_targets` table remembers those collisions across incremental updates so a
 deleted duplicate's references are never reassigned to the surviving entry. Full rebuilds
@@ -225,7 +308,9 @@ Hybrid retrieval tokenizes natural-language questions, removes common question
 filler, and uses OR across the remaining FTS5 terms. Semantic and lexical RRF
 weights are balanced. A separate name-only pass detects complete entry names in
 the query; those entries are promoted before and after reranking so a question
-that explicitly names Fireball cannot lose the Fireball entry.
+that explicitly names Fireball cannot lose the Fireball entry. Remaster ordering
+is bounded to exact normalized-name overlaps; it never globally demotes
+legacy-only results.
 
 ## Training Data Pipeline
 
@@ -319,6 +404,7 @@ Docs are outdated — see https://github.com/microsoft/onnxruntime/issues/25379.
 ### Git-ignored data files
 ```
 pf2e-codex.toml    # local config
+.local-corpus/      # purchased PDFs and generated native-text JSON
 *.db               # sqlite-vec databases
 chunks*.json       # intermediate chunk files
 ```
@@ -385,6 +471,10 @@ curl -sS -X POST http://127.0.0.1:8080/mcp \
 - **Contents**: All compendium packs as JSON + `lang/en.json`
 - **Size**: ~34MB zip, ~28,837 chunks after processing
 - **License**: Foundry code Apache 2.0; PF2E content ORC/OGL
+- **Optional local corpus**: user-owned PDFs under `.local-corpus/` (never committed)
+- **Extraction**: native text only via `corpus-export` or automatic `corpus-sync`
+- **Parsing**: `corpus.py` recognizes the built-in PZO catalog, strips watermark-like
+  PII and repeated furniture, and emits stable provenance-rich sections
 
 ## Common Modification Patterns
 
@@ -412,14 +502,14 @@ ONNX is auto-detected at runtime. MIGraphX is first priority on AMD.
 For local development (outside PKGBUILD):
 
 ```bash
-# CPU (default, bundled by PKGBUILD when no GPU detected)
-pip install onnxruntime
+# CPU (explicit; never combine with a GPU runtime)
+uv pip install -e ".[cpu]"
 
 # AMD GPU (official AMD repo, ROCm 7.2+)
-pip install onnxruntime-migraphx -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+make setup-dev
 
 # NVIDIA GPU
-pip install onnxruntime-gpu
+uv pip install -e ".[cuda]"
 ```
 
 The PKGBUILD auto-detects your GPU at build time and installs only the relevant variant.
@@ -512,11 +602,16 @@ responsive, query commands report the failure instead of starting local inferenc
 
 | Package | Purpose |
 |---------|---------|
-| `optimum[onnxruntime]` | ONNX model export + runtime inference (bundled in package) |
+| `optimum` / `optimum-onnx` | ONNX model export support |
+| ONNX Runtime hardware extra | Exactly one of CPU, MIGraphX/ROCm, or CUDA |
 | `sqlite-vec` | Vector storage + similarity search |
 | `mcp` | MCP Python SDK 2 server |
 | `pydantic` + `pydantic-settings` | Config + validation |
 | `typer` + `rich` | CLI framework + formatting |
+| `pdfplumber` (`corpus` extra) | Native text, font, and geometry export from local PDFs |
 
-All Python deps are bundled in the PKGBUILD via `pip install --target`.
+All core Python deps are bundled in the PKGBUILD via `pip install --target`.
+The PKGBUILD also bundles the `corpus` extra: its wrapper uses `python -S`, so
+an Arch `python-pdfplumber` package would not be visible. The extra remains
+optional for ordinary pip/uv installs that only query a Foundry-only database.
 The only system dependency is `python`.

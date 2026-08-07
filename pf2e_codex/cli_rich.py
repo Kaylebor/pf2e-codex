@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.text import Text
 from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 console = Console(highlight=False)
 
@@ -23,6 +22,7 @@ def print_search_results(results: list[dict], query: str) -> None:
     table.add_column("Name", style="bold")
     table.add_column("Type", style="green")
     table.add_column("Pack", style="dim")
+    table.add_column("Source", style="dim")
     table.add_column("License", style="yellow")
     table.add_column("Confidence", justify="center")
 
@@ -42,12 +42,26 @@ def print_search_results(results: list[dict], query: str) -> None:
 
         conf = r.get("confidence", "?")
         conf_style = conf_colors.get(conf, "")
+        provenance = r.get("provenance") or {}
+        local_provenance = provenance.get("provenance") or {}
+        source = (
+            local_provenance.get("title")
+            or provenance.get("product")
+            or provenance.get("source")
+            or ""
+        )
+        page_start = provenance.get("source_page_start")
+        page_end = provenance.get("source_page_end")
+        if page_start is not None:
+            pages = str(page_start) if page_end in (None, page_start) else f"{page_start}-{page_end}"
+            source = f"{source}\nPDF p. {pages}".strip()
 
         table.add_row(
             str(i),
             name + ref_str,
             r.get("type", "?"),
             r.get("pack", "?"),
+            source,
             r.get("license", "?"),
             f"[{conf_style}]{conf}[/{conf_style}]" if conf_style else conf,
         )
@@ -56,8 +70,8 @@ def print_search_results(results: list[dict], query: str) -> None:
 
     # Footer with summary
     n = len(results)
-    types = set(r.get("type", "") for r in results)
-    licenses = set(r.get("license", "") for r in results)
+    types = {r.get("type", "") for r in results}
+    licenses = {r.get("license", "") for r in results}
     console.print(f"\n  {n} result{'s' if n != 1 else ''} | types: {', '.join(sorted(types))} | licenses: {', '.join(sorted(licenses))}\n")
 
 
@@ -115,8 +129,6 @@ def print_status(meta: dict) -> None:
 
 def print_validation(result: dict) -> None:
     """Render validation results."""
-    conf_colors = {1: "bold green", 2: "green", 3: "yellow"}
-
     table = Table(
         title=f"Validation: {result['n_queries']} queries",
         box=box.SIMPLE_HEAVY,

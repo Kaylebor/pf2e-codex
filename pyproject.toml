@@ -7,7 +7,6 @@ dependencies = [
     "optimum",
     "optimum-onnx",
     "einops",
-    "onnxruntime>=1.20",
     "sqlite-vec>=0.1",
     "mcp>=2.0,<3",
     "pydantic>=2.0",
@@ -19,7 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-export = []  # ONNX model export — deps are in core (optimum, onnxruntime)
+export = []  # Model-export deps are core; the hardware runtime is selected separately.
+corpus = ["pdfplumber>=0.11,<0.12"]  # Native-text extraction for locally owned PDFs
+cpu = ["onnxruntime>=1.20"]
 rocm = ["onnxruntime-rocm"]  # ROCm 6.x
 cuda = ["onnxruntime-gpu"]
 dev = ["pytest", "ruff", "mypy"]

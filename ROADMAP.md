@@ -4,7 +4,38 @@ Ordered by impact. Check items off as completed.
 
 ## High Impact
 
-- [ ] **Pre-built DB download (`pull`)** — `pf2e-codex pull` downloads a pre-computed `sqlite-vec` DB from GitHub Releases (`pf2e-codex-data` repo) into `$PF2E_DATA_DIR`. Auto-triggered on first search if no local DB exists. Shares the same file path as `index` — they're a single "slot" per model. `pull` replaces; `index` rebuilds; `index --update` incrementally patches (handles additions, changes, and deletions). Tagged per PF2E release + model, checksum-verified. Pattern: llama.cpp / GPT4All. Removes "wait 5 minutes" onboarding.
+- [x] **Supplement Foundry with user-owned rulebook prose**
+  - Native no-OCR exporter plus recursive PZO catalog discovery for combined
+    PDFs, split PDFs, and chapter ZIPs under the ignored `.local-corpus/` tree.
+  - Persisted revision selection, local raw-hash staleness checks, normalized
+    watermark-independent rules fingerprints, and stable page/heading IDs.
+  - Paizo layout parser with column ordering, repeated-furniture/watermark
+    removal, action-glyph preservation, cross-page sections, and book/page
+    provenance. Core Rulebook, Player Core, GM Core, Monster Core, and Player
+    Core 2 are cataloged.
+  - Foundry/corpus ownership boundaries, versioned sources, tri-state era,
+    section-scoped errata refresh, staged full rebuilds, atomic swaps, and
+    daemon mutation refusal. Legacy and Remaster remain side by side; only
+    exact-name overlaps receive a bounded Remaster preference.
+  - Distribution boundary: clean and private complete seeds use separate DB
+    files per model. Queries prefer the private file, while pull, auto-download,
+    and release tooling can only activate audited clean files. Strict release
+    audits reject private rows, stale release/model metadata, or missing
+    provenance markers. Required notices remain a release packaging concern;
+    the database audit does not fabricate a legal-approval marker.
+  - Constraint: the parser consumes exporter JSON; it must not invoke a second
+    PDF extraction tool or silently substitute OCR.
+  - Source identity: preserve original `PZO` PDF basenames and recognize a
+    small explicit catalog of known product-code/split-file patterns. Never use
+    a fixed source hash for product identity because purchased PDFs contain
+    customer-specific watermarks; hashes are local provenance only. Detect and
+    remove watermark text before indexing without logging its value.
+
+- [x] **Pre-built clean DB download (`pull`)** — `pull` and first-query
+  auto-download stage artifacts beside the clean slot, verify ownership,
+  requested PF2E release, and embedding model, then atomically activate them.
+  Existing stale files are replaced; the private `.local.db` slot is never a
+  download target.
 
 - [x] **Hybrid search: semantic + FTS5 via RRF**
   - Done: Weighted RRF (0.85 semantic / 0.15 name-LIKE). Stop-word filtering, bag-of-words name matching.
@@ -54,8 +85,16 @@ Ordered by impact. Check items off as completed.
 
 ## Medium Impact
 
-- [x] **Release pipeline (embed-all)** — `scripts/embed-all.py`: runs `pf2e-codex index -m <model>` for all supported models in parallel (configurable concurrency), with proper Ctrl+C signal handling via Python `subprocess`. Skips existing DBs. Logs per-model to `/tmp`.
-  2. `scripts/push-release.sh` (TODO) — takes generated DBs, creates tagged GitHub Releases on `pf2e-codex-data`.
+- [x] **Release pipeline (embed-all)** — `pf2e-codex embed` builds clean model
+  DBs with bounded concurrency. `scripts/release-dbs.sh` requires an exact PF2E
+  release, propagates any model failure, verifies scope/license/release/model
+  metadata, and uploads only clean-slot files from an isolated `.release-dbs/`
+  staging directory.
+
+- [ ] **Qualify the exact-one-runtime setup on NVIDIA** — exercise the CUDA
+  extra, PKGBUILD detection, model export, cache behavior, bulk indexing, and
+  MCP queries on real NVIDIA hardware. Preserve the same no-overlapping-runtime
+  invariant used by the AMD/MIGraphX path.
 
 - [ ] **Pretty CLI output (Rich tables)** — search results, status, catalog in rich formatting.
 

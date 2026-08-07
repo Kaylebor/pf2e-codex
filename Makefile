@@ -6,16 +6,16 @@ PYTHON := .venv/bin/python3
 
 # ── Developer setup ──
 
-# Full dev environment: sync deps + bundle protobuf 34 + cleanup stale CPU files
+# AMD dev environment: sync deps, install only MIGraphX, and bundle protobuf 34.
 setup-dev: dev-build
-	@echo "==> Bundling protobuf 34 for MIGraphX (via onnxruntime-migraphx)..."
+	@echo "==> Replacing any ONNX Runtime variant with AMD MIGraphX..."
+	@$(UV) pip uninstall onnxruntime onnxruntime-rocm onnxruntime-gpu \
+		onnxruntime-migraphx >/dev/null 2>&1 || true
+	@$(UV) pip install --no-deps 'onnxruntime-migraphx>=1.25' \
+		-f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+	@echo "==> Bundling protobuf 34 for MIGraphX..."
 	@set -e; \
 	CAPI=$$(find .venv -type d -name capi -path '*/onnxruntime/capi' 2>/dev/null | head -1); \
-	if [ -z "$$CAPI" ]; then \
-		echo "No onnxruntime capi dir found. Installing onnxruntime-migraphx..."; \
-		$(UV) pip install onnxruntime-migraphx>=1.25; \
-		CAPI=$$(find .venv -type d -name capi -path '*/onnxruntime/capi' 2>/dev/null | head -1); \
-	fi; \
 	if [ -z "$$CAPI" ]; then \
 		echo "ERROR: Could not find onnxruntime capi dir"; exit 1; \
 	fi; \
@@ -37,15 +37,11 @@ setup-dev: dev-build
 		rm -rf "$$PB_DIR"; \
 		echo "  protobuf 34 bundled -> $$CAPI"; \
 	fi; \
-	echo "==> Cleaning stale CPU onnxruntime files..."; \
-	find "$$CAPI" -name '*.cpython-*-x86_64-linux-gnu.so' -delete 2>/dev/null || true; \
-	find "$$CAPI" -name 'libonnxruntime.so.*' ! -name '*.1.25.0' -delete 2>/dev/null || true; \
-	find ".venv/lib" -path '*/site-packages/onnxruntime-1.25.1.dist-info' -type d -exec rm -rf {} + 2>/dev/null || true; \
-	echo "==> Setup complete. MIGraphX ready."
+	$(PYTHON) -c 'import onnxruntime as ort; providers=ort.get_available_providers(); assert "MIGraphXExecutionProvider" in providers, providers; print("==> MIGraphX ready:", providers)'
 
 # Install dev dependencies
 dev-build:
-	$(UV) sync --group dev
+	$(UV) sync --group dev --extra corpus
 
 # ── Lint / typecheck ──
 

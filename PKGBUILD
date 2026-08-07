@@ -37,11 +37,14 @@ EOF
     # Install pf2e-codex WITHOUT transitive deps (we pick the right onnxruntime variant below).
     /usr/bin/pip3 install --no-cache-dir --no-deps --target "$lib" "$startdir"
 
-    # Install non-onnxruntime deps from pyproject.toml (optimum, einops, sqlite-vec, etc.)
+    # Install non-onnxruntime core deps plus the corpus extra. The Arch package
+    # is self-contained and runs Python with -S, so corpus-export cannot rely on
+    # a separately installed system python-pdfplumber package.
     python3 -c "
 import tomllib, json
 with open('$startdir/pyproject.toml', 'rb') as f:
-    deps = tomllib.load(f)['project']['dependencies']
+    project = tomllib.load(f)['project']
+deps = project['dependencies'] + project['optional-dependencies']['corpus']
 filtered = [d for d in deps if 'onnxruntime' not in d]
 print(json.dumps(filtered))
 " > /tmp/pf2e-non-ort-deps.json

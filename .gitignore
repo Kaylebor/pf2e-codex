@@ -1,5 +1,7 @@
 
 _archive/
+.local-corpus/
+.release-dbs/
 # Archives
 build/
 chunks.json

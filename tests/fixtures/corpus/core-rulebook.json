@@ -1,0 +1,32 @@
+{
+  "source_filename": "PZO2101E.pdf",
+  "pages": [
+    {
+      "number": 12,
+      "printed": "10",
+      "lines": [
+        ["CORE RULEBOOK", 30, 12, "GoodOT", 8],
+        ["LINE OF EFFECT", 30, 70, "GoodOT-Bold", 16],
+        ["Choose an origin point.", 30, 110, "GoodOT", 9],
+        ["Trace an unobstructed path.", 30, 130, "GoodOT", 9],
+        ["A solid barrier blocks the path.", 30, 150, "GoodOT", 9],
+        ["[one-action] Resolve the effect.", 30, 170, "Pathfinder-Icons", 9],
+        ["The right column continues.", 330, 110, "GoodOT", 9],
+        ["Use the same origin point.", 330, 130, "GoodOT", 9],
+        ["Check each target separately.", 330, 150, "GoodOT", 9],
+        ["Keep the ruling consistent.", 330, 170, "GoodOT", 9],
+        ["reader@example.invalid", 40, 742, "GoodOT", 7]
+      ]
+    },
+    {
+      "number": 13,
+      "printed": "11",
+      "lines": [
+        ["CORE RULEBOOK", 30, 12, "GoodOT", 8],
+        ["This section crosses the page.", 30, 100, "GoodOT", 9],
+        ["Its heading remains unchanged.", 30, 120, "GoodOT", 9]
+      ]
+    }
+  ],
+  "expected_names": ["LINE OF EFFECT"]
+}

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import signal
 import socket
 import sqlite3
 import sys
 import time
+import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from mcp.server import MCPServer  # type: ignore[import-untyped]
@@ -20,6 +22,7 @@ from .index import SearchIndex, load_vec_extension
 
 # Server endpoint file — CLI reads this to detect running server
 _SERVER_JSON: Path | None = None
+_SERVER_REGISTRATION_ID: str | None = None
 
 
 def _check_port_free(host: str, port: int) -> bool:
@@ -106,9 +109,39 @@ def _pick_port(host: str, preferred: int) -> int:
     return _find_free_port(host)
 
 
-def _write_server_json(host: str, port: int, transport: str) -> Path:
-    """Write server endpoint to server.json for CLI auto-detection."""
-    settings = get_settings()
+def _pid_is_alive(pid: int) -> bool:
+    """Return whether ``pid`` currently identifies a process we must not replace."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # We cannot inspect another user's process, so it is not safe to replace.
+        return True
+    return True
+
+
+def _existing_registration_pid(path: Path) -> int:
+    """Read a valid existing registration's PID, rejecting malformed files safely."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            f"Refusing to replace unreadable MCP daemon registration: {path}"
+        ) from exc
+    pid = data.get("pid") if isinstance(data, dict) else None
+    if not isinstance(pid, int):
+        raise RuntimeError(
+            f"Refusing to replace MCP daemon registration without a valid PID: {path}"
+        )
+    return pid
+
+
+def _write_server_json(settings: Settings, host: str, port: int, transport: str) -> Path:
+    """Exclusively register this HTTP daemon beside its configured database."""
+    global _SERVER_REGISTRATION_ID
     path = settings.data_dir / "server.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -116,18 +149,60 @@ def _write_server_json(host: str, port: int, transport: str) -> Path:
         "host": host,
         "port": port,
         "transport": transport,
-        "pid": __import__("os").getpid(),
+        "db_path": str(settings.db.expanduser().resolve()),
+        "database_scope": str(
+            getattr(getattr(settings, "resolved_database_scope", None), "value", "unknown")
+        ),
+        "pid": os.getpid(),
+        "registration_id": uuid.uuid4().hex,
     }
-    path.write_text(json.dumps(data, indent=2))
-    return path
+
+    # O_EXCL prevents two concurrent daemons from silently replacing each other.
+    # A previous registration may be replaced only after its PID is confirmed dead.
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            existing_pid = _existing_registration_pid(path)
+            if _pid_is_alive(existing_pid):
+                raise RuntimeError(
+                    f"MCP daemon registration is already live (PID {existing_pid}): {path}"
+                ) from None
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                # Another daemon changed the registration; re-check exclusively.
+                continue
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(data, file, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            _SERVER_REGISTRATION_ID = str(data["registration_id"])
+            return path
+
+    raise RuntimeError(f"Unable to claim MCP daemon registration: {path}")
 
 
 def _cleanup_server_json() -> None:
-    """Remove server.json on shutdown."""
-    global _SERVER_JSON
-    if _SERVER_JSON and _SERVER_JSON.exists():
-        _SERVER_JSON.unlink(missing_ok=True)
+    """Remove only the registration created by this daemon instance."""
+    global _SERVER_JSON, _SERVER_REGISTRATION_ID
+    path = _SERVER_JSON
+    registration_id = _SERVER_REGISTRATION_ID
+    try:
+        if path is not None and registration_id is not None:
+            data = json.loads(path.read_text())
+            if (
+                data.get("pid") == os.getpid()
+                and data.get("registration_id") == registration_id
+            ):
+                path.unlink(missing_ok=True)
+    except (json.JSONDecodeError, OSError):
+        # A concurrent owner or external cleanup changed the file; leave it alone.
+        pass
+    finally:
         _SERVER_JSON = None
+        _SERVER_REGISTRATION_ID = None
 
 
 def _register_cleanup() -> None:
@@ -146,11 +221,10 @@ def _register_cleanup() -> None:
 
 # Recent search history (for result flagging)
 _RECENT: deque[dict] = deque(maxlen=5)
-_FLAGGED_PATH = (get_settings().data_dir if get_settings().data_dir else Path.home() / ".local" / "share" / "pf2e-codex") / "flagged_results.jsonl"
 
 
-def _flagged_path() -> Path:
-    settings = get_settings()
+def _flagged_path(settings: Settings) -> Path:
+    """Keep feedback beside the exact database served by this process."""
     return settings.data_dir / "flagged_results.jsonl"
 
 
@@ -159,7 +233,7 @@ def _store_recent(query: str, results: list[dict], **params: str | int | bool | 
         "query": query,
         "results": results,
         "params": params,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     })
 
 
@@ -177,7 +251,13 @@ def create_mcp_app(settings: Settings | None = None) -> MCPServer:
     )
     manager.start()  # synchronous — server won't accept requests until ready
 
-    search = SearchIndex(settings.db, manager)
+    resolved_scope = getattr(settings, "resolved_database_scope", None)
+    search = SearchIndex(
+        settings.db,
+        manager,
+        expected_scope=(resolved_scope.value if resolved_scope is not None else None),
+        clean_db_path=getattr(settings, "clean_db", None),
+    )
 
     # MCP 2 keeps transport configuration on ``run()`` rather than the server
     # constructor.  The tool closures retain ``search`` for the daemon lifetime.
@@ -261,11 +341,11 @@ def create_mcp_app(settings: Settings | None = None) -> MCPServer:
             "flagged_result": last["results"][idx],
             "result_index": result_index,
             "note": note,
-            "flagged_at": datetime.now(timezone.utc).isoformat(),
+            "flagged_at": datetime.now(UTC).isoformat(),
         }
         del flagged["results"]  # keep only the flagged one, not the full list
 
-        path = _flagged_path()
+        path = _flagged_path(settings)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a") as f:
             f.write(json.dumps(flagged) + "\n")
@@ -483,7 +563,7 @@ def serve(settings: Settings | None = None, host: str = "127.0.0.1", port: int =
     if transport in ("streamable-http", "sse"):
         port = _pick_port(host, port)
         global _SERVER_JSON
-        _SERVER_JSON = _write_server_json(host, port, transport)
+        _SERVER_JSON = _write_server_json(settings, host, port, transport)
         _register_cleanup()
 
     mcp = create_mcp_app(settings)

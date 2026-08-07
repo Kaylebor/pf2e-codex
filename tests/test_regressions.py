@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,6 +110,7 @@ def test_natural_language_fts_terms_use_or_and_drop_question_filler() -> None:
     assert "fireball" in terms
     assert "saving" in terms
     assert "throw" in terms
+    assert "dc" in index_module._search_terms("How do I set a DC?")
     assert "does" not in terms
     assert "the" not in terms
 
@@ -119,6 +121,22 @@ def test_explicit_name_matching_uses_complete_terms() -> None:
     assert index_module._query_contains_name(query, "Fireball")
     assert not index_module._query_contains_name(query, "Fire")
     assert not index_module._query_contains_name(query, "Fireball Rune")
+    assert not index_module._query_contains_name("How do I set a DC?", "Set")
+
+
+def test_remaster_preference_only_swaps_confirmed_exact_name_overlap() -> None:
+    results = [
+        {"id": "legacy", "name": "Dying and Recovery", "remaster": False},
+        {"id": "unrelated", "name": "Recovery Checks", "remaster": False},
+        {"id": "remaster", "name": "Dying and Recovery", "remaster": True},
+        {"id": "legacy-only", "name": "Legacy Only Rule", "remaster": False},
+    ]
+
+    preferred = index_module._prefer_remaster_overlaps(results)
+
+    assert [item["id"] for item in preferred] == [
+        "remaster", "unrelated", "legacy", "legacy-only",
+    ]
 
 
 def test_rrf_keeps_a_top_lexical_only_candidate() -> None:
@@ -295,11 +313,14 @@ def test_cli_get_does_not_start_local_index_when_daemon_is_registered(
 ) -> None:
     from pf2e_codex import cli
 
-    monkeypatch.setattr(cli, "_daemon_registered", lambda: True)
+    monkeypatch.setattr(cli, "_daemon_registered", lambda _settings=None: True)
     monkeypatch.setattr(
         cli, "_local_index", lambda _settings: pytest.fail("local inference started"),
     )
-    monkeypatch.setattr("pf2e_codex.daemon_proxy.proxy_get_entry", lambda _entry_id: None)
+    monkeypatch.setattr(
+        "pf2e_codex.daemon_proxy.proxy_get_entry",
+        lambda _entry_id, *, settings=None: None,
+    )
 
     with pytest.raises(cli.typer.Exit):
         cli.get("missing", data_dir=None, model=None)
@@ -653,3 +674,301 @@ def test_ambiguous_ref_tombstone_survives_duplicate_orphan_transition(
     search._enrich_results([result])
     assert result["incoming_refs"] == []
     search._conn_ro.close()
+
+
+def _source_chunk(chunk_id: str, *, origin: str = "foundry") -> dict:
+    chunk = {
+        "id": chunk_id,
+        "name": "Source chunk",
+        "type": "journal_page",
+        "pack": "journal",
+        "slug": "source-chunk",
+        "level": None,
+        "traits": [],
+        "text": f"text for {chunk_id}",
+        "raw_rules_count": 0,
+        "source_hash": "stable",
+        "license": "ORC",
+        "remaster": None,
+        "refs": [],
+        "origin": origin,
+    }
+    if origin != "foundry":
+        chunk.update({
+            "source_id": "pzo2101e-4th",
+            "source": {
+                "source_id": "pzo2101e-4th",
+                "source": "paizo-pdf",
+                "product": "Pathfinder Core Rulebook",
+                "revision": "4th printing",
+                "parser": "native-pages-v1",
+                "license": "OGL",
+                "era": "legacy",
+                "provenance": {"artifact": "native-pages.json"},
+            },
+            "source_page_start": 42,
+            "source_page_end": 43,
+            "printed_page": "40",
+            "section_hash": "section-hash",
+        })
+    return chunk
+
+
+class _SourceProvider:
+    dim = 2
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 2.0] for _ in texts]
+
+
+def test_full_seed_persists_source_metadata_and_corpus_provenance(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    settings = SimpleNamespace(
+        db=db_path,
+        data_dir=tmp_path,
+        model="test-model",
+        provider="auto",
+        onnx_provider="cpu",
+        release="foundry-release",
+        corpus_scope="local-full",
+    )
+    pipeline.embed_and_index(
+        [_source_chunk("journal:foundry"), _source_chunk("corpus:rulebook", origin="corpus")],
+        settings,
+        rebuild=True,
+        provider=_SourceProvider(),
+    )
+
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT id, origin, source_id, source_page_start, source_page_end, printed_page, section_hash "
+        "FROM chunks ORDER BY id"
+    ).fetchall()
+    source = conn.execute(
+        "SELECT source, product, revision, parser, license, era, provenance "
+        "FROM sources WHERE source_id = 'pzo2101e-4th'"
+    ).fetchone()
+    search = index_module.SearchIndex.__new__(index_module.SearchIndex)
+    search._ensure_loaded = lambda: None
+    search._conn_ro = conn
+    fetched = search.fetch_by_id("corpus:rulebook")
+    conn.close()
+
+    assert rows == [
+        ("corpus:rulebook", "corpus", "pzo2101e-4th", 42, 43, "40", "section-hash"),
+        ("journal:foundry", "foundry", "foundry:foundry-release", None, None, None, None),
+    ]
+    assert source[:6] == (
+        "paizo-pdf", "Pathfinder Core Rulebook", "4th printing", "native-pages-v1", "OGL", "legacy",
+    )
+    assert json.loads(source[6]) == {"artifact": "native-pages.json"}
+    assert fetched["provenance"]["origin"] == "corpus"
+    assert fetched["provenance"]["product"] == "Pathfinder Core Rulebook"
+
+
+def test_rebuild_refuses_registered_daemon_before_provider_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "server.json").write_text("{}")
+    settings = SimpleNamespace(
+        db=tmp_path / "index.db",
+        data_dir=tmp_path,
+        model="test-model",
+        provider="auto",
+        onnx_provider="cpu",
+        release="new",
+    )
+    monkeypatch.setattr(
+        pipeline, "get_provider", lambda *_args, **_kwargs: pytest.fail("provider was created"),
+    )
+
+    with pytest.raises(RuntimeError, match="registered daemon"):
+        pipeline.embed_and_index([_source_chunk("journal:foundry")], settings, rebuild=True)
+
+
+def test_incremental_update_does_not_treat_corpus_rows_as_foundry_orphans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "ownership.db"
+    settings = SimpleNamespace(
+        db=db_path,
+        model="test-model",
+        provider="auto",
+        onnx_provider="cpu",
+        release="new",
+        cache_dir=tmp_path,
+    )
+    index_module.init_db(db_path, 2)
+    conn = sqlite3.connect(str(db_path))
+    index_module.load_vec_extension(conn)
+    pipeline._insert_chunk(conn, _source_chunk("journal:foundry"), [1.0, 2.0], settings)
+    pipeline._insert_chunk(
+        conn, _source_chunk("corpus:rulebook", origin="corpus"), [1.0, 2.0], settings,
+    )
+    conn.execute("INSERT INTO _meta(key, value) VALUES ('pf2e_release', 'old')")
+    conn.commit()
+    conn.close()
+
+    class Provider:
+        dim = 2
+
+        def embed(self, _texts: list[str]) -> list[list[float]]:
+            pytest.fail("unchanged Foundry rows should not be embedded")
+
+    monkeypatch.setattr(pipeline, "UUIDResolver", lambda _entries: object())
+    monkeypatch.setattr(pipeline, "ChunkBuilder", lambda _resolver: object())
+    monkeypatch.setattr(pipeline, "entry_hash", lambda _entry: "stable")
+    import pf2e_codex.fetcher as fetcher
+    monkeypatch.setattr(fetcher, "get_cached_zip", lambda _settings: "zip")
+    monkeypatch.setattr(
+        fetcher, "extract_all_packs", lambda *_args: {"journal": [{"_id": "foundry"}]},
+    )
+
+    pipeline.update_index(settings, _provider=Provider())
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT id FROM chunks ORDER BY id").fetchall() == [
+        ("corpus:rulebook",), ("journal:foundry",),
+    ]
+    conn.close()
+
+
+def test_remaster_false_excludes_unknown_rows() -> None:
+    class SearchConnection:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def execute(self, sql: str, params: object = ()) -> _Cursor:
+            self.calls.append((sql, params))
+            return _Cursor([])
+
+    fake = index_module.SearchIndex.__new__(index_module.SearchIndex)
+    fake._ensure_loaded = lambda: None
+    fake._encode = lambda _query: [0.0]
+    fake._enrich_results = lambda _results: None
+    fake._conn_ro = SearchConnection()
+
+    fake.search("legacy", hybrid=False, rerank=False, remaster=False)
+
+    sql = fake._conn_ro.calls[0][0]
+    assert "chunks.remaster = 0" in sql
+    assert "remaster IS NULL" not in sql
+
+
+def test_failed_staged_rebuild_preserves_live_database(tmp_path: Path) -> None:
+    db_path = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE sentinel (value TEXT)")
+    conn.execute("INSERT INTO sentinel VALUES ('live')")
+    conn.commit()
+    conn.close()
+
+    class FailingProvider:
+        dim = 2
+
+        def embed(self, _texts: list[str]) -> list[list[float]]:
+            raise RuntimeError("embedding failed")
+
+    settings = SimpleNamespace(
+        db=db_path,
+        data_dir=tmp_path,
+        model="test-model",
+        provider="auto",
+        onnx_provider="cpu",
+        release="new",
+    )
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        pipeline.embed_and_index(
+            [_source_chunk("journal:foundry")], settings, rebuild=True, provider=FailingProvider(),
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT value FROM sentinel").fetchone() == ("live",)
+    conn.close()
+    assert not list(tmp_path.glob(".live.db.staging-*"))
+
+
+def test_rejected_auto_download_never_reaches_canonical_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = tmp_path / "private-source.db"
+    conn = sqlite3.connect(private)
+    conn.execute("CREATE TABLE chunks (id TEXT PRIMARY KEY, origin TEXT)")
+    conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO chunks VALUES ('corpus:one', 'corpus')")
+    conn.execute("INSERT INTO _meta VALUES ('distribution_scope', 'local-full')")
+    conn.commit()
+    conn.close()
+
+    destination = tmp_path / "pf2e_test-model.db"
+    downloads: list[Path] = []
+
+    def fake_download(_url: str, target: str | Path):
+        target = Path(target)
+        target.write_bytes(private.read_bytes())
+        downloads.append(target)
+        return str(target), None
+
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_download)
+    manager = SimpleNamespace(model_name="test-model")
+
+    for _ in range(2):
+        search = index_module.SearchIndex(
+            destination,
+            manager,
+            expected_scope="clean",
+        )
+        with pytest.raises(FileNotFoundError, match="Auto-download failed"):
+            search._ensure_loaded()
+        assert not destination.exists()
+        assert not list(tmp_path.glob(".pf2e_test-model.db.download-*"))
+
+    assert len(downloads) == 2
+
+
+@pytest.mark.parametrize(
+    ("release", "model"),
+    [("pf2e-old", "test-model"), ("pf2e-8.4.0", "other-model")],
+)
+def test_auto_download_rejects_wrong_release_or_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release: str,
+    model: str,
+) -> None:
+    source = tmp_path / "source.db"
+    conn = sqlite3.connect(source)
+    conn.execute("CREATE TABLE chunks (id TEXT PRIMARY KEY, origin TEXT)")
+    conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO chunks VALUES ('foundry:one', 'foundry')")
+    conn.executemany(
+        "INSERT INTO _meta VALUES (?, ?)",
+        [
+            ("distribution_scope", "redistributable"),
+            ("pf2e_release", release),
+            ("embedding_model", model),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    destination = tmp_path / "pf2e_test-model.db"
+
+    def fake_download(_url: str, target: str | Path):
+        Path(target).write_bytes(source.read_bytes())
+        return str(target), None
+
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_download)
+    search = index_module.SearchIndex(
+        destination,
+        SimpleNamespace(model_name="test-model"),
+        expected_scope="clean",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Auto-download failed"):
+        search._ensure_loaded()
+    assert not destination.exists()

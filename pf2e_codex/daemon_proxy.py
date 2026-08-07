@@ -8,25 +8,39 @@ MIGraphX compilation overhead on each CLI call).
 from __future__ import annotations
 
 import json
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 
-def _server_json_path() -> Path:
+def _server_json_path(data_dir: Path | None = None) -> Path:
     """Return path to server.json."""
-    from .config import get_settings
-    return get_settings().data_dir / "server.json"
+    if data_dir is None:
+        from .config import get_settings
+
+        data_dir = get_settings().data_dir
+    return Path(data_dir) / "server.json"
 
 
-def _read_endpoint() -> str | None:
+def _read_endpoint(settings: Any | None = None) -> str | None:
     """Read endpoint from server.json if it exists."""
-    path = _server_json_path()
+    data_dir = getattr(settings, "data_dir", None)
+    path = _server_json_path(data_dir)
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text())
+        registered_db = data.get("db_path")
+        expected_db = getattr(settings, "db", None)
+        if expected_db is not None:
+            if not isinstance(registered_db, str):
+                return None
+            if (
+                Path(registered_db).expanduser().resolve()
+                != Path(expected_db).expanduser().resolve()
+            ):
+                return None
         return data.get("endpoint")
     except (json.JSONDecodeError, OSError):
         return None
@@ -150,56 +164,80 @@ def _call_tool(endpoint: str, tool_name: str, arguments: dict[str, Any], timeout
         return None
 
 
-def proxy_search(query: str, top_k: int = 5, hybrid: bool = True, **kwargs: Any) -> dict | None:
+def proxy_search(
+    query: str,
+    top_k: int = 5,
+    hybrid: bool = True,
+    *,
+    settings: Any | None = None,
+    **kwargs: Any,
+) -> dict | None:
     """Try to proxy a search query to the running MCP server."""
-    endpoint = _read_endpoint()
+    endpoint = _read_endpoint(settings)
     if not endpoint or not _check_server(endpoint):
         return None
     args = {"query": query, "top_k": top_k, "hybrid": hybrid, **kwargs}
     return _call_tool(endpoint, "pf2e_search", args)
 
 
-def proxy_get_entry(entry_id: str) -> dict | None:
+def proxy_get_entry(entry_id: str, *, settings: Any | None = None) -> dict | None:
     """Try to proxy a get_entry query to the running MCP server."""
-    endpoint = _read_endpoint()
+    endpoint = _read_endpoint(settings)
     if not endpoint or not _check_server(endpoint):
         return None
     return _call_tool(endpoint, "pf2e_get_entry", {"entry_id": entry_id})
 
 
-def proxy_related(entry_id: str, direction: str = "both", limit: int = 10) -> dict | None:
+def proxy_related(
+    entry_id: str,
+    direction: str = "both",
+    limit: int = 10,
+    *,
+    settings: Any | None = None,
+) -> dict | None:
     """Try to proxy a related query to the running MCP server."""
-    endpoint = _read_endpoint()
+    endpoint = _read_endpoint(settings)
     if not endpoint or not _check_server(endpoint):
         return None
     return _call_tool(endpoint, "pf2e_related", {"entry_id": entry_id, "direction": direction, "limit": limit})
 
 
-def proxy_status() -> dict | None:
+def proxy_status(*, settings: Any | None = None) -> dict | None:
     """Try to proxy a status query to the running MCP server."""
-    endpoint = _read_endpoint()
+    endpoint = _read_endpoint(settings)
     if not endpoint or not _check_server(endpoint):
         return None
     return _call_tool(endpoint, "pf2e_index_status", {})
 
 
-def proxy_catalog() -> dict | None:
+def proxy_catalog(*, settings: Any | None = None) -> dict | None:
     """Try to proxy a catalog query to the running MCP server."""
-    endpoint = _read_endpoint()
+    endpoint = _read_endpoint(settings)
     if not endpoint or not _check_server(endpoint):
         return None
     return _call_tool(endpoint, "pf2e_catalog", {})
 
 
-def proxy_rules_explain(topic: str, top_k: int = 3, license: str | None = None, content_type: str | None = None, remaster: bool | None = None) -> dict | None:
+def proxy_rules_explain(
+    topic: str,
+    top_k: int = 3,
+    license: str | None = None,
+    content_type: str | None = None,
+    remaster: bool | None = None,
+    *,
+    settings: Any | None = None,
+) -> dict | None:
     """Try to proxy a rules_explain query to the running MCP server."""
-    endpoint = _read_endpoint()
+    endpoint = _read_endpoint(settings)
     if not endpoint or not _check_server(endpoint):
         return None
     args = {"topic": topic, "top_k": top_k}
-    if license: args["license"] = license
-    if content_type: args["content_type"] = content_type
-    if remaster is not None: args["remaster"] = remaster
+    if license:
+        args["license"] = license
+    if content_type:
+        args["content_type"] = content_type
+    if remaster is not None:
+        args["remaster"] = remaster
     return _call_tool(endpoint, "pf2e_rules_explain", args)
 
 
