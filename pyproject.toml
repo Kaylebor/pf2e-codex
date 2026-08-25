@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "PF2E rules knowledge base with MCP, CLI, and SDK interfaces"
 requires-python = ">=3.12"
 dependencies = [
+    # Optimum uses Torch to export models; ONNX Runtime performs inference.
+    "torch>=2.10",
     "optimum",
     "optimum-onnx",
     "einops",
@@ -27,6 +29,19 @@ dev = ["pytest", "ruff", "mypy"]
 
 [dependency-groups]
 dev = ["pytest"]
+
+# Optimum needs Torch only while exporting a model to ONNX. Runtime inference
+# is always handled by the hardware-selected ONNX Runtime package, so resolving
+# PyPI's CUDA-flavoured Torch wheel here only adds NVIDIA libraries and breaks
+# AMD development machines. Keep project-managed Torch explicitly CPU-only;
+# separate visual-model experiments use their own hardware-specific environment.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 # onnxruntime NOT in core deps — installed at build time based on GPU detection.
 # Pick one at install time:

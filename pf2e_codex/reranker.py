@@ -140,8 +140,12 @@ class Reranker:
                 raise RuntimeError("No ONNX execution provider available")
             try:
                 return _session([provider])
-            except Exception:
-                return _session(["CPUExecutionProvider"])
+            except Exception as e:
+                raise RuntimeError(
+                    f"ONNX provider '{provider}' failed to initialize for reranking. "
+                    "Refusing silent CPU fallback; set the ONNX provider to 'cpu' "
+                    "explicitly to accept it."
+                ) from e
 
     def _load_tokenizer(self):
         """Load tokenizer from cache or original model.

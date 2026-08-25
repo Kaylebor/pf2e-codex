@@ -115,7 +115,13 @@ class Settings(BaseSettings):
     model: str = Field(default=DEFAULT_MODEL, description="Embedding model name or path")
     provider: str = Field(default="auto", description="Embedding provider: auto, onnx")
     onnx_provider: str = Field(default="auto", description="ONNX provider for batch embedding (pipeline). Prefer GPU for bulk indexing.")
-    query_provider: str = Field(default="cpu", description="ONNX provider for daemon queries (search/rerank). CPU avoids MIGraphX per-shape recompiles.")
+    query_provider: str = Field(
+        default="auto",
+        description=(
+            "ONNX provider for daemon queries (search/rerank). Auto prefers a GPU; "
+            "set cpu explicitly only when CPU fallback is intended."
+        ),
+    )
     release: str = Field(default=DEFAULT_RELEASE, description="PF2E system release version")
     reranker_model: str = Field(default="Kaylebor/pf2e-codex-reranker-quantized", description="Fine-tuned reranker model on HuggingFace. Leave at default for best results (int8 quantized, 0.55GB, multilingual).")
     warmup_threads: int = Field(default=2, description="ONNX intra-op threads during 'pf2e-codex warmup'. Lower = less GPU power draw.")

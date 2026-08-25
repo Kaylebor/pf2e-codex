@@ -39,6 +39,21 @@ No background thread, no gate, no race conditions.
 Models are process-scoped — held by ModelManager, referenced by
 SearchIndex, kept alive for the daemon's lifetime.
 
+### GPU is the primary inference path; never silently fall back
+
+Both indexing and daemon queries default to automatic ONNX provider selection:
+MIGraphX, ROCm, CUDA, then CPU. If Linux DRM reports supported AMD or NVIDIA
+hardware but ONNX Runtime exposes only CPU, startup must fail with an actionable
+error. CPU remains valid only on a machine without supported GPU hardware or
+when the user explicitly selects `cpu`.
+
+Optimum requires Torch for ONNX export, so `uv` must keep Torch pinned to the
+explicit `pytorch-cpu` index in `pyproject.toml`. Do not remove that source or
+let PyPI resolve a CUDA-flavoured Torch wheel: Torch is not the inference
+backend and those libraries break AMD development environments. `make
+setup-dev` auto-detects AMD/NVIDIA and installs exactly one matching ONNX
+Runtime; `PF2E_DEV_ACCELERATOR` is the explicit override.
+
 ### CLI must never fall back to local inference when daemon exists
 If the daemon is registered (server.json exists), the CLI must NEVER create its own
 SearchIndex. Doing so triggers a separate MIGraphX compile that competes with the
@@ -519,7 +534,8 @@ Subsequent loads skip export.
 MIGraphX also compiles the model to GPU kernels on first inference (~10-30s per batch shape).
 After compile, steady-state throughput is 50-500× faster than PyTorch CPU.
 
-**Key provider order:** MIGraphX → ROCm → CUDA → CPU
+**Key provider order:** MIGraphX → ROCm → CUDA → CPU (CPU only when
+no supported GPU is detected or explicitly selected)
 **Per-batch-shape compile:** MIGraphX compiles once per unique batch size. For a running
 MCP server this happens once at startup.
 

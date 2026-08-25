@@ -1,4 +1,5 @@
-.PHONY: test test-chunker test-integration dev-build setup-dev clean lint typecheck build install \
+.PHONY: test test-chunker test-integration dev-build setup-dev setup-dev-amd \
+        setup-dev-nvidia setup-dev-cpu clean lint typecheck build install \
         validate benchmark embed-all train-data mcp
 
 UV := uv
@@ -6,8 +7,37 @@ PYTHON := .venv/bin/python3
 
 # ── Developer setup ──
 
-# AMD dev environment: sync deps, install only MIGraphX, and bundle protobuf 34.
+# Detect accelerator hardware unless PF2E_DEV_ACCELERATOR explicitly selects
+# amd, nvidia, or cpu. CPU is only selected when no supported GPU is detected.
 setup-dev: dev-build
+	@accelerator="$${PF2E_DEV_ACCELERATOR:-auto}"; \
+	if [ "$$accelerator" = auto ]; then \
+		has_nvidia=0; has_amd=0; \
+		for vendor_path in /sys/class/drm/card[0-9]*/device/vendor; do \
+			[ -r "$$vendor_path" ] || continue; \
+			read -r vendor < "$$vendor_path"; \
+			case "$$vendor" in \
+				0x10de) has_nvidia=1 ;; \
+				0x1002) has_amd=1 ;; \
+			esac; \
+		done; \
+		if [ "$$has_nvidia" = 1 ]; then \
+			accelerator=nvidia; \
+		elif [ "$$has_amd" = 1 ]; then \
+			accelerator=amd; \
+		else \
+			accelerator=cpu; \
+		fi; \
+	fi; \
+	case "$$accelerator" in \
+		amd) $(MAKE) --no-print-directory setup-dev-amd ;; \
+		nvidia) $(MAKE) --no-print-directory setup-dev-nvidia ;; \
+		cpu) $(MAKE) --no-print-directory setup-dev-cpu ;; \
+		*) echo "ERROR: PF2E_DEV_ACCELERATOR must be auto, amd, nvidia, or cpu"; exit 2 ;; \
+	esac
+
+# AMD dev environment: install only MIGraphX and bundle protobuf 34.
+setup-dev-amd:
 	@echo "==> Replacing any ONNX Runtime variant with AMD MIGraphX..."
 	@$(UV) pip uninstall onnxruntime onnxruntime-rocm onnxruntime-gpu \
 		onnxruntime-migraphx >/dev/null 2>&1 || true
@@ -39,9 +69,23 @@ setup-dev: dev-build
 	fi; \
 	$(PYTHON) -c 'import onnxruntime as ort; providers=ort.get_available_providers(); assert "MIGraphXExecutionProvider" in providers, providers; print("==> MIGraphX ready:", providers)'
 
+setup-dev-nvidia:
+	@echo "==> Replacing any ONNX Runtime variant with NVIDIA CUDA..."
+	@$(UV) pip uninstall onnxruntime onnxruntime-rocm onnxruntime-gpu \
+		onnxruntime-migraphx >/dev/null 2>&1 || true
+	@$(UV) pip install onnxruntime-gpu
+	@$(PYTHON) -c 'import onnxruntime as ort; providers=ort.get_available_providers(); assert "CUDAExecutionProvider" in providers, providers; print("==> CUDA ready:", providers)'
+
+setup-dev-cpu:
+	@echo "==> No supported GPU detected; installing explicit CPU fallback..."
+	@$(UV) pip uninstall onnxruntime onnxruntime-rocm onnxruntime-gpu \
+		onnxruntime-migraphx >/dev/null 2>&1 || true
+	@$(UV) pip install 'onnxruntime>=1.20'
+	@$(PYTHON) -c 'import onnxruntime as ort; providers=ort.get_available_providers(); assert providers == ["CPUExecutionProvider"], providers; print("==> CPU fallback ready:", providers)'
+
 # Install dev dependencies
 dev-build:
-	$(UV) sync --group dev --extra corpus
+	$(UV) sync --group dev --extra corpus --extra dev --inexact
 
 # ── Lint / typecheck ──
 
@@ -105,7 +149,7 @@ mcp-http:
 help:
 	@echo "pf2e-codex Makefile targets:"
 	@echo ""
-	@echo "  setup-dev        Full dev setup (deps + protobuf 34 bundle + cleanup)"
+	@echo "  setup-dev        Auto-detect AMD/NVIDIA; CPU only when no GPU is usable"
 	@echo "  dev-build        Install dev dependencies"
 	@echo "  lint             Run ruff check + format check"
 	@echo "  typecheck        Run mypy"

@@ -30,7 +30,7 @@ cd pf2e-codex
 uv venv
 uv pip install -e ".[cpu]"             # CPU runtime, Foundry-only use
 uv pip install -e ".[cpu,corpus]"      # CPU runtime plus local rulebook PDFs
-make setup-dev                          # AMD development: MIGraphX + corpus
+make setup-dev                          # GPU-first dev setup + corpus
 ```
 
 The Arch package bundles corpus extraction support because its isolated
@@ -278,16 +278,23 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 ## ONNX Acceleration (automatic)
 
 ONNX Runtime is selected explicitly so CPU and GPU wheels can never overwrite
-one another. Use the `cpu` extra for CPU, or `make setup-dev` for the supported
-AMD development environment.
+one another. `make setup-dev` detects AMD or NVIDIA hardware and installs the
+matching GPU runtime. It selects CPU only when no supported GPU is detected; an
+explicit `PF2E_DEV_ACCELERATOR=cpu` remains available for intentional fallback.
+
+The project locks Torch to its CPU wheel because Optimum uses it only while
+exporting models to ONNX. Embedding and reranker inference are ONNX-only and
+GPU-first. On a machine with AMD or NVIDIA hardware, automatic provider
+selection refuses a CPU-only ONNX installation instead of silently degrading.
 
 **For GPU acceleration, install the matching `onnxruntime` variant:**
 
 | GPU | Install | Source |
 |-----|---------|-------|
-| AMD (ROCm) | `make setup-dev` | AMD official MIGraphX repo |
-| NVIDIA (CUDA) | `uv pip install -e ".[cuda]"` | PyPI (official) |
-| CPU | `uv pip install -e ".[cpu]"` | PyPI (official) |
+| Auto-detect | `make setup-dev` | AMD MIGraphX or NVIDIA CUDA |
+| AMD (ROCm) | `PF2E_DEV_ACCELERATOR=amd make setup-dev` | AMD official MIGraphX repo |
+| NVIDIA (CUDA) | `PF2E_DEV_ACCELERATOR=nvidia make setup-dev` | PyPI (official) |
+| CPU fallback | `PF2E_DEV_ACCELERATOR=cpu make setup-dev` | PyPI (official) |
 
 > **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
 
@@ -308,7 +315,9 @@ To force ONNX (fail if unavailable):
 PF2E_PROVIDER=onnx pf2e-codex index
 ```
 
-**Provider priority:** ROCm → CUDA → CPU. ZLUDA (CUDA-on-AMD emulation) is correctly deprioritized — native ROCm is preferred.
+**Provider priority:** MIGraphX → ROCm → CUDA → CPU. CPU is accepted
+automatically only when no supported GPU is detected. ZLUDA (CUDA-on-AMD
+emulation) is correctly deprioritized — native ROCm is preferred.
 
 ## Multilingual Search
 
@@ -357,14 +366,17 @@ retrieval natively) without a reranker. For optimal quality, use the 2.2GB reran
 
 ONNX Runtime is selected explicitly; it is intentionally absent from the core
 dependency set so a normal `uv sync` cannot overwrite a GPU runtime with CPU.
+Project-managed Torch is pinned to the CPU index because it performs export,
+not inference; ONNX Runtime owns hardware acceleration.
 
 **For GPU acceleration, install the matching `onnxruntime` variant:**
 
 | GPU | Install | Source |
 |-----|---------|-------|
-| AMD (ROCm) | `make setup-dev` | AMD official MIGraphX repo |
-| NVIDIA (CUDA) | `uv pip install -e ".[cuda]"` | PyPI (official) |
-| CPU | `uv pip install -e ".[cpu]"` | PyPI (official) |
+| Auto-detect | `make setup-dev` | AMD MIGraphX or NVIDIA CUDA |
+| AMD (ROCm) | `PF2E_DEV_ACCELERATOR=amd make setup-dev` | AMD official MIGraphX repo |
+| NVIDIA (CUDA) | `PF2E_DEV_ACCELERATOR=nvidia make setup-dev` | PyPI (official) |
+| CPU fallback | `PF2E_DEV_ACCELERATOR=cpu make setup-dev` | PyPI (official) |
 
 > **Note:** On Arch Linux, use `sudo pacman -S python-onnxruntime-opt-rocm` for AMD or `python-onnxruntime-cuda` for NVIDIA.
 

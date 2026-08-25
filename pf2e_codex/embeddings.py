@@ -72,6 +72,11 @@ _ONNX_EXEC_PROVIDERS = [
     "CPUExecutionProvider",
 ]
 
+_SUPPORTED_GPU_PCI_VENDORS = {
+    "0x1002": "AMD",
+    "0x10de": "NVIDIA",
+}
+
 _ONNX_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx"
 _MIGRAPHX_USER_CACHE = Path.home() / ".cache" / "pf2e-codex" / "onnx" / "migraphx_cache"
 
@@ -102,16 +107,58 @@ def _has_onnx() -> bool:
         return False
 
 
+def _detected_supported_gpu_vendors() -> tuple[str, ...]:
+    """Return supported GPU vendors detected through Linux DRM sysfs.
+
+    This deliberately does not shell out to vendor utilities.  The check is a
+    guard against silently using a CPU-only ONNX Runtime package on a machine
+    whose AMD or NVIDIA GPU should be the primary inference path.
+    """
+    if not _sys.platform.startswith("linux"):
+        return ()
+    vendors: set[str] = set()
+    for vendor_path in Path("/sys/class/drm").glob("card[0-9]*/device/vendor"):
+        try:
+            vendor_id = vendor_path.read_text().strip().lower()
+        except OSError:
+            continue
+        vendor = _SUPPORTED_GPU_PCI_VENDORS.get(vendor_id)
+        if vendor:
+            vendors.add(vendor)
+    return tuple(sorted(vendors))
+
+
+def _select_onnx_provider(
+    available: list[str],
+    *,
+    detected_gpu_vendors: tuple[str, ...] = (),
+) -> str | None:
+    """Select the best provider, refusing an accidental CPU-only GPU install."""
+    for preferred in _ONNX_EXEC_PROVIDERS[:-1]:
+        if preferred in available:
+            return preferred
+    if "CPUExecutionProvider" not in available:
+        return None
+    if detected_gpu_vendors:
+        vendors = "/".join(detected_gpu_vendors)
+        raise RuntimeError(
+            f"{vendors} GPU hardware detected, but this ONNX Runtime exposes only "
+            "CPUExecutionProvider. Install the matching GPU runtime or explicitly "
+            "set the ONNX provider to 'cpu' to accept fallback."
+        )
+    return "CPUExecutionProvider"
+
+
 def _detect_onnx_provider() -> str | None:
-    """Return the best candidate from available ONNX execution providers."""
+    """Return the best available provider, with GPU hardware mismatch checks."""
     if not _has_onnx():
         return None
     import onnxruntime as ort
     available = ort.get_available_providers()
-    for preferred in _ONNX_EXEC_PROVIDERS:
-        if preferred in available:
-            return preferred
-    return None
+    return _select_onnx_provider(
+        available,
+        detected_gpu_vendors=_detected_supported_gpu_vendors(),
+    )
 
 
 class ONNXProvider(EmbeddingProvider):
@@ -166,9 +213,11 @@ class ONNXProvider(EmbeddingProvider):
                 raise RuntimeError("No ONNX execution provider available")
             try:
                 self._session = _make_session([provider], _provider_opts(provider))
-            except Exception:
-                print(f"{provider} unavailable, falling back to CPU")
-                self._session = _make_session(["CPUExecutionProvider"])
+            except Exception as e:
+                raise RuntimeError(
+                    f"ONNX provider '{provider}' failed to initialize. Refusing silent "
+                    "CPU fallback; set the ONNX provider to 'cpu' explicitly to accept it."
+                ) from e
 
         self._input_names = {model_input.name for model_input in self._session.get_inputs()}
 
