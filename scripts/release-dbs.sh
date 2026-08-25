@@ -2,13 +2,13 @@
 # Build all embedding databases and upload them as a GitHub Release.
 # Usage: ./scripts/release-dbs.sh [version] [pf2e-release]
 #   version: git tag (e.g. "v0.1.0"), defaults to current date
-#   pf2e-release: exact Foundry PF2E release, defaults to pf2e-8.4.0
+#   pf2e-release: exact Foundry PF2E release, defaults to pf2e-8.4.1
 
 set -euo pipefail
 
 REPO="Kaylebor/pf2e-codex"
 VERSION="${1:-v$(date +%Y.%m.%d)}"
-PF2E_RELEASE="${2:-pf2e-8.4.0}"
+PF2E_RELEASE="${2:-pf2e-8.4.1}"
 RELEASE_DIR="${PF2E_RELEASE_DB_DIR:-$PWD/.release-dbs/$VERSION}"
 PF2E_CODEX_BIN="${PF2E_CODEX_BIN:-pf2e-codex}"
 MODELS=(

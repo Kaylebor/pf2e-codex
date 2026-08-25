@@ -28,6 +28,16 @@ def test_core_dependencies_do_not_force_cpu_onnxruntime():
     assert "onnxruntime>=1.20" in project["optional-dependencies"]["cpu"]
 
 
+def test_sdist_uses_explicit_private_corpus_allowlist():
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    sdist = config["tool"]["hatch"]["build"]["targets"]["sdist"]
+
+    assert {"pf2e_codex", "scripts", "tests"} <= set(sdist["only-include"])
+    assert {"/.local-corpus", "/dist", "/.venv", "/tmpdiag*", "/*.db"} <= set(
+        sdist["exclude"]
+    )
+
+
 def test_amd_dev_setup_installs_only_official_migraphx_runtime():
     makefile = (REPO_ROOT / "Makefile").read_text()
 
@@ -74,10 +84,9 @@ def test_pull_rejects_artifact_for_wrong_release_and_leaves_no_database(
     conn.execute("INSERT INTO chunks VALUES ('foundry:one', 'foundry')")
     conn.executemany(
         "INSERT INTO _meta VALUES (?, ?)",
-        [
-            ("distribution_scope", "redistributable"),
-            ("pf2e_release", "pf2e-old"),
-            ("embedding_model", "test-model"),
+            [
+                ("pf2e_release", "pf2e-old"),
+                ("embedding_model", "test-model"),
         ],
     )
     conn.commit()
@@ -106,6 +115,51 @@ def test_pull_rejects_artifact_for_wrong_release_and_leaves_no_database(
     assert not (tmp_path / "data" / "pf2e_test-model.db").exists()
 
 
+def test_pull_applies_strict_audit_to_marked_clean_artifact(tmp_path: Path, monkeypatch):
+    source = tmp_path / "marked-source.db"
+    conn = sqlite3.connect(source)
+    conn.execute(
+        "CREATE TABLE chunks (id TEXT PRIMARY KEY, origin TEXT, license TEXT, publication_title TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO chunks VALUES ('foundry:one', 'foundry', 'ORC', 'Pathfinder Player Core')"
+    )
+    conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.executemany(
+        "INSERT INTO _meta VALUES (?, ?)",
+        [
+            ("distribution_scope", "redistributable"),
+            ("foundry_scope", "core-publications-v1"),
+            ("pf2e_release", "pf2e-8.4.0"),
+            ("embedding_model", "test-model"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    def fake_download(_url: str, target: str | Path):
+        Path(target).write_bytes(source.read_bytes())
+        return str(target), None
+
+    monkeypatch.setattr(urllib.request, "urlretrieve", fake_download)
+    result = CliRunner().invoke(
+        app,
+        [
+            "pull",
+            "--model",
+            "test-model",
+            "--release",
+            "pf2e-8.4.0",
+            "--data-dir",
+            str(tmp_path / "data"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "reviewed licensed-core content is missing" in result.output
+    assert not (tmp_path / "data" / "pf2e_test-model.db").exists()
+
+
 def test_pull_replaces_stale_existing_artifact_atomically(tmp_path: Path, monkeypatch):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -119,7 +173,6 @@ def test_pull_replaces_stale_existing_artifact_atomically(tmp_path: Path, monkey
         conn.executemany(
             "INSERT INTO _meta VALUES (?, ?)",
             [
-                ("distribution_scope", "redistributable"),
                 ("pf2e_release", release),
                 ("embedding_model", "test-model"),
             ],

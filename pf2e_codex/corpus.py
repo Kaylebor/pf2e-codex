@@ -13,16 +13,35 @@ import json
 import re
 import zipfile
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from statistics import median
+from types import MappingProxyType
 from typing import Any
 
-from .pdf_export import PDF_EXPORT_SCHEMA_VERSION, export_pdf
+from .pdf_export import (
+    _TRUSTED_PDF_ORIGIN,
+    PDF_EXPORT_SCHEMA_VERSION,
+    NativeWordInventory,
+    VerifiedNativeExport,
+    annotate_native_words,
+    export_pdf,
+    native_word_inventory,
+    trusted_payload_digest,
+    verified_native_export_from_pdf,
+)
 
 SELECTION_STATE_FILENAME = ".pf2e-codex-corpus-selection.json"
 CORPUS_SCHEMA_VERSION = 1
+PAIZO_NATIVE_PARSER_V1 = "paizo-native-v1"
+PAIZO_NATIVE_PARSER_V2 = "paizo-native-v2"
+# V3 is deliberately opt-in for staged review runs.  It retains V2's reading
+# order and only rejects a narrowly evidenced class of false headings inside
+# recurring two-cell regions.
+PAIZO_NATIVE_PARSER_V3 = "paizo-native-v3"
+PAIZO_NATIVE_LAYOUT_V1 = "paizo-native-v3+pp-doclayout-v3-v1"
+PAIZO_NATIVE_PARSER_VERSION = PAIZO_NATIVE_PARSER_V1
 
 
 @dataclass(frozen=True)
@@ -181,6 +200,7 @@ class RulebookSection:
     section_hash: str
     provenance: Mapping[str, Any]
     ordinal: int
+    parser_version: str = PAIZO_NATIVE_PARSER_VERSION
 
     def as_chunk(self) -> dict[str, Any]:
         """Return the dict shape consumed by chunk/index integrations."""
@@ -202,7 +222,7 @@ class RulebookSection:
                 "source": "paizo-pdf",
                 "product": self.product_code,
                 "revision": self.provenance.get("content_fingerprint"),
-                "parser": "paizo-native-v1",
+                "parser": self.parser_version,
                 "license": self.license,
                 "era": self.rules_era,
                 "provenance": dict(self.provenance),
@@ -229,6 +249,69 @@ class RulebookSection:
         }
 
 
+@dataclass(frozen=True, repr=False)
+class TrustedSection:
+    """Immutable private section record; its repr never exposes source text."""
+
+    id: str
+    heading: str
+    text: str = field(repr=False)
+    text_hash: str
+    physical_pages: tuple[int, ...]
+    printed_page: str | None
+    stable_section_identity: str
+    layout_flags: tuple[str, ...]
+    coverage_anchors: tuple[str, ...] = field(repr=False)
+    # Public-safe provenance handle: product/component/physical page/ordinal
+    # only. It contains neither title text nor local asset information.
+    source_section_id: str = ""
+
+    def __repr__(self) -> str:
+        return f"TrustedSection(page={self.physical_pages[:1] or (0,)}, anchors={len(self.coverage_anchors)})"
+
+
+@dataclass(frozen=True, repr=False)
+class TrustedParseBundle:
+    """Deep-sealed private handoff from a PDF-verified parse."""
+
+    product_code: str
+    parser_version: str
+    exporter_profile_version: int
+    semantic_fingerprint: str = field(repr=False)
+    artifact_attestation: Mapping[str, object] = field(repr=False)
+    inventory: NativeWordInventory = field(repr=False)
+    sections: tuple[TrustedSection, ...] = field(repr=False)
+    parser_output_digest: str = field(repr=False)
+    sealed_digest: str = field(repr=False)
+    artifact_attestation_digest: str = field(repr=False, default="")
+    layout_binding_digest: str | None = field(repr=False, default=None)
+
+    def __repr__(self) -> str:
+        return (
+            f"TrustedParseBundle(product={self.product_code}, parser={self.parser_version}, "
+            f"sections={len(self.sections)}, anchors={len(self.inventory.anchors)}, "
+            f"ignored={len(self.inventory.ignored_anchors)})"
+        )
+
+    def verify_seal(self) -> None:
+        """Raise if this immutable bundle no longer matches its canonical seal."""
+        parser_digest = _trusted_parser_output_digest(self.sections)
+        if parser_digest != self.parser_output_digest:
+            raise ValueError("trusted parser bundle output digest does not match its sections")
+        expected = _trusted_bundle_seal(
+            product_code=self.product_code, parser_version=self.parser_version,
+            exporter_profile_version=self.exporter_profile_version,
+            semantic_fingerprint=self.semantic_fingerprint,
+            artifact_attestation=self.artifact_attestation,
+            artifact_attestation_digest=self.artifact_attestation_digest,
+            inventory=self.inventory, sections=self.sections,
+            parser_output_digest=self.parser_output_digest,
+            layout_binding_digest=self.layout_binding_digest,
+        )
+        if expected != self.sealed_digest:
+            raise ValueError("trusted parser bundle seal does not match its immutable fields")
+
+
 _SOURCE_RE = re.compile(
     r"(?i)(?<![A-Z0-9])(PZO(?:2101|12001|12002|12003|12004))(?P<ebook>E)?(?P<suffix>[^.]*)$"
 )
@@ -241,6 +324,9 @@ _PAGE_RANGE_RE = re.compile(r"(?i)(?:^|\s)(\d{3})-(\d{3}|cover)(?:\s|$)")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _PAGE_NUMBER_RE = re.compile(r"^[-–—]?\s*\d{1,4}\s*[-–—]?$")
 _WHITESPACE_RE = re.compile(r"\s+")
+_TRUSTED_SOURCE_SECTION_ID_RE = re.compile(
+    r"^pzo\d+:[a-z0-9-]+:p[1-9]\d*:h[0-9a-f]{16}:i\d+$"
+)
 
 
 def _normalize_name(value: str) -> str:
@@ -700,10 +786,103 @@ class _Line:
     x1: float
     size: float
     fonts: tuple[str, ...]
+    layout_kind: str = "body"
+    native_word_anchors: tuple[str, ...] = ()
 
 
-def _lines_for_page(page: Mapping[str, Any]) -> list[_Line]:
-    words = [word for word in page.get("words", []) if isinstance(word, Mapping)]
+@dataclass(frozen=True)
+class _PageXBandModel:
+    """Page-local evidence for reading starts and recurring interior cells."""
+
+    dominant_starts: tuple[float, ...]
+    interior_cell_starts: tuple[float, ...]
+    tolerance: float
+
+    def is_interior_cell_start(self, line: _Line) -> bool:
+        return any(
+            abs(line.x0 - start) <= self.tolerance
+            for start in self.interior_cell_starts
+        )
+
+
+def _row_break_gap(words: Sequence[Mapping[str, Any]]) -> tuple[list[float], float]:
+    """Return local gaps and a type-scaled threshold for one visual row."""
+    if len(words) < 2:
+        return [], 0.0
+    gaps = [
+        float(right.get("x0", 0)) - float(left.get("x1", left.get("x0", 0)))
+        for left, right in zip(words, words[1:], strict=False)
+    ]
+    ordinary = [gap for gap in gaps if gap >= 0]
+    typical_gap = median(ordinary) if ordinary else 0.0
+    sizes = [float(word.get("size", 0)) for word in words]
+    type_size = median([size for size in sizes if size > 0]) if any(sizes) else 9.0
+    return gaps, max(type_size * 1.25, min(typical_gap * 3.0, type_size * 2.0))
+
+
+def _page_split_starts(
+    rows: Sequence[Sequence[Mapping[str, Any]]], width: float
+) -> tuple[float, ...]:
+    """Infer recurring region starts before splitting a page's word rows.
+
+    An individual broad gap can be justified body text.  A column/table start
+    recurs across independent baselines; use that page-level evidence before
+    treating local spacing as a structural split.
+    """
+    candidates: list[tuple[float, float]] = []
+    for row in rows:
+        gaps, break_gap = _row_break_gap(row)
+        structural = [gap for gap in gaps if gap > break_gap]
+        if not structural:
+            continue
+        largest = max(structural)
+        for word, gap in zip(row[1:], gaps, strict=False):
+            x0 = float(word.get("x0", 0))
+            # A real gutter is the dominant discontinuity in its visual row.
+            # Retain near-ties for multi-cell tables, but ignore incidental
+            # wide word spacing elsewhere in a paragraph.
+            if gap >= largest * 0.7 and x0 >= width * 0.15:
+                candidates.append((x0, float(word.get("top", 0))))
+    if not candidates:
+        return ()
+    tolerance = max(width * 0.05, 18.0)
+    clusters: list[list[tuple[float, float]]] = []
+    for candidate in sorted(candidates):
+        if not clusters or candidate[0] - clusters[-1][-1][0] > tolerance:
+            clusters.append([candidate])
+        else:
+            clusters[-1].append(candidate)
+    return tuple(
+        median([x0 for x0, _top in cluster])
+        for cluster in clusters
+        if len({round(top, 1) for _x0, top in cluster}) >= 2
+    )
+
+
+def _split_word_row(
+    words: Sequence[Mapping[str, Any]], split_starts: Sequence[float], width: float
+) -> list[list[Mapping[str, Any]]]:
+    """Split a row only at native region starts proven elsewhere on the page."""
+    if len(words) < 2 or not split_starts:
+        return [list(words)]
+    gaps, break_gap = _row_break_gap(words)
+    tolerance = max(width * 0.05, 18.0)
+    groups: list[list[Mapping[str, Any]]] = [[words[0]]]
+    for word, gap in zip(words[1:], gaps, strict=False):
+        x0 = float(word.get("x0", 0))
+        if gap > break_gap and any(abs(x0 - start) <= tolerance for start in split_starts):
+            groups.append([word])
+        else:
+            groups[-1].append(word)
+    return groups
+
+
+def _lines_for_page_v1(page: Mapping[str, Any]) -> list[_Line]:
+    """Frozen v1 reconstruction path retained for the active corpus."""
+    words = [
+        word for word in page.get("words", [])
+        if isinstance(word, Mapping) and not word.get("_native_excluded")
+    ]
     words.sort(key=lambda word: (float(word.get("top", 0)), float(word.get("x0", 0))))
     groups: list[list[Mapping[str, Any]]] = []
     for word in words:
@@ -715,39 +894,374 @@ def _lines_for_page(page: Mapping[str, Any]) -> list[_Line]:
     lines: list[_Line] = []
     for group in groups:
         group.sort(key=lambda word: float(word.get("x0", 0)))
-        # At the same y-coordinate, two newspaper-style columns appear as one
-        # flat word row.  A large horizontal gap is geometric evidence that it
-        # is actually two lines and must not be interleaved.
         subgroups: list[list[Mapping[str, Any]]] = []
         for word in group:
             if not subgroups:
                 subgroups.append([word])
                 continue
             previous = subgroups[-1][-1]
-            gap = float(word.get("x0", 0)) - float(previous.get("x1", previous.get("x0", 0)))
+            gap = float(word.get("x0", 0)) - float(
+                previous.get("x1", previous.get("x0", 0))
+            )
             if gap > 48:
                 subgroups.append([word])
             else:
                 subgroups[-1].append(word)
-        for subgroup in subgroups:
-            text = _clean_text(" ".join(str(word.get("text", "")) for word in subgroup))
-            if not text:
-                continue
-            lines.append(
-                _Line(
-                    text=text,
-                    top=min(float(word.get("top", 0)) for word in subgroup),
-                    bottom=max(float(word.get("bottom", word.get("top", 0))) for word in subgroup),
-                    x0=min(float(word.get("x0", 0)) for word in subgroup),
-                    x1=max(float(word.get("x1", word.get("x0", 0))) for word in subgroup),
-                    size=max(float(word.get("size", 0)) for word in subgroup),
-                    fonts=tuple(str(word.get("font") or "") for word in subgroup),
-                )
-            )
+        lines.extend(_lines_from_subgroups(subgroups))
     return lines
 
 
-def _reading_order(page: Mapping[str, Any], lines: list[_Line]) -> list[_Line]:
+def _lines_from_subgroups(
+    subgroups: Sequence[Sequence[Mapping[str, Any]]],
+) -> list[_Line]:
+    lines: list[_Line] = []
+    for subgroup in subgroups:
+        text = _clean_text(" ".join(str(word.get("text", "")) for word in subgroup))
+        if not text:
+            continue
+        lines.append(
+            _Line(
+                text=text,
+                top=min(float(word.get("top", 0)) for word in subgroup),
+                bottom=max(float(word.get("bottom", word.get("top", 0))) for word in subgroup),
+                x0=min(float(word.get("x0", 0)) for word in subgroup),
+                x1=max(float(word.get("x1", word.get("x0", 0))) for word in subgroup),
+                size=max(float(word.get("size", 0)) for word in subgroup),
+                fonts=tuple(str(word.get("font") or "") for word in subgroup),
+                native_word_anchors=tuple(
+                    str(word["_native_anchor"])
+                    for word in subgroup
+                    if isinstance(word.get("_native_anchor"), str)
+                ),
+            )
+        )
+    return lines
+
+
+def _lines_for_page_v2(page: Mapping[str, Any]) -> list[_Line]:
+    words = [
+        word for word in page.get("words", [])
+        if isinstance(word, Mapping) and not word.get("_native_excluded")
+    ]
+    words.sort(key=lambda word: (float(word.get("top", 0)), float(word.get("x0", 0))))
+    groups: list[list[Mapping[str, Any]]] = []
+    for word in words:
+        top = float(word.get("top", 0))
+        if not groups or abs(top - float(groups[-1][0].get("top", 0))) > 2.2:
+            groups.append([word])
+        else:
+            groups[-1].append(word)
+    width = float(page.get("width", 0) or 0)
+    split_starts = _page_split_starts(groups, width) if width else ()
+    lines: list[_Line] = []
+    for group in groups:
+        group.sort(key=lambda word: float(word.get("x0", 0)))
+        # At the same y-coordinate, two newspaper-style columns appear as one
+        # flat word row.  Use local geometry instead of a fixed page gutter:
+        # native exports contain both 20--30pt and 50--60pt gutters.
+        subgroups = _split_word_row(group, split_starts, width)
+        lines.extend(_lines_from_subgroups(subgroups))
+    return lines
+
+
+def _rows_for_lines(lines: Sequence[_Line]) -> list[list[_Line]]:
+    """Group already reconstructed lines that share one visual baseline."""
+    rows: list[list[_Line]] = []
+    for line in sorted(lines, key=lambda value: (value.top, value.x0)):
+        if not rows or abs(line.top - rows[-1][0].top) > 2.2:
+            rows.append([line])
+        else:
+            rows[-1].append(line)
+    return rows
+
+
+def _page_x_band_model(lines: Sequence[_Line], width: float) -> _PageXBandModel:
+    """Separate repeated reading starts from recurring two-cell interiors.
+
+    This is intentionally independent of the V2 reading-order bands.  Those
+    bands use a generous indentation tolerance, which is right for reading
+    order but too broad to tell a cell label from its containing column.  V3
+    needs the narrower model only to reject a false heading when *both* its
+    start and same-baseline cell relationship recur on this page.
+    """
+    sizes = [line.size for line in lines if line.size > 0]
+    tolerance = max(6.0, min(width * 0.025, (median(sizes) if sizes else 9.0) * 1.25))
+    if not lines or not width:
+        return _PageXBandModel((), (), tolerance)
+
+    bands: list[list[_Line]] = []
+    for line in sorted(lines, key=lambda value: value.x0):
+        if not bands or line.x0 - bands[-1][-1].x0 > tolerance:
+            bands.append([line])
+        else:
+            bands[-1].append(line)
+    repeated = [
+        band
+        for band in bands
+        if len({round(line.top, 1) for line in band}) >= 2
+    ]
+    if not repeated:
+        return _PageXBandModel((), (), tolerance)
+    # A page can have one or two ordinary reading columns.  The outermost
+    # repeated start on each page half is the reading start; a compact table's
+    # denser interior labels must not displace it by sheer row count.
+    dominant: list[float] = []
+    for lower, upper in ((float("-inf"), width / 2), (width / 2, float("inf"))):
+        candidates = [
+            band for band in repeated
+            if lower <= median([line.x0 for line in band]) < upper
+        ]
+        if candidates:
+            chosen = min(
+                candidates,
+                key=lambda band: median([line.x0 for line in band]),
+            )
+            dominant.append(median([line.x0 for line in chosen]))
+    dominant = sorted(set(dominant))
+    if not dominant:
+        return _PageXBandModel((), (), tolerance)
+
+    def is_dominant(line: _Line) -> bool:
+        return any(abs(line.x0 - start) <= tolerance for start in dominant)
+
+    interior: list[float] = []
+    for band in repeated:
+        start = median([line.x0 for line in band])
+        if any(abs(start - primary) <= tolerance for primary in dominant):
+            continue
+        # An indented list can recur, but it normally occupies its own
+        # baseline.  A cell start is only actionable when it repeatedly shares
+        # a baseline with a dominant reading start.
+        shared_baselines = sum(
+            1
+            for row in _rows_for_lines(lines)
+            if any(item in band for item in row)
+            and any(
+                is_dominant(item)
+                and (item.x0 < width / 2) == (start < width / 2)
+                for item in row
+            )
+        )
+        if shared_baselines >= 2:
+            interior.append(start)
+    return _PageXBandModel(tuple(dominant), tuple(sorted(interior)), tolerance)
+
+
+def _stable_x_bands(lines: Sequence[_Line], width: float) -> list[list[_Line]]:
+    """Return persistent left-edge bands, ignoring one-off indents.
+
+    Column starts are much more stable than the right edge of ragged text.  A
+    band needs repeated baselines before it is treated as a page region; this
+    keeps table cells and isolated callouts from manufacturing a column.
+    """
+    if not lines:
+        return []
+    font_sizes = [line.size for line in lines if line.size > 0]
+    # Treat ordinary indentation as one reading band; real Paizo columns are
+    # substantially farther apart than a body/list indent.
+    tolerance = max(width * 0.10, (median(font_sizes) if font_sizes else 9.0) * 2.5)
+    bands: list[list[_Line]] = []
+    for line in sorted(lines, key=lambda value: value.x0):
+        if not bands or line.x0 - bands[-1][-1].x0 > tolerance:
+            bands.append([line])
+        else:
+            bands[-1].append(line)
+    return [
+        band
+        for band in bands
+        if len(band) >= 2 and len({round(line.top, 1) for line in band}) >= 2
+    ]
+
+
+def _dominant_x_bands(
+    lines: Sequence[_Line], width: float, *, minimum_count: int
+) -> list[list[_Line]]:
+    """Discard sparse callout/sidebar starts before choosing reading bands."""
+    bands = _stable_x_bands(lines, width)
+    if not bands:
+        return []
+    threshold = max(minimum_count, max(len(band) for band in bands) * 0.25)
+    return [band for band in bands if len(band) >= threshold]
+
+
+def _table_block(row: Sequence[_Line], *, layout_kind: str) -> _Line:
+    """Flatten one bounded table row in its observed left-to-right order."""
+    ordered = sorted(row, key=lambda line: line.x0)
+    return _Line(
+        text=_clean_text(" ".join(line.text for line in ordered)),
+        top=min(line.top for line in ordered),
+        bottom=max(line.bottom for line in ordered),
+        x0=min(line.x0 for line in ordered),
+        x1=max(line.x1 for line in ordered),
+        size=max(line.size for line in ordered),
+        fonts=tuple(font for line in ordered for font in line.fonts),
+        layout_kind=layout_kind,
+        native_word_anchors=tuple(anchor for line in ordered for anchor in line.native_word_anchors),
+    )
+
+
+def _persistent_region_bands(
+    lines: Sequence[_Line], width: float, height: float
+) -> list[list[_Line]]:
+    """Return region bands that persist enough of a page to be reading columns."""
+    minimum_span = max(height * 0.18, width * 0.12)
+    minimum_count = 3 if len(lines) < 30 else 8
+    return [
+        band
+        for band in _dominant_x_bands(lines, width, minimum_count=minimum_count)
+        if len({round(line.top, 1) for line in band}) >= 3
+        and max(line.bottom for line in band) - min(line.top for line in band) >= minimum_span
+    ]
+
+
+def _row_grid_signature(row: Sequence[_Line], tolerance: float) -> tuple[int, ...]:
+    """Normalize cell starts so aligned table rows compare without source text."""
+    return tuple(round(line.x0 / tolerance) for line in sorted(row, key=lambda line: line.x0))
+
+
+def _is_table_grid(
+    rows: Sequence[Sequence[_Line]], width: float, height: float
+) -> bool:
+    """Recognize a bounded, aligned multi-row table using geometry only."""
+    if len(rows) < 2 or any(len(row) < 3 for row in rows):
+        return False
+    font_sizes = [line.size for row in rows for line in row if line.size > 0]
+    tolerance = max(width * 0.035, (median(font_sizes) if font_sizes else 9.0) * 2.0)
+    signatures = [_row_grid_signature(row, tolerance) for row in rows]
+    cell_counts = {len(signature) for signature in signatures}
+    if len(cell_counts) != 1:
+        return False
+    if any(signature != signatures[0] for signature in signatures[1:]):
+        return False
+    cell_tokens = [len(line.text.split()) for row in rows for line in row]
+    if median(cell_tokens) > 12:
+        return False
+    if font_sizes and max(font_sizes) - min(font_sizes) > 3.0:
+        return False
+    ordered_rows = sorted(rows, key=lambda row: row[0].top)
+    row_gaps = [
+        following[0].top - max(line.bottom for line in preceding)
+        for preceding, following in zip(ordered_rows, ordered_rows[1:], strict=False)
+    ]
+    row_size = median(font_sizes) if font_sizes else 9.0
+    if any(gap < 0 or gap > max(row_size * 3.5, height * 0.08) for gap in row_gaps):
+        return False
+    vertical_span = max(line.bottom for row in rows for line in row) - min(
+        line.top for row in rows for line in row
+    )
+    # A page-spanning matrix may be reading columns, not a table.  A bounded
+    # aligned grid is safe to retain as one table block for later review.
+    return vertical_span <= height * 0.65
+
+
+def _table_row_groups(rows: Sequence[Sequence[_Line]], height: float) -> list[list[list[_Line]]]:
+    """Group nearby multi-cell rows into bounded candidate table blocks."""
+    groups: list[list[list[_Line]]] = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        if not groups:
+            groups.append([row])
+            continue
+        previous = groups[-1][-1]
+        gap = row[0].top - max(line.bottom for line in previous)
+        if 0 <= gap <= height * 0.08:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    return groups
+
+
+def _collapse_table_rows(
+    page: Mapping[str, Any], lines: Sequence[_Line]
+) -> tuple[list[_Line], list[_Line], bool]:
+    """Keep bounded 3+ cell rows as blocks, rejecting only persistent columns."""
+    width = float(page.get("width", 0) or 0)
+    height = float(page.get("height", 0) or 0)
+    rows = _rows_for_lines(lines)
+    for row in rows:
+        ordered = sorted(row, key=lambda line: line.x0)
+        if any(
+            following.x0 < preceding.x1 - max(preceding.size, following.size) * 0.25
+            for preceding, following in zip(ordered, ordered[1:], strict=False)
+        ):
+            raise ValueError("unsupported Paizo page layout: overlapping regions")
+    table_groups = _table_row_groups(rows, height)
+    table_row_ids: set[int] = set()
+    table_kinds: dict[int, str] = {}
+    unbounded_complex = False
+    for group in table_groups:
+        kind = "table-grid" if _is_table_grid(group, width, height) else "table-ambiguous"
+        vertical_span = max(line.bottom for row in group for line in row) - min(
+            line.top for row in group for line in row
+        )
+        if kind == "table-ambiguous" and vertical_span > height * 0.65:
+            unbounded_complex = True
+        # An unaligned but bounded multi-cell block is retained for section
+        # review.  It is not evidence that the entire page has three reading
+        # columns, and aborting the book would lose unrelated rules.
+        for row in group:
+            table_row_ids.add(id(row))
+            table_kinds[id(row)] = kind
+    non_table_lines = [
+        line
+        for row in rows
+        if id(row) not in table_row_ids
+        for line in row
+    ]
+    complex_regions = unbounded_complex or bool(
+        width and len(_persistent_region_bands(non_table_lines, width, height)) >= 3
+    )
+    ordinary: list[_Line] = []
+    tables: list[_Line] = []
+    for row in rows:
+        if len(row) >= 3:
+            tables.append(_table_block(row, layout_kind=table_kinds[id(row)]))
+        else:
+            ordinary.extend(row)
+    layout_lines = ordinary + tables
+    if complex_regions:
+        # Preserve a representable but non-two-column page in visual row order
+        # and expose that uncertainty to the later section-review gate.  It is
+        # safer than aborting every unrelated section in the source book.
+        layout_lines = [
+            replace(line, layout_kind="complex-layout")
+            if line.layout_kind == "body"
+            else line
+            for line in layout_lines
+        ]
+    return layout_lines, ordinary, complex_regions
+
+
+def _spanning_blocks(
+    lines: Sequence[_Line], bands: Sequence[Sequence[_Line]], width: float
+) -> set[_Line]:
+    """Identify blocks crossing both proven columns, including ragged tails."""
+    starts = [median([line.x0 for line in band]) for band in bands]
+    tolerance = max(width * 0.05, 12.0)
+
+    def crosses_columns(line: _Line) -> bool:
+        return line.x0 <= starts[0] + tolerance and line.x1 >= starts[1] - tolerance
+
+    ordered = sorted(lines, key=lambda line: (line.top, line.x0))
+    initial_spanning = {line for line in ordered if crosses_columns(line)}
+    spanning = set(initial_spanning)
+    for index, line in enumerate(ordered[:-1]):
+        if line not in initial_spanning:
+            continue
+        candidate = ordered[index + 1]
+        vertical_gap = candidate.top - line.bottom
+        if (
+            0 <= vertical_gap <= max(line.size, candidate.size) * 2.5
+            and abs(candidate.x0 - line.x0) <= tolerance
+            and candidate.x1 < starts[1] - tolerance
+        ):
+            spanning.add(candidate)
+    return spanning
+
+
+def _reading_order_v1(page: Mapping[str, Any], lines: list[_Line]) -> list[_Line]:
+    """Frozen v1 page order retained for normal/local-full parsing."""
     if not lines:
         return []
     width = float(page.get("width", 0) or 0)
@@ -758,29 +1272,65 @@ def _reading_order(page: Mapping[str, Any], lines: list[_Line]) -> list[_Line]:
     body = [line for line in lines if line not in full]
     left = [line for line in body if (line.x0 + line.x1) / 2 < split]
     right = [line for line in body if (line.x0 + line.x1) / 2 >= split]
-    has_columns = bool(left and right)
-    if not has_columns or len(body) < 6:
+    if not left or not right or len(body) < 6:
         return sorted(lines, key=lambda line: (line.top, line.x0))
-    # Full-width headings are emitted at their vertical position; column body
-    # is read down the left column and then down the right column.
     if full:
         first_body = min(line.top for line in body)
         before = sorted((line for line in full if line.top <= first_body), key=lambda line: line.top)
         after = sorted((line for line in full if line.top > first_body), key=lambda line: line.top)
-        ordered = before
-        ordered.extend(sorted(left, key=lambda line: line.top))
-        ordered.extend(sorted(right, key=lambda line: line.top))
-        ordered.extend(after)
-    else:
-        ordered = sorted(left, key=lambda line: line.top) + sorted(right, key=lambda line: line.top)
+        return before + sorted(left, key=lambda line: line.top) + sorted(right, key=lambda line: line.top) + after
+    return sorted(left, key=lambda line: line.top) + sorted(right, key=lambda line: line.top)
+
+
+def _reading_order_v2(page: Mapping[str, Any], lines: list[_Line]) -> list[_Line]:
+    if not lines:
+        return []
+    width = float(page.get("width", 0) or 0)
+    if not width:
+        return sorted(lines, key=lambda line: (line.top, line.x0))
+    layout_lines, ordinary_lines, force_visual_order = _collapse_table_rows(page, lines)
+    if force_visual_order:
+        return sorted(layout_lines, key=lambda line: (line.top, line.x0))
+    bands = _dominant_x_bands(ordinary_lines, width, minimum_count=2)
+    if len(bands) != 2 or len(ordinary_lines) < 4:
+        return sorted(layout_lines, key=lambda line: (line.top, line.x0))
+    # The midpoint between the repeated left-edge bands is the gutter.  It is
+    # inferred from native geometry and works for both narrow and wide gutters.
+    band_starts = [median([line.x0 for line in band]) for band in bands]
+    gutter = (band_starts[0] + band_starts[1]) / 2
+    full = _spanning_blocks(layout_lines, bands, width)
+
+    def order_column_band(items: Sequence[_Line]) -> list[_Line]:
+        left = [line for line in items if (line.x0 + line.x1) / 2 < gutter]
+        right = [line for line in items if line not in left]
+        return sorted(left, key=lambda line: (line.top, line.x0)) + sorted(
+            right, key=lambda line: (line.top, line.x0)
+        )
+
+    # A spanning block is a vertical boundary: read the column band above it,
+    # emit the block at its observed position, then begin a new band below it.
+    # The old parser appended every full-width block after both columns.
+    ordered: list[_Line] = []
+    pending: list[_Line] = []
+    for line in sorted(layout_lines, key=lambda value: (value.top, value.x0)):
+        if line in full:
+            ordered.extend(order_column_band(pending))
+            pending = []
+            ordered.append(line)
+        else:
+            pending.append(line)
+    ordered.extend(order_column_band(pending))
     return ordered
 
 
-def _repeated_furniture(pages: Sequence[Mapping[str, Any]]) -> set[str]:
+def _repeated_furniture(
+    pages: Sequence[Mapping[str, Any]],
+    line_builder: Callable[[Mapping[str, Any]], list[_Line]],
+) -> set[str]:
     candidates: list[str] = []
     for page in pages:
         height = float(page.get("height", 0) or 0)
-        for line in _lines_for_page(page):
+        for line in line_builder(page):
             if height and (line.top < height * 0.12 or line.bottom > height * 0.88):
                 normalized = _normalize_name(re.sub(r"\b\d+\b", "", line.text))
                 if normalized and not _PAGE_NUMBER_RE.match(line.text):
@@ -788,7 +1338,7 @@ def _repeated_furniture(pages: Sequence[Mapping[str, Any]]) -> set[str]:
     return {value for value, count in Counter(candidates).items() if count >= 2}
 
 
-def _is_heading(line: _Line, body_size: float) -> bool:
+def _is_heading_v1(line: _Line, body_size: float) -> bool:
     text = line.text
     if len(text) > 160 or _EMAIL_RE.search(text):
         return False
@@ -817,9 +1367,115 @@ def _is_heading(line: _Line, body_size: float) -> bool:
     )
 
 
+def _is_heading_v2(line: _Line, body_size: float) -> bool:
+    text = line.text
+    if len(text) > 160 or _EMAIL_RE.search(text):
+        return False
+    if sum(char.isalnum() for char in text) < 3:
+        return False
+    if line.fonts and all(
+        any(token in font.casefold() for token in ("pathfinder-icons", "taroca"))
+        for font in line.fonts
+    ):
+        return False
+    bold_tokens = ("bold", "semibold", "heavy", "black", "display", "condbold")
+    bold_words = sum(
+        any(token in font.casefold() for token in bold_tokens)
+        for font in line.fonts
+    )
+    bold_fraction = bold_words / len(line.fonts) if line.fonts else 0.0
+    all_caps = text.upper() == text and any(char.isalpha() for char in text)
+    return (
+        line.size >= body_size + 2.5
+        or (bold_fraction >= 0.8 and line.size >= body_size + 0.75)
+        # Condensed all-caps labels are common inside body-sized tables.  Caps
+        # alone is not a boundary unless it is also visibly display-sized.
+        or (
+            all_caps
+            and len(text) < 90
+            and bold_fraction >= 0.8
+            and line.size >= body_size + 1.5
+        )
+    )
+
+
+def _is_condensed_bold_body_candidate(line: _Line, body_size: float) -> bool:
+    """Identify the V3 heading-shaped labels evidenced inside Paizo cells."""
+    if line.size > body_size + 3.5 or not line.fonts:
+        return False
+    condensed = sum(
+        "condbold" in font.casefold() or "condensed" in font.casefold()
+        for font in line.fonts
+    )
+    return condensed / len(line.fonts) >= 0.8
+
+
 def _slug(value: str) -> str:
     value = _normalize_name(value).replace(" ", "-")
     return value[:80] or "section"
+
+
+def _stable_section_identity(
+    product: ProductSpec, page_start: object, printed_page: object, heading: object, ordinal: object
+) -> str:
+    """Versioned parser identity, deliberately separate from text/provenance hashes."""
+    material = "\n".join(
+        (
+            "paizo-section-identity-v2", product.code, product.component,
+            str(page_start), str(printed_page or ""), _normalize_name(str(heading)), str(ordinal),
+        )
+    )
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _trusted_section_canonical(section: TrustedSection) -> dict[str, object]:
+    return {
+        "id": section.id,
+        "source_section_id": section.source_section_id,
+        "text_hash": section.text_hash,
+        "heading": section.heading,
+        "pages": section.physical_pages,
+        "printed_page": section.printed_page,
+        "stable_section_identity": section.stable_section_identity,
+        "layout_flags": section.layout_flags,
+        "anchors": section.coverage_anchors,
+    }
+
+
+def _trusted_parser_output_digest(sections: Sequence[TrustedSection]) -> str:
+    canonical = [_trusted_section_canonical(section) for section in sections]
+    return hashlib.sha256(
+        ("trusted-parser-output-v2\n" + json.dumps(canonical, sort_keys=True, separators=(",", ":"))).encode()
+    ).hexdigest()
+
+
+def _trusted_bundle_seal(
+    *,
+    product_code: str,
+    parser_version: str,
+    exporter_profile_version: int,
+    semantic_fingerprint: str,
+    artifact_attestation: Mapping[str, object],
+    artifact_attestation_digest: str,
+    inventory: NativeWordInventory,
+    sections: Sequence[TrustedSection],
+    parser_output_digest: str,
+    layout_binding_digest: str | None = None,
+) -> str:
+    material = {
+        "version": "trusted-parse-bundle-v3",
+        "product": product_code,
+        "artifact_attestation": artifact_attestation_digest,
+        "artifact_evidence": dict(artifact_attestation),
+        "exporter_profile": exporter_profile_version,
+        "parser": parser_version,
+        "layout_binding": layout_binding_digest,
+        "semantic_fingerprint": semantic_fingerprint,
+        "ignored_policy": sorted((item.anchor_hash, item.reason) for item in inventory.ignored_anchors),
+        "sections": [_trusted_section_canonical(section) for section in sections],
+        "parser_output_digest": parser_output_digest,
+    }
+    return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def parse_rulebook_export(
@@ -827,23 +1483,64 @@ def parse_rulebook_export(
     *,
     product: ProductSpec | None = None,
     source: CorpusSource | None = None,
+    parser_version: str = PAIZO_NATIVE_PARSER_VERSION,
 ) -> list[dict[str, Any]]:
     """Parse one exporter JSON artifact into ``rulebook_section`` chunks."""
     path = Path(export_path).expanduser().resolve()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    return parse_rulebook_payload(
+        payload, product=product, source=source, parser_version=parser_version,
+        fallback_filename=path.name,
+    )
+
+
+def parse_rulebook_payload(
+    payload: Mapping[str, Any],
+    *,
+    product: ProductSpec | None = None,
+    source: CorpusSource | None = None,
+    parser_version: str = PAIZO_NATIVE_PARSER_VERSION,
+    fallback_filename: str = "native-export.json",
+) -> list[dict[str, Any]]:
+    """Parse an already-loaded native export; trusted callers never reread it."""
+    if parser_version == PAIZO_NATIVE_PARSER_V1:
+        line_builder = _lines_for_page_v1
+        reading_order = _reading_order_v1
+        is_heading = _is_heading_v1
+    elif parser_version == PAIZO_NATIVE_PARSER_V2:
+        line_builder = _lines_for_page_v2
+        reading_order = _reading_order_v2
+        is_heading = _is_heading_v2
+    elif parser_version == PAIZO_NATIVE_PARSER_V3:
+        # V3 keeps V2's reconstruction exactly; its page-local x-band model is
+        # consumed only at heading classification below.
+        line_builder = _lines_for_page_v2
+        reading_order = _reading_order_v2
+        is_heading = _is_heading_v2
+    else:
+        raise ValueError(f"unsupported Paizo parser version: {parser_version}")
     if payload.get("schema_version") != PDF_EXPORT_SCHEMA_VERSION:
         raise ValueError("unsupported native PDF export schema")
     source_meta = payload.get("source") or {}
     if product is None:
-        classified = _classify_name(str(source_meta.get("filename", path.name)))
+        classified = _classify_name(str(source_meta.get("filename", fallback_filename)))
         if classified is None:
             raise ValueError("native export filename does not identify a catalog product")
         product = PRODUCT_CATALOG[classified[0]]
-    source_name = source.display_name if source else str(source_meta.get("filename", path.name))
+    source_name = source.display_name if source else _safe_basename(str(source_meta.get("filename", fallback_filename)))
     source_hash = source.source_sha256 if source else str(source_meta.get("sha256", ""))
-    pages = [page for page in payload.get("pages", []) if isinstance(page, Mapping)]
-    repeated = _repeated_furniture(pages)
-    page_records: list[tuple[int, str | None, list[_Line]]] = []
+    # Build the source-wide inventory before parser segmentation.  V1/V2 keep
+    # their normal local-full text behavior, while carrying opaque anchors in
+    # private provenance so the trusted staging path can prove coverage.
+    inventory = native_word_inventory(payload, product.code)
+    annotated_payload = annotate_native_words(payload, inventory)
+    pages = [page for page in annotated_payload.get("pages", []) if isinstance(page, Mapping)]
+    raw_pages_by_number = {
+        int(page.get("number", 0)): page
+        for page in payload.get("pages", [])
+        if isinstance(page, Mapping)
+    }
+    page_records: list[tuple[int, str | None, list[_Line], _PageXBandModel | None]] = []
     all_sizes = [
         float(word.get("size", 0))
         for page in pages
@@ -859,11 +1556,13 @@ def parse_rulebook_export(
                 page_number = int(part_start) + max(page_number - 1, 0)
         lines = []
         height = float(page.get("height", 0) or 0)
-        raw_lines = _lines_for_page(page)
+        raw_lines = line_builder(page)
         width = float(page.get("width", 0) or 0)
+        original_page = raw_pages_by_number.get(int(page.get("number", 0)), page)
+        printed_lines = line_builder(original_page)
         printed_candidates = [
             line.text.strip(" -–—")
-            for line in raw_lines
+            for line in printed_lines
             if _PAGE_NUMBER_RE.match(line.text)
             and (not height or line.bottom > height * 0.88)
             and (
@@ -873,46 +1572,38 @@ def parse_rulebook_export(
             )
         ]
         printed_page = printed_candidates[-1] if printed_candidates else None
-        for line in _reading_order(page, raw_lines):
-            normalized = _normalize_name(line.text)
-            if normalized in repeated or _PAGE_NUMBER_RE.match(line.text):
-                continue
-            if _contains_email(line.text):
-                continue
-            # A lone email-like watermark can be rotated or split in native
-            # extraction; remove any line whose compacted text still contains
-            # the characteristic marker without retaining/logging its value.
-            if height and (line.top < height * 0.04 or line.bottom > height * 0.96) and "@" in line.text:
-                continue
-            lines.append(line)
-        page_records.append((page_number, printed_page, lines))
+        # Quarantined watermark/furniture anchors have already been removed by
+        # annotation. A body ``@`` or repeated table header stays visible and
+        # must either attach to a rule or become explicit unclassified text.
+        lines.extend(reading_order(page, raw_lines))
+        x_band_model = (
+            _page_x_band_model(raw_lines, width)
+            if parser_version == PAIZO_NATIVE_PARSER_V3
+            else None
+        )
+        page_records.append((page_number, printed_page, lines, x_band_model))
 
-    # This intentionally excludes raw PDF bytes, paths, page furniture, and
-    # watermark-like lines. It is therefore stable across personalized or
-    # regenerated copies while still changing when searchable rules change.
-    normalized_source_text = "\n".join(
-        f"{page_number}:{line.text}"
-        for page_number, _printed_page, lines in page_records
-        for line in lines
-    )
-    content_fingerprint = hashlib.sha256(
-        f"{product.code}\n{normalized_source_text}".encode()
-    ).hexdigest()
+    content_fingerprint = inventory.content_fingerprint
 
     sections: list[dict[str, Any]] = []
     current_title = product.title
     current_lines: list[str] = []
     current_pages: list[int] = []
     current_printed_pages: list[str] = []
+    current_layout_flags: set[str] = set()
+    current_anchors: list[str] = []
     anchor_ordinals: Counter[tuple[int, str]] = Counter()
 
     def flush() -> None:
         nonlocal current_lines, current_pages, current_printed_pages, current_title
+        nonlocal current_layout_flags, current_anchors
         body = _clean_text(" ".join(current_lines))
         if not body:
             current_lines = []
             current_pages = []
             current_printed_pages = []
+            current_layout_flags = set()
+            current_anchors = []
             return
         text = _clean_text(f"{current_title} {body}")
         page_values = tuple(dict.fromkeys(current_pages))
@@ -944,7 +1635,12 @@ def parse_rulebook_export(
             "physical_pages": list(page_values),
             "printed_pages": list(printed_values),
             "content_fingerprint": content_fingerprint,
+            # Private only: the review staging bridge consumes these and the
+            # public projection intentionally drops them.
+            "native_word_anchors": list(current_anchors),
         }
+        if current_layout_flags:
+            provenance["layout_flags"] = sorted(current_layout_flags)
         sections.append(
             RulebookSection(
                 id=section_id,
@@ -965,35 +1661,468 @@ def parse_rulebook_export(
                 section_hash=section_hash,
                 provenance=provenance,
                 ordinal=ordinal,
+                parser_version=parser_version,
             ).as_chunk()
         )
         current_lines = []
         current_pages = []
         current_printed_pages = []
+        current_layout_flags = set()
+        current_anchors = []
 
-    for page_number, printed_page, lines in page_records:
+    for page_number, printed_page, lines, x_band_model in page_records:
         for line in lines:
-            if _is_heading(line, body_size):
+            heading = is_heading(line, body_size)
+            if (
+                parser_version == PAIZO_NATIVE_PARSER_V3
+                and heading
+                and x_band_model is not None
+                and x_band_model.is_interior_cell_start(line)
+                and _is_condensed_bold_body_candidate(line, body_size)
+            ):
+                # Keep this label in its surrounding section and require an
+                # explicit layout-aware review before anything derived from it
+                # can enter the public projection.
+                heading = False
+                if line.layout_kind == "body":
+                    line = replace(line, layout_kind="table-cell")
+            if heading:
                 flush()
                 current_title = line.text
                 current_pages = [page_number]
                 current_printed_pages = [printed_page] if printed_page else []
+                current_anchors = list(line.native_word_anchors)
                 continue
             current_lines.append(line.text)
+            if parser_version in {PAIZO_NATIVE_PARSER_V2, PAIZO_NATIVE_PARSER_V3} and line.layout_kind != "body":
+                current_layout_flags.add(line.layout_kind)
             current_pages.append(page_number)
             if printed_page:
                 current_printed_pages.append(printed_page)
+            current_anchors.extend(line.native_word_anchors)
     flush()
+    assigned_counts = Counter(
+        anchor
+        for section in sections
+        for anchor in section["provenance"].get("native_word_anchors", [])
+    )
+    expected = set(inventory.anchors) - set(inventory.ignored_anchor_reasons)
+    duplicate = {anchor for anchor, count in assigned_counts.items() if count != 1}
+    unknown = set(assigned_counts) - expected
+    if duplicate or unknown:
+        raise ValueError("parser assigned duplicate, invalid, or ignored native-word anchors")
+    unassigned = expected - set(assigned_counts)
+    if unassigned:
+        # Never collapse dropped source text into an "ignored" category.  It
+        # becomes a visible review section that can be excluded deliberately.
+        words_by_anchor: dict[str, str] = {}
+        pages_by_anchor: dict[str, int] = {}
+        for page in pages:
+            page_number = int(page.get("number", 0))
+            for word in page.get("words", []):
+                if not isinstance(word, Mapping):
+                    continue
+                anchor = word.get("_native_anchor")
+                if isinstance(anchor, str) and anchor in unassigned:
+                    words_by_anchor[anchor] = str(word.get("text", ""))
+                    pages_by_anchor[anchor] = page_number
+        by_page: dict[int, list[str]] = defaultdict(list)
+        for anchor in sorted(unassigned, key=lambda value: (pages_by_anchor.get(value, 0), value)):
+            if anchor not in words_by_anchor:
+                raise ValueError("parser left an unclassified native word without recoverable text")
+            by_page[pages_by_anchor[anchor]].append(anchor)
+        for page_number, anchors in sorted(by_page.items()):
+            text = _clean_text(" ".join(words_by_anchor[anchor] for anchor in anchors))
+            if not text:
+                raise ValueError("parser left an empty unclassified native-word section")
+            section_id = f"corpus:{product.code}:{product.component}:p{page_number}:unclassified:0"
+            section_hash = hashlib.sha256(text.encode()).hexdigest()
+            provenance = {
+                "export_schema_version": payload.get("schema_version"),
+                "title": product.title,
+                "physical_pages": [page_number],
+                "printed_pages": [],
+                "content_fingerprint": content_fingerprint,
+                "native_word_anchors": anchors,
+                "layout_flags": ["unclassified-native-coverage"],
+            }
+            sections.append(
+                RulebookSection(
+                    id=section_id, name="Unclassified native text", text=text,
+                    product_code=product.code, book=product.title, component=product.component,
+                    rules_era=product.rules_era, license=product.license, remaster=product.remaster,
+                    source_filename=source_name, source_sha256=source_hash, pages=(page_number,),
+                    page_start=page_number, page_end=page_number, printed_page=None,
+                    section_hash=section_hash, provenance=provenance, ordinal=0,
+                    parser_version=parser_version,
+                ).as_chunk()
+            )
+    for section in sections:
+        provenance = section.get("provenance")
+        if isinstance(provenance, dict):
+            provenance["stable_section_identity"] = _stable_section_identity(
+                product, section.get("page_start"), section.get("printed_page"),
+                section.get("name"), section.get("id", "").rsplit(":", 1)[-1],
+            )
     return sections
+
+
+def parse_verified_native_export(
+    artifact: VerifiedNativeExport,
+    *,
+    parser_version: str = PAIZO_NATIVE_PARSER_VERSION,
+) -> TrustedParseBundle:
+    """Parse one verified in-memory export into a private staging contract."""
+    if (
+        not artifact.pdf_verified
+        or artifact._verification_token is not _TRUSTED_PDF_ORIGIN
+        or not artifact._payload_digest
+        or artifact._payload_digest != trusted_payload_digest(artifact.payload)
+    ):
+        raise ValueError("trusted parsing requires a PDF-verified native export")
+    product = PRODUCT_CATALOG.get(artifact.product_code)
+    if product is None:
+        raise ValueError("verified export references an unsupported PZO product")
+    inventory = native_word_inventory(artifact.payload, product.code, strict=True)
+    sections = parse_rulebook_payload(
+        artifact.payload, product=product, parser_version=parser_version,
+        fallback_filename=artifact.source_basename,
+    )
+    trusted_sections: list[TrustedSection] = []
+    for section in sections:
+        provenance = section.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError("parser section lacks provenance")
+        anchors = provenance.get("native_word_anchors")
+        if not isinstance(anchors, list) or not all(isinstance(anchor, str) for anchor in anchors):
+            raise ValueError("parser section lacks native anchor coverage")
+        flags = provenance.get("layout_flags", [])
+        if not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags):
+            raise ValueError("parser section layout flags are invalid")
+        stable = provenance.get("stable_section_identity")
+        if not isinstance(stable, str):
+            raise ValueError("parser section lacks stable identity")
+        pages = section.get("pages")
+        if not isinstance(pages, list) or not all(isinstance(page, int) for page in pages):
+            raise ValueError("parser section pages are invalid")
+        ordinal_text = str(section["id"]).rsplit(":", 1)[-1]
+        if not ordinal_text.isdigit():
+            raise ValueError("parser section lacks a structural ordinal")
+        heading_anchor = hashlib.sha256(
+            _normalize_name(str(section["name"])).encode("utf-8")
+        ).hexdigest()[:16]
+        source_section_id = (
+            f"{product.code.casefold()}:{product.component}:p{pages[0]}:"
+            f"h{heading_anchor}:i{ordinal_text}"
+        )
+        if not _TRUSTED_SOURCE_SECTION_ID_RE.fullmatch(source_section_id):
+            raise ValueError("parser generated an unsafe source section identifier")
+        trusted_sections.append(
+            TrustedSection(
+                id=str(section["id"]), source_section_id=source_section_id,
+                heading=str(section["name"]), text=str(section["text"]),
+                text_hash=str(section["section_hash"]), physical_pages=tuple(pages),
+                printed_page=section.get("printed_page") if isinstance(section.get("printed_page"), str) else None,
+                stable_section_identity=stable, layout_flags=tuple(sorted(flags)),
+                coverage_anchors=tuple(anchors),
+            )
+        )
+    parser_output_digest = _trusted_parser_output_digest(trusted_sections)
+    attestation = MappingProxyType({
+        "product_verified": True,
+        "page_count": artifact.page_count,
+        "title_marker_verified": bool(artifact.product_evidence.get("title_marker_verified")),
+        "matched_product_count": len(artifact.product_evidence.get("matched_product_codes", ())),
+        "conflict_product_count": len(artifact.product_evidence.get("conflict_product_codes", ())),
+    })
+    sealed_digest = _trusted_bundle_seal(
+        product_code=product.code, parser_version=parser_version,
+        exporter_profile_version=artifact.extractor_profile_version,
+        semantic_fingerprint=inventory.content_fingerprint, artifact_attestation=attestation,
+        artifact_attestation_digest=artifact.attestation_digest, inventory=inventory,
+        sections=trusted_sections, parser_output_digest=parser_output_digest,
+    )
+    return TrustedParseBundle(
+        product_code=product.code,
+        parser_version=parser_version,
+        exporter_profile_version=artifact.extractor_profile_version,
+        semantic_fingerprint=inventory.content_fingerprint,
+        artifact_attestation=attestation,
+        artifact_attestation_digest=artifact.attestation_digest,
+        inventory=inventory,
+        sections=tuple(trusted_sections),
+        parser_output_digest=parser_output_digest,
+        sealed_digest=sealed_digest,
+    )
+
+
+def load_and_parse_verified_pdf(
+    source_pdf: Path | str,
+    *,
+    product_code: str,
+    parser_version: str = PAIZO_NATIVE_PARSER_VERSION,
+    layout_artifact: Path | str | Mapping[str, object] | None = None,
+) -> TrustedParseBundle:
+    """The one-read trusted bridge from a selected PDF to sealed parser output."""
+    product = PRODUCT_CATALOG.get(product_code)
+    if product is None:
+        raise ValueError("selected PDF references an unsupported PZO product")
+    title_markers = (product.title, product.title.removeprefix("Pathfinder "))
+    catalog_title_markers = {
+        code: (spec.title, spec.title.removeprefix("Pathfinder "))
+        for code, spec in PRODUCT_CATALOG.items()
+    }
+    artifact = verified_native_export_from_pdf(
+        source_pdf, product_code=product_code, expected_title_markers=title_markers,
+        catalog_title_markers=catalog_title_markers,
+    )
+    bundle = parse_verified_native_export(artifact, parser_version=parser_version)
+    if layout_artifact is None:
+        return bundle
+    if parser_version != PAIZO_NATIVE_PARSER_V3:
+        raise ValueError("layout evidence currently requires paizo-native-v3")
+    from .pdf_layout import bind_layout_to_native_export
+
+    binding = bind_layout_to_native_export(artifact, layout_artifact)
+    native_pages = tuple(
+        sorted(
+            int(page["number"])
+            for page in artifact.payload["pages"]
+            if isinstance(page, Mapping)
+        )
+    )
+    if binding.selected_pages != native_pages:
+        raise ValueError(
+            "trusted layout evidence must cover every exported native PDF page"
+        )
+    return apply_layout_evidence(bundle, binding)
+
+
+def apply_layout_evidence(bundle: TrustedParseBundle, binding: Any) -> TrustedParseBundle:
+    """Add bounded layout-review flags without changing parser text or anchors."""
+    bundle.verify_seal()
+    if bundle.parser_version != PAIZO_NATIVE_PARSER_V3:
+        raise ValueError("layout evidence can only adapt a paizo-native-v3 bundle")
+    if binding.product_code != bundle.product_code or not re.fullmatch(
+        r"[0-9a-f]{64}", str(binding.binding_digest)
+    ):
+        raise ValueError("native layout binding does not match the trusted parser bundle")
+
+    anchor_owner: dict[str, int] = {}
+    for section_index, section in enumerate(bundle.sections):
+        for anchor in section.coverage_anchors:
+            if anchor in anchor_owner:
+                raise ValueError("trusted parser sections contain duplicate native anchors")
+            anchor_owner[anchor] = section_index
+    region_by_anchor: dict[str, Any] = {}
+    split_sections: dict[int, set[str]] = defaultdict(set)
+    textual_labels = {
+        "abstract", "algorithm", "aside_text", "content", "doc_title", "figure_title",
+        "footnote", "formula", "paragraph_title", "reference", "reference_content",
+        "table", "text", "vision_footnote",
+    }
+    complex_labels = {
+        "algorithm", "aside_text", "chart", "formula", "image", "table",
+        "footnote", "vision_footnote",
+    }
+    for region in binding.regions:
+        owners: set[int] = set()
+        for anchor in region.native_word_anchors:
+            if anchor in region_by_anchor:
+                raise ValueError("native layout binding assigns one anchor to multiple regions")
+            region_by_anchor[anchor] = region
+            owner = anchor_owner.get(anchor)
+            if owner is not None:
+                owners.add(owner)
+        ordered = sorted(owners)
+        if (
+            region.label in textual_labels
+            and 2 <= len(ordered) <= 3
+            and ordered == list(range(ordered[0], ordered[-1] + 1))
+        ):
+            token = f"layout-region-split:p{region.page}-o{region.order}"
+            for owner in ordered:
+                split_sections[owner].add(token)
+
+    unbound = set(binding.unbound_native_anchors)
+    sections: list[TrustedSection] = []
+    for section_index, section in enumerate(bundle.sections):
+        flags = set(section.layout_flags)
+        section_regions = [
+            region_by_anchor[anchor]
+            for anchor in section.coverage_anchors
+            if anchor in region_by_anchor
+        ]
+        if any(anchor in unbound for anchor in section.coverage_anchors):
+            flags.add("layout-model-unbound")
+        if any(region.label in complex_labels for region in section_regions):
+            flags.add("layout-model-complex")
+        if any(region.label == "table" for region in section_regions):
+            flags.add("layout-model-table")
+        collapsed_orders: list[tuple[int, int]] = []
+        for region in section_regions:
+            key = (region.page, region.order)
+            if not collapsed_orders or collapsed_orders[-1] != key:
+                collapsed_orders.append(key)
+        if any(right < left for left, right in zip(collapsed_orders, collapsed_orders[1:], strict=False)):
+            flags.add("layout-order-conflict")
+        if section_index in split_sections:
+            flags.add("layout-region-split")
+            flags.update(split_sections[section_index])
+        sections.append(replace(section, layout_flags=tuple(sorted(flags))))
+
+    parser_output_digest = _trusted_parser_output_digest(sections)
+    sealed_digest = _trusted_bundle_seal(
+        product_code=bundle.product_code,
+        parser_version=PAIZO_NATIVE_LAYOUT_V1,
+        exporter_profile_version=bundle.exporter_profile_version,
+        semantic_fingerprint=bundle.semantic_fingerprint,
+        artifact_attestation=bundle.artifact_attestation,
+        artifact_attestation_digest=bundle.artifact_attestation_digest,
+        inventory=bundle.inventory,
+        sections=sections,
+        parser_output_digest=parser_output_digest,
+        layout_binding_digest=binding.binding_digest,
+    )
+    adapted = TrustedParseBundle(
+        product_code=bundle.product_code,
+        parser_version=PAIZO_NATIVE_LAYOUT_V1,
+        exporter_profile_version=bundle.exporter_profile_version,
+        semantic_fingerprint=bundle.semantic_fingerprint,
+        artifact_attestation=bundle.artifact_attestation,
+        artifact_attestation_digest=bundle.artifact_attestation_digest,
+        inventory=bundle.inventory,
+        sections=tuple(sections),
+        parser_output_digest=parser_output_digest,
+        sealed_digest=sealed_digest,
+        layout_binding_digest=binding.binding_digest,
+    )
+    adapted.verify_seal()
+    return adapted
+
+
+def repair_trusted_bundle(
+    bundle: TrustedParseBundle,
+    merge_groups: Sequence[Sequence[str]],
+) -> TrustedParseBundle:
+    """Return a newly sealed bundle after complete adjacent-section unions.
+
+    ``merge_groups`` contains source-section IDs from the freshly re-read,
+    sealed bundle. Groups must contain two or three consecutive sections and
+    may not overlap. No anchor may be added, removed, or duplicated.
+    """
+    bundle.verify_seal()
+    sections = list(bundle.sections)
+    positions = {section.source_section_id: index for index, section in enumerate(sections)}
+    claimed: set[int] = set()
+    normalized: dict[int, tuple[int, ...]] = {}
+    for raw_group in merge_groups:
+        group = tuple(raw_group)
+        if len(group) not in {2, 3} or len(set(group)) != len(group):
+            raise ValueError("trusted stitch groups must contain two or three distinct sections")
+        try:
+            indexes = tuple(positions[value] for value in group)
+        except KeyError as exc:
+            raise ValueError("trusted stitch references an unknown source section") from exc
+        if indexes != tuple(range(indexes[0], indexes[0] + len(indexes))):
+            raise ValueError("trusted stitch groups must preserve consecutive parser order")
+        if claimed.intersection(indexes):
+            raise ValueError("trusted stitch groups must not overlap")
+        claimed.update(indexes)
+        normalized[indexes[0]] = indexes
+
+    repaired: list[TrustedSection] = []
+    index = 0
+    while index < len(sections):
+        indexes = normalized.get(index)
+        if indexes is None:
+            repaired.append(sections[index])
+            index += 1
+            continue
+        group = [sections[position] for position in indexes]
+        pages = tuple(sorted({page for section in group for page in section.physical_pages}))
+        anchors = tuple(anchor for section in group for anchor in section.coverage_anchors)
+        if len(set(anchors)) != len(anchors):
+            raise ValueError("trusted stitch would duplicate native anchors")
+        text = "\n\n".join(section.text.rstrip() for section in group).strip()
+        stable = hashlib.sha256(
+            ("paizo-stitched-section-v1\n" + "\n".join(
+                section.stable_section_identity for section in group
+            )).encode("utf-8")
+        ).hexdigest()
+        repaired.append(
+            TrustedSection(
+                id=group[0].id,
+                source_section_id=group[0].source_section_id,
+                heading=group[0].heading,
+                text=text,
+                text_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                physical_pages=pages,
+                printed_page=group[0].printed_page,
+                stable_section_identity=stable,
+                layout_flags=tuple(sorted({
+                    "stitched-adjacent-v1",
+                    *(flag for section in group for flag in section.layout_flags),
+                })),
+                coverage_anchors=anchors,
+            )
+        )
+        index += len(indexes)
+
+    original_anchors = [anchor for section in sections for anchor in section.coverage_anchors]
+    repaired_anchors = [anchor for section in repaired for anchor in section.coverage_anchors]
+    if sorted(original_anchors) != sorted(repaired_anchors):
+        raise ValueError("trusted stitch changed native anchor coverage")
+    parser_output_digest = _trusted_parser_output_digest(repaired)
+    sealed_digest = _trusted_bundle_seal(
+        product_code=bundle.product_code,
+        parser_version=bundle.parser_version,
+        exporter_profile_version=bundle.exporter_profile_version,
+        semantic_fingerprint=bundle.semantic_fingerprint,
+        artifact_attestation=bundle.artifact_attestation,
+        artifact_attestation_digest=bundle.artifact_attestation_digest,
+        inventory=bundle.inventory,
+        sections=repaired,
+        parser_output_digest=parser_output_digest,
+        layout_binding_digest=bundle.layout_binding_digest,
+    )
+    result = TrustedParseBundle(
+        product_code=bundle.product_code,
+        parser_version=bundle.parser_version,
+        exporter_profile_version=bundle.exporter_profile_version,
+        semantic_fingerprint=bundle.semantic_fingerprint,
+        artifact_attestation=bundle.artifact_attestation,
+        artifact_attestation_digest=bundle.artifact_attestation_digest,
+        inventory=bundle.inventory,
+        sections=tuple(repaired),
+        parser_output_digest=parser_output_digest,
+        sealed_digest=sealed_digest,
+        layout_binding_digest=bundle.layout_binding_digest,
+    )
+    result.verify_seal()
+    return result
+
+
+def load_and_parse_verified_native_export(*args: Any, **kwargs: Any) -> TrustedParseBundle:
+    """Removed trusted JSON bridge; callers must use ``load_and_parse_verified_pdf``."""
+    raise ValueError("cached native exports are untrusted; provide the source PDF to load_and_parse_verified_pdf")
 
 
 def parse_exports(
     prepared: Iterable[PreparedExport],
+    *,
+    parser_version: str = PAIZO_NATIVE_PARSER_VERSION,
 ) -> list[dict[str, Any]]:
     """Parse selected prepared artifacts in source/page reading order."""
     chunks: list[dict[str, Any]] = []
     for item in prepared:
-        chunks.extend(parse_rulebook_export(item.output_path, source=item.source))
+        chunks.extend(
+            parse_rulebook_export(
+                item.output_path,
+                source=item.source,
+                parser_version=parser_version,
+            )
+        )
     by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for chunk in chunks:
         by_source[chunk["source_id"]].append(chunk)
@@ -1018,19 +2147,31 @@ parse_export = parse_rulebook_export
 
 __all__ = [
     "CORPUS_SCHEMA_VERSION",
+    "PAIZO_NATIVE_PARSER_V1",
+    "PAIZO_NATIVE_PARSER_V2",
+    "PAIZO_NATIVE_PARSER_V3",
+    "PAIZO_NATIVE_LAYOUT_V1",
+    "PAIZO_NATIVE_PARSER_VERSION",
     "PRODUCT_CATALOG",
     "SELECTION_STATE_FILENAME",
     "CorpusSource",
     "PreparedExport",
     "ProductSpec",
     "RulebookSection",
+    "TrustedSection",
+    "TrustedParseBundle",
     "SelectedRevision",
     "discover",
     "discover_sources",
     "group_sources",
     "parse_export",
     "parse_exports",
+    "parse_rulebook_payload",
     "parse_rulebook_export",
+    "parse_verified_native_export",
+    "apply_layout_evidence",
+    "load_and_parse_verified_native_export",
+    "load_and_parse_verified_pdf",
     "prepare_exports",
     "select",
     "select_revisions",

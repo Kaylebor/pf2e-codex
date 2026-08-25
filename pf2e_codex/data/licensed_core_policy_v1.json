@@ -1,0 +1,18 @@
+{
+  "policy_version": "mechanics-v1",
+  "scope": "functional game mechanics from cataloged Paizo core rulebooks",
+  "public_decisions": {
+    "PUBLIC_AS_IS": "A complete, terse functional rule may be retained verbatim only when it contains no reserved setting material, expressive example or narrative prose, trademark-only branding, private data, or local provenance.",
+    "MIXED_NEEDS_EXTRACTION": "Rewrite a mixed section as a concise, faithful statement of only the operational rules facts. Do not preserve expressive wording, examples, lore, characters, places, art captions, or other reserved material."
+  },
+  "nonpublic_decisions": {
+    "EXCLUDE": "Use for Foundry duplicates, parser fragments, navigation, nonfunctional prose, reserved material, or sections whose mechanic is not usable without excluded context.",
+    "UNCERTAIN": "Use whenever the functional-mechanics or licensing boundary cannot be made confidently safe. Uncertain text is never exported."
+  },
+  "evidence": {
+    "foundry": "Local Foundry data may prove duplication or corroborate an already classified mechanic, but its presence is not by itself redistribution authority.",
+    "aon": "Archives of Nethys is optional existence and provenance corroboration only. Absence proves nothing, and AON text must never be copied."
+  },
+  "required_review": "Every decision requires a separately claimed review. Public text is exported only after APPROVE; EXCLUDE or UNCERTAIN is resolved only after the reviewer confirms the nonpublication decision.",
+  "release_gate": "This review policy is an engineering control, not legal advice. Public artifacts still require the repository's distribution audit and maintainer-approved notices."
+}

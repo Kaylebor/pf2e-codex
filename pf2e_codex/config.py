@@ -12,7 +12,7 @@ Resolution order (highest priority wins):
 Example `~/.config/pf2e-codex/config.toml`:
     model = "snowflake-arctic-embed-s"
     data_dir = "~/pf2e"
-    release = "pf2e-8.4.0"
+    release = "pf2e-8.4.1"
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "pf2e-codex"
 DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "pf2e-codex"
 DEFAULT_MODEL = "Snowflake/snowflake-arctic-embed-xs"
-DEFAULT_RELEASE = "pf2e-8.4.0"
+DEFAULT_RELEASE = "pf2e-8.4.1"
 GITHUB_RELEASE_URL = (
     "https://github.com/foundryvtt/pf2e/releases/download/{version}/json-assets.zip"
 )

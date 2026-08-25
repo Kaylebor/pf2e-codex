@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -14,6 +15,7 @@ from .chunker import ChunkBuilder, UUIDResolver, entry_hash
 from .config import Settings
 from .embeddings import EmbeddingProvider, get_provider
 from .fetcher import extract_all_packs, get_cached_zip
+from .foundry_scope import is_redistributable_foundry_entry
 from .index import (
     ensure_ambiguous_ref_targets,
     init_db,
@@ -22,6 +24,127 @@ from .index import (
     rebuild_fts,
     vec_blob,
 )
+
+
+def _corpus_product_codes(chunks: list[dict[str, Any]]) -> set[str]:
+    """Return product codes represented by full private corpus chunks."""
+    products: set[str] = set()
+    for chunk in chunks:
+        if chunk.get("origin") != "corpus":
+            continue
+        source = chunk.get("source")
+        product = source.get("product") if isinstance(source, dict) else None
+        if isinstance(product, str) and product.startswith("PZO"):
+            products.add(product)
+            continue
+        source_id = str(chunk.get("source_id") or "")
+        parts = source_id.split(":")
+        if len(parts) > 1 and parts[1].startswith("PZO"):
+            products.add(parts[1])
+    return products
+
+
+def _insert_licensed_metadata(
+    conn: Any,
+    chunks: list[dict[str, Any]],
+    notices: tuple[dict[str, str], ...] = (),
+) -> None:
+    """Copy the audited static-corpus manifest and notices into a model DB."""
+    revisions: dict[tuple[str, str], dict[str, Any]] = {}
+    for notice in notices:
+        notice_text = str(notice.get("text") or "")
+        notice_key = str(notice.get("notice_key") or "")
+        license_name = str(notice.get("license") or "")
+        if not notice_text.strip() or not notice_key or license_name not in {"OGL", "ORC"}:
+            raise ValueError(f"invalid licensed-core notice: {notice_key!r}")
+        conn.execute(
+            """INSERT OR REPLACE INTO license_notices
+               (notice_key, license, text, content_hash) VALUES (?, ?, ?, ?)""",
+            (
+                notice_key,
+                license_name,
+                notice_text,
+                hashlib.sha256(notice_text.encode("utf-8")).hexdigest(),
+            ),
+        )
+    for chunk in chunks:
+        if chunk.get("origin") != "licensed-core":
+            continue
+        provenance = chunk.get("licensed_provenance")
+        notice = chunk.get("licensed_notice")
+        if not isinstance(provenance, dict) or not isinstance(notice, dict):
+            raise ValueError(f"licensed-core chunk lacks audited provenance: {chunk.get('id')}")
+        notice_text = str(notice.get("text") or "")
+        notice_key = str(notice.get("notice_key") or "")
+        license_name = str(provenance.get("license") or "")
+        if (
+            not notice_text.strip()
+            or notice.get("license") != license_name
+            or notice_key != provenance.get("notice_key")
+        ):
+            raise ValueError(f"licensed-core chunk has invalid notice metadata: {chunk.get('id')}")
+        conn.execute(
+            """INSERT INTO license_notices(notice_key, license, text, content_hash)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(notice_key) DO UPDATE SET
+                   license=excluded.license, text=excluded.text,
+                   content_hash=excluded.content_hash""",
+            (
+                notice_key,
+                license_name,
+                notice_text,
+                hashlib.sha256(notice_text.encode("utf-8")).hexdigest(),
+            ),
+        )
+        product = str(provenance.get("product_code") or "")
+        fingerprint = str(provenance.get("content_fingerprint") or "")
+        revision_key = (product, fingerprint)
+        revision = revisions.setdefault(
+            revision_key,
+            {
+                "license": license_name,
+                "era": str(provenance.get("era") or "unknown"),
+                "parser_version": str(provenance.get("parser_version") or ""),
+                "source_schema_version": provenance.get("source_schema_version"),
+                "printing_revision": provenance.get("printing_revision"),
+                "policy_versions": set(),
+            },
+        )
+        revision["policy_versions"].add(str(provenance.get("policy_version") or ""))
+        conn.execute(
+            """INSERT OR REPLACE INTO licensed_sections
+               (public_id, product_code, content_fingerprint, source_section_id,
+                source_section_hash, page_start, page_end, printed_page, heading,
+                content_hash, license, era, extraction_method, policy_version,
+                parser_version, printing_revision, notice_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                chunk["id"], product, fingerprint,
+                str(provenance.get("source_section_id") or ""),
+                str(provenance.get("source_section_hash") or ""),
+                chunk.get("source_page_start"), chunk.get("source_page_end"),
+                chunk.get("printed_page"), str(chunk.get("name") or ""),
+                str(provenance.get("content_hash") or ""), license_name,
+                str(provenance.get("era") or "unknown"),
+                provenance.get("extraction_method"),
+                str(provenance.get("policy_version") or ""),
+                str(provenance.get("parser_version") or ""),
+                provenance.get("printing_revision"), notice_key,
+            ),
+        )
+    for (product, fingerprint), revision in sorted(revisions.items()):
+        conn.execute(
+            """INSERT OR REPLACE INTO licensed_revisions
+               (product_code, content_fingerprint, license, era, parser_version,
+                source_schema_version, printing_revision, policy_versions)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                product, fingerprint, revision["license"], revision["era"],
+                revision["parser_version"], revision["source_schema_version"],
+                revision["printing_revision"],
+                json.dumps(sorted(revision["policy_versions"])),
+            ),
+        )
 
 
 def _corpus_scope_value(settings: Settings) -> str:
@@ -156,8 +279,9 @@ def _insert_chunk(
         INSERT OR REPLACE INTO chunks (
             id, name, type, pack, slug, level, traits, text, raw_rules_count,
             source_hash, license, remaster, translations, origin, source_id,
-            source_page_start, source_page_end, printed_page, section_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_page_start, source_page_end, printed_page, section_hash,
+            publication_title
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         chunk["id"], chunk["name"], chunk["type"], chunk["pack"],
         chunk.get("slug", ""),
@@ -168,6 +292,7 @@ def _insert_chunk(
         json.dumps(chunk.get("translations")) if chunk.get("translations") else None,
         origin, source["source_id"], chunk.get("source_page_start"),
         chunk.get("source_page_end"), chunk.get("printed_page"), chunk.get("section_hash"),
+        chunk.get("publication_title"),
     ))
     conn.execute(
         "INSERT OR REPLACE INTO vec_chunks (id, embedding) VALUES (?, vec_f32(?))",
@@ -207,13 +332,35 @@ def _validate_staged_db(db_path: Path, expected_chunks: int) -> None:
             "SELECT value FROM _meta WHERE key = 'distribution_scope'"
         ).fetchone()
         scope = str(scope_row[0]) if scope_row else None
-        non_foundry_count = conn.execute(
-            "SELECT COUNT(*) FROM chunks "
-            "WHERE origin IS NULL OR origin <> 'foundry'"
+        private_or_unknown_count = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE origin IS NULL "
+            "OR origin NOT IN ('foundry', 'licensed-core')"
         ).fetchone()[0]
         unknown_origin_count = conn.execute(
             "SELECT COUNT(*) FROM chunks WHERE origin IS NULL "
-            "OR origin NOT IN ('foundry', 'corpus')"
+            "OR origin NOT IN ('foundry', 'licensed-core', 'corpus')"
+        ).fetchone()[0]
+        licensed_count = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE origin = 'licensed-core'"
+        ).fetchone()[0]
+        licensed_provenance_count = conn.execute(
+            "SELECT COUNT(*) FROM licensed_sections"
+        ).fetchone()[0]
+        from .foundry_scope import (
+            REDISTRIBUTABLE_FOUNDRY_PUBLICATIONS,
+            REDISTRIBUTABLE_LICENSES,
+        )
+
+        titles = sorted(REDISTRIBUTABLE_FOUNDRY_PUBLICATIONS)
+        licenses = sorted(REDISTRIBUTABLE_LICENSES)
+        title_slots = ",".join("?" for _ in titles)
+        license_slots = ",".join("?" for _ in licenses)
+        unapproved_foundry_count = conn.execute(
+            f"""SELECT COUNT(*) FROM chunks WHERE origin='foundry' AND (
+                publication_title IS NULL OR publication_title NOT IN ({title_slots})
+                OR license IS NULL OR license NOT IN ({license_slots})
+            )""",
+            (*titles, *licenses),
         ).fetchone()[0]
         if (
             actual_chunks != expected_chunks
@@ -225,12 +372,21 @@ def _validate_staged_db(db_path: Path, expected_chunks: int) -> None:
             raise RuntimeError("staged database contains no provenance sources")
         if scope not in ("redistributable", "local-full"):
             raise RuntimeError("staged database has no valid distribution scope")
-        if scope == "redistributable" and non_foundry_count:
+        if scope == "redistributable" and private_or_unknown_count:
             raise RuntimeError(
-                "redistributable staging database contains non-Foundry or unowned rows"
+                "redistributable staging database contains private or unowned rows"
+            )
+        if scope == "redistributable" and unapproved_foundry_count:
+            raise RuntimeError(
+                "redistributable staging database contains Foundry rows outside "
+                "the approved core publications"
             )
         if scope == "local-full" and unknown_origin_count:
             raise RuntimeError("local staging database contains unknown row ownership")
+        if licensed_count != licensed_provenance_count:
+            raise RuntimeError(
+                "staged database licensed-core chunk/provenance counts do not match"
+            )
     finally:
         conn.close()
 
@@ -268,8 +424,13 @@ def build_chunks(settings: Settings) -> list[dict[str, Any]]:
     builder = ChunkBuilder(resolver)
 
     chunks = []
+    excluded_foundry = 0
+    clean_scope = _corpus_scope_value(settings) == "redistributable"
     for pack_name, entries in all_entries.items():
         for entry in entries:
+            if clean_scope and not is_redistributable_foundry_entry(entry):
+                excluded_foundry += 1
+                continue
             for chunk in builder.build_all(entry, pack_name):
                 # Foundry content owns its rows even when a later parser uses
                 # the same database for local book sections.
@@ -281,10 +442,22 @@ def build_chunks(settings: Settings) -> list[dict[str, Any]]:
 
     types = Counter(c["type"] for c in chunks)
     print(f"Generated {len(chunks)} chunks")
+    if clean_scope:
+        print(
+            f"Excluded {excluded_foundry} Foundry entries outside the core publication allowlist"
+        )
     print("Chunk types:", dict(types))
     print(f"Total text chars: {sum(len(c['text']) for c in chunks):,}")
     print(f"Avg chunk size: {sum(len(c['text']) for c in chunks) / len(chunks):.0f} chars")
     corpus_chunks = build_corpus_chunks(settings)
+    from .licensed_core import load_licensed_core
+
+    licensed = load_licensed_core(
+        exclude_products=_corpus_product_codes(corpus_chunks),
+    )
+    if licensed.chunks:
+        chunks.extend(licensed.chunks)
+        print(f"Added {len(licensed.chunks)} reviewed licensed-core sections")
     if corpus_chunks:
         chunks.extend(corpus_chunks)
         print(f"Added {len(corpus_chunks)} local corpus sections")
@@ -307,7 +480,13 @@ def build_corpus_chunks(settings: Settings) -> list[dict[str, Any]]:
             raise FileNotFoundError(f"configured corpus source directory does not exist: {source_root}")
         return []
 
-    from .corpus import discover_sources, parse_exports, prepare_exports, select_revisions
+    from .corpus import (
+        PAIZO_NATIVE_PARSER_V1,
+        discover_sources,
+        parse_exports,
+        prepare_exports,
+        select_revisions,
+    )
 
     sources = discover_sources(
         source_root,
@@ -322,7 +501,9 @@ def build_corpus_chunks(settings: Settings) -> list[dict[str, Any]]:
     if not revisions:
         return []
     prepared = prepare_exports(root, revisions)
-    chunks = parse_exports(prepared)
+    # Local-full remains pinned to the frozen v1 parser until a parser-run
+    # migration can stage and review v2 independently.
+    chunks = parse_exports(prepared, parser_version=PAIZO_NATIVE_PARSER_V1)
     ids = [chunk["id"] for chunk in chunks]
     duplicates = [value for value, count in Counter(ids).items() if count > 1]
     if duplicates:
@@ -404,6 +585,12 @@ def embed_and_index(
         conn.execute("BEGIN")
         for chunk, emb in zip(chunks, embeddings, strict=True):
             _insert_chunk(conn, chunk, emb, settings)
+        from .licensed_core import load_licensed_core
+
+        bundled_metadata = load_licensed_core(
+            exclude_products=_corpus_product_codes(chunks),
+        )
+        _insert_licensed_metadata(conn, chunks, bundled_metadata.notices)
         # Mark duplicate IDs introduced by this inserted snapshot. Incremental
         # updates use INSERT OR IGNORE so prior ambiguity tombstones persist.
         ensure_ambiguous_ref_targets(conn)
@@ -430,8 +617,45 @@ def embed_and_index(
             ("pf2e_release", settings.release),
             ("index_date", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
             ("distribution_scope", _corpus_scope_value(settings)),
+            (
+                "foundry_scope",
+                "core-publications-v1"
+                if _corpus_scope_value(settings) == "redistributable"
+                else "upstream-complete",
+            ),
         ]:
             conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", (k, v))
+        licensed_count = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE origin = 'licensed-core'"
+        ).fetchone()[0]
+        if licensed_count:
+            from .licensed_core import (
+                LICENSED_CORE_SCHEMA_VERSION,
+                licensed_core_digest,
+                load_licensed_core,
+            )
+
+            licensed_metadata = [
+                ("licensed_core_schema_version", str(LICENSED_CORE_SCHEMA_VERSION)),
+                ("licensed_core_scope", "licensed-core-reviewed"),
+            ]
+            bundled = load_licensed_core(
+                exclude_products=_corpus_product_codes(chunks),
+            )
+            indexed_ids = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM chunks WHERE origin='licensed-core'"
+                )
+            }
+            if indexed_ids == {chunk["id"] for chunk in bundled.chunks}:
+                licensed_metadata.append(
+                    ("licensed_core_digest", licensed_core_digest(bundled))
+                )
+            conn.executemany(
+                "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+                licensed_metadata,
+            )
         conn.commit()
         conn.close()
     except Exception:
@@ -548,23 +772,94 @@ def sync_corpus_index(
         removed_ids = set(existing) - set(incoming)
         unchanged = len(chunks) - len(changed)
 
+        from .licensed_core import load_licensed_core
+
+        licensed_bundle = load_licensed_core(
+            exclude_products=_corpus_product_codes(chunks),
+        )
+        existing_licensed = {
+            row[0]: (row[1] or "")
+            for row in conn.execute(
+                "SELECT id, section_hash FROM chunks WHERE origin = 'licensed-core'"
+            )
+        }
+        incoming_licensed = {chunk["id"]: chunk for chunk in licensed_bundle.chunks}
+        changed_licensed = [
+            chunk for chunk in licensed_bundle.chunks
+            if chunk["id"] not in existing_licensed
+            or existing_licensed[chunk["id"]] != chunk.get("section_hash", "")
+        ]
+        removed_licensed_ids = set(existing_licensed) - set(incoming_licensed)
+
         embeddings: list[list[float]] = []
-        if changed:
+        all_changed = [*changed, *changed_licensed]
+        if all_changed:
             if provider is None:
                 provider = get_provider(
                     settings.model,
                     provider=settings.provider,
                     onnx_provider=settings.onnx_provider,
                 )
-            embeddings = provider.embed([chunk["text"] for chunk in changed])
+            embeddings = provider.embed([chunk["text"] for chunk in all_changed])
+        corpus_embeddings = embeddings[: len(changed)]
+        licensed_embeddings = embeddings[len(changed) :]
 
         conn.execute("BEGIN")
         for chunk_id in removed_ids | {chunk["id"] for chunk in changed}:
             conn.execute("DELETE FROM refs WHERE source_id = ?", (chunk_id,))
             conn.execute("DELETE FROM vec_chunks WHERE id = ?", (chunk_id,))
             conn.execute("DELETE FROM chunks WHERE id = ? AND origin = 'corpus'", (chunk_id,))
-        for chunk, embedding in zip(changed, embeddings, strict=True):
+        for chunk, embedding in zip(changed, corpus_embeddings, strict=True):
             _insert_chunk(conn, chunk, embedding, settings)
+
+        for chunk_id in removed_licensed_ids | {
+            chunk["id"] for chunk in changed_licensed
+        }:
+            conn.execute("DELETE FROM refs WHERE source_id = ?", (chunk_id,))
+            conn.execute("DELETE FROM vec_chunks WHERE id = ?", (chunk_id,))
+            conn.execute(
+                "DELETE FROM chunks WHERE id = ? AND origin = 'licensed-core'",
+                (chunk_id,),
+            )
+            conn.execute("DELETE FROM licensed_sections WHERE public_id = ?", (chunk_id,))
+        for chunk, embedding in zip(changed_licensed, licensed_embeddings, strict=True):
+            _insert_chunk(conn, chunk, embedding, settings)
+
+        conn.execute("DELETE FROM licensed_sections")
+        conn.execute("DELETE FROM licensed_revisions")
+        conn.execute("DELETE FROM license_notices")
+        _insert_licensed_metadata(
+            conn,
+            list(licensed_bundle.chunks),
+            licensed_bundle.notices,
+        )
+        if licensed_bundle.chunks:
+            from .licensed_core import (
+                LICENSED_CORE_SCHEMA_VERSION,
+                licensed_core_digest,
+            )
+
+            conn.executemany(
+                "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+                [
+                    ("licensed_core_schema_version", str(LICENSED_CORE_SCHEMA_VERSION)),
+                    ("licensed_core_scope", "licensed-core-reviewed"),
+                    ("licensed_core_digest", licensed_core_digest(licensed_bundle)),
+                ],
+            )
+        else:
+            conn.execute(
+                """DELETE FROM _meta WHERE key IN (
+                    'licensed_core_schema_version', 'licensed_core_scope',
+                    'licensed_core_digest'
+                )"""
+            )
+        conn.execute(
+            """DELETE FROM sources WHERE source = 'licensed-core'
+               AND source_id NOT IN (
+                   SELECT DISTINCT source_id FROM chunks WHERE origin = 'licensed-core'
+               )"""
+        )
 
         changed_ids = {chunk["id"] for chunk in changed}
         for chunk in chunks:
@@ -594,15 +889,18 @@ def sync_corpus_index(
             if source["source_id"] not in seen_sources:
                 _upsert_source(conn, source)
                 seen_sources.add(source["source_id"])
+        # Remove only stale provenance owned by this private PDF importer.
+        # Other non-Foundry sources (notably the reviewed, redistributable
+        # licensed-core projection) have an independent lifecycle.
         if seen_sources:
             placeholders = ",".join("?" for _ in seen_sources)
             conn.execute(
-                f"DELETE FROM sources WHERE source <> 'foundry' "
+                f"DELETE FROM sources WHERE source = 'paizo-pdf' "
                 f"AND source_id NOT IN ({placeholders})",
                 tuple(sorted(seen_sources)),
             )
         else:
-            conn.execute("DELETE FROM sources WHERE source <> 'foundry'")
+            conn.execute("DELETE FROM sources WHERE source = 'paizo-pdf'")
 
         rebuild_fts(conn)
         corpus_count = conn.execute(
@@ -614,6 +912,20 @@ def sync_corpus_index(
         ).fetchone()[0]
         if corpus_count != len(chunks) or corpus_vectors != len(chunks):
             raise RuntimeError("corpus validation failed: chunk/vector counts do not match")
+        licensed_count = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE origin = 'licensed-core'"
+        ).fetchone()[0]
+        licensed_vectors = conn.execute(
+            "SELECT COUNT(*) FROM vec_chunks "
+            "WHERE id IN (SELECT id FROM chunks WHERE origin = 'licensed-core')"
+        ).fetchone()[0]
+        if (
+            licensed_count != len(licensed_bundle.chunks)
+            or licensed_vectors != len(licensed_bundle.chunks)
+        ):
+            raise RuntimeError(
+                "corpus validation failed: licensed-core chunk/vector counts do not match"
+            )
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise RuntimeError("corpus validation failed: database integrity check")
         conn.execute(
@@ -627,6 +939,10 @@ def sync_corpus_index(
         conn.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
             ("distribution_scope", "local-full"),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            ("foundry_scope", "upstream-complete"),
         )
         conn.commit()
     except Exception:
@@ -668,6 +984,13 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
         "SELECT value FROM _meta WHERE key = 'pf2e_release'"
     ).fetchone()
     current_release = current_release[0] if current_release else None
+    current_foundry_scope = conn.execute(
+        "SELECT value FROM _meta WHERE key = 'foundry_scope'"
+    ).fetchone()
+    current_foundry_scope = current_foundry_scope[0] if current_foundry_scope else None
+    clean_scope = _corpus_scope_value(settings) == "redistributable"
+    target_foundry_scope = "core-publications-v1" if clean_scope else "upstream-complete"
+    scope_migration = current_foundry_scope != target_foundry_scope
 
     # Persist duplicate-ID tombstones before any incremental deletions. The
     # markers intentionally survive ordinary updates to prevent a former
@@ -675,7 +998,7 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
     ensure_ambiguous_ref_targets(conn)
     conn.commit()
 
-    if current_release == settings.release:
+    if current_release == settings.release and not scope_migration:
         print(f"Already indexed version {settings.release}")
         conn.close()
         return
@@ -710,12 +1033,14 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
 
     for pack_name, entries in all_entries.items():
         for entry in entries:
+            if clean_scope and not is_redistributable_foundry_entry(entry):
+                continue
             entry_id = entry.get("_id", "")
             packed_id = f"{pack_name}:{entry_id}"
             all_new_ids.add(packed_id)
             h = entry_hash(entry)
             existing = existing_hashes.get(packed_id, "")
-            if existing and existing == h:
+            if not scope_migration and existing and existing == h:
                 unchanged += 1
                 continue
             changed_entry_ids.add(packed_id)
@@ -779,6 +1104,14 @@ def update_index(settings: Settings, _provider: EmbeddingProvider | None = None)
             ("total_chunks", str(actual)))
         conn.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
             ("pf2e_release", settings.release))
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            ("foundry_scope", target_foundry_scope),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            ("distribution_scope", _corpus_scope_value(settings)),
+        )
         conn.commit()
     except Exception:
         conn.rollback()

@@ -131,3 +131,78 @@ def test_export_pdf_does_not_replace_existing_output(tmp_path, monkeypatch):
         pdf_export.export_pdf(source, output)
 
     assert output.read_text() == "keep me"
+
+
+def test_verified_native_export_comes_from_pdf_not_forged_cache(tmp_path, monkeypatch):
+    source = tmp_path / "PZO12001E.pdf"
+    source.write_bytes(b"fixture PDF bytes")
+    output = tmp_path / "native.json"
+    pages = [_FakePage("Pathfinder Player Core"), _FakePage("two")]
+    monkeypatch.setattr(pdf_export, "_load_pdfplumber", lambda: _backend(pages))
+    pdf_export.export_pdf(source, output)
+
+    # A cached export can be forged, but direct verification never reads it.
+    forged = json.loads(output.read_text())
+    forged["pages"][0]["words"][0]["text"] = "forged"
+    output.write_text(json.dumps(forged))
+    verified = pdf_export.verified_native_export_from_pdf(
+        source, product_code="PZO12001", expected_title_markers=("Pathfinder Player Core",)
+    )
+    assert verified.pdf_verified is True
+    assert verified.page_count == 2
+    assert "fixture PDF bytes" not in repr(verified)
+    assert verified.payload["pages"][0]["words"][0]["text"] == "Pathfinder Player Core"
+
+    untrusted = pdf_export.load_untrusted_native_export(output, product_code="PZO12001")
+    assert untrusted.pdf_verified is False
+
+    with pytest.raises(ValueError, match="title evidence"):
+        pdf_export.verified_native_export_from_pdf(
+            source, product_code="PZO12001", expected_title_markers=("GM Core",)
+        )
+    with pytest.raises(ValueError, match="PZO product"):
+        pdf_export.verified_native_export_from_pdf(
+            source, product_code="PZO12002", expected_title_markers=("GM Core",)
+        )
+
+
+def test_catalog_title_evidence_rejects_player_core_2_as_player_core():
+    pages = [{
+        "number": 1,
+        "words": [{"text": "Pathfinder Player Core 2"}],
+    }]
+    catalog = {
+        "PZO12001": ("Pathfinder Player Core", "Player Core"),
+        "PZO12004": ("Pathfinder Player Core 2", "Player Core 2"),
+        "PZO12002": ("Pathfinder GM Core", "GM Core"),
+        "PZO12003": ("Pathfinder Monster Core", "Monster Core"),
+        "PZO2101": ("Pathfinder Core Rulebook", "Core Rulebook"),
+    }
+    wrong = pdf_export._title_marker_evidence(
+        pages, selected_product_code="PZO12001", selected_markers=catalog["PZO12001"],
+        catalog_markers=catalog,
+    )
+    assert wrong["title_marker_verified"] is False
+    assert wrong["conflict_product_codes"] == ("PZO12004",)
+    right = pdf_export._title_marker_evidence(
+        pages, selected_product_code="PZO12004", selected_markers=catalog["PZO12004"],
+        catalog_markers=catalog,
+    )
+    assert right["title_marker_verified"] is True
+    assert right["conflict_product_codes"] == ()
+
+
+def test_catalog_title_evidence_accepts_unambiguous_short_cover_title():
+    pages = [{"number": 1, "words": [{"text": "GM Core"}]}]
+    catalog = {
+        "PZO12001": ("Pathfinder Player Core", "Player Core"),
+        "PZO12002": ("Pathfinder GM Core", "GM Core"),
+    }
+
+    evidence = pdf_export._title_marker_evidence(
+        pages, selected_product_code="PZO12002", selected_markers=catalog["PZO12002"],
+        catalog_markers=catalog,
+    )
+
+    assert evidence["title_marker_verified"] is True
+    assert evidence["matched_product_codes"] == ("PZO12002",)

@@ -4,6 +4,66 @@ Ordered by impact. Check items off as completed.
 
 ## High Impact
 
+- [ ] **Reviewed redistributable core-rules projection**
+  - Implemented: ignored WAL-backed swarm workspace, atomic candidate/reviewer
+    claims, revision-specific section keys, independent approval, optional AON
+    corroboration, and a fail-closed deterministic public SQLite builder.
+  - Implemented: `licensed-core` ownership, packaged projection validation,
+    model-independent loading, manifest/notice tables, clean/local separation,
+    product-level suppression for complete local PDFs, and restoration when a
+    private product disappears.
+  - Implemented: versioned mechanics policy and privacy validation, targeted
+    shard claims, clear review aliases, core-publication/license filtering for
+    Foundry rows, persisted publication provenance, and strict comparison to a
+    trusted packaged projection digest.
+  - Implemented: trusted exporter-to-parser staging. It recomputes a
+    watermark-independent whole-export native-word inventory before parsing,
+    permits only constrained repeated-furniture/page-number ignores, and
+    blocks activation when any other source word is unassigned or duplicated.
+  - Implemented: opt-in `paizo-native-v3` cell-label protection. It preserves
+    v1/v2 output, identifies recurring condensed two-cell labels from
+    page-local geometry, and marks affected sections for mandatory layout
+    review rather than silently creating publicable headings.
+  - Implemented: a parser-run-scoped quad-state screening queue. Parallel cheap
+    workers emit only `add`, `reject`, or `defer` with a bounded reason; deferred
+    records move to a separate senior-model queue. Exact duplicates collapse
+    deterministically, retries are idempotent, escalation provenance is
+    retained, and the private draft remains separate from publication
+    candidates and independent approval.
+  - Implemented: deterministic `licensed-corpus-runner` and claimed-ID-only
+    evidence executable. The supervisor owns fresh five-PDF staging, bounded
+    queue leases, 32-record/64-KiB packing, exact output schemas and ID sets,
+    retries, Spark/Luna/Terra/Sol routing, disjoint producer/reviewer sessions,
+    session rotation, AON title/URL caching, and content-free audit metadata.
+    A bounded pilot mode runs at most one selected-queue batch per catalog
+    product and refuses to screen until the active layout queue is terminal.
+  - Implemented: evidence-driven adjacent layout repair. Only consecutive full
+    groups of two or three may merge; Luna selection requires independent Terra
+    confirmation, the PDF is re-read, native anchors are revalidated exactly,
+    and disagreement or overlap enters `needs-maintainer`. Stitch selection and
+    confirmation use independent database leases, and an explicit bounded local
+    inspection/resolution command is required for a model disagreement. The
+    initial five-book live fixed point applied 46 independently approved unions
+    across four products and then reached zero pending layout work without
+    entering screening.
+  - Implemented: GPU-first PP-DocLayoutV3 evidence as a separate ONNX-only
+    artifact. Raster inference emits boxes/order only, binds them to opaque
+    native-word anchors, and can add bounded review or adjacent-stitch flags
+    without changing the PDF text or coverage inventory. The one-time exporter
+    has an isolated, upgradeable PEP 723 lock because the layout checkpoint
+    needs Transformers 5 while the embedding exporter remains on Transformers 4.
+  - Implemented: audited model-independent base build with zero-unresolved-work,
+    privacy, manifest/hash, provenance, notice, SQLite, and deterministic
+    repeat-build gates. Promotion to the tracked projection is a separate
+    explicit command and never triggers embedding builds or publication.
+  - In progress: parallel review of the five cataloged books, exact bundled
+    project-owned OGL/ORC notices, final tracked projection, qualified
+    licensing/trademark review, retrieval comparison, and the first six-model
+    clean release using Foundry `pf2e-8.4.1`.
+  - Deferred packaging follow-up: make the PKGBUILD's native-PDF/layout tooling
+    lazy or optional rather than eagerly expanding the ordinary query package;
+    do this after the review pipeline is qualified.
+
 - [x] **Supplement Foundry with user-owned rulebook prose**
   - Native no-OCR exporter plus recursive PZO catalog discovery for combined
     PDFs, split PDFs, and chapter ZIPs under the ignored `.local-corpus/` tree.
@@ -21,8 +81,11 @@ Ordered by impact. Check items off as completed.
     files per model. Queries prefer the private file, while pull, auto-download,
     and release tooling can only activate audited clean files. Strict release
     audits reject private rows, stale release/model metadata, or missing
-    provenance markers. Required notices remain a release packaging concern;
-    the database audit does not fabricate a legal-approval marker.
+    provenance markers. Clean Foundry rows are restricted to the five cataloged
+    core publications with explicit OGL/ORC metadata; missing and other
+    publications fail closed. Required notices are embedded and exportable,
+    while legal approval remains a release-process gate rather than a fabricated
+    database marker.
   - Constraint: the parser consumes exporter JSON; it must not invoke a second
     PDF extraction tool or silently substitute OCR.
   - Source identity: preserve original `PZO` PDF basenames and recognize a

@@ -419,7 +419,11 @@ def test_incremental_update_preserves_pages_deletes_orphans_and_rebuilds_fts(
         initialized = True
         conn.executemany(
             "INSERT INTO _meta(key, value) VALUES (?, ?)",
-            [("pf2e_release", "old"), ("total_chunks", "3")],
+            [
+                ("pf2e_release", "old"),
+                ("total_chunks", "3"),
+                ("foundry_scope", "upstream-complete"),
+            ],
         )
         old_chunks = [
             _chunk("journal:entry_page_1", "old page one", "old"),
@@ -483,6 +487,7 @@ def test_incremental_update_preserves_pages_deletes_orphans_and_rebuilds_fts(
         onnx_provider="cpu",
         release="new",
         cache_dir=tmp_path,
+        corpus_scope="local-full",
     )
     pipeline.update_index(settings, _provider=Provider())
 
@@ -614,7 +619,11 @@ def test_ambiguous_ref_tombstone_survives_duplicate_orphan_transition(
     )
     conn.executemany(
         "INSERT INTO _meta VALUES (?, ?)",
-        [("pf2e_release", "old"), ("total_chunks", "2")],
+        [
+            ("pf2e_release", "old"),
+            ("total_chunks", "2"),
+            ("foundry_scope", "upstream-complete"),
+        ],
     )
     for chunk_id, pack in (("pack-a:same-id", "pack-a"), ("pack-b:same-id", "pack-b")):
         conn.execute(
@@ -655,6 +664,7 @@ def test_ambiguous_ref_tombstone_survives_duplicate_orphan_transition(
         onnx_provider="cpu",
         release="new",
         cache_dir=tmp_path,
+        corpus_scope="local-full",
     )
     pipeline.update_index(settings, _provider=Provider())
 
@@ -797,6 +807,7 @@ def test_incremental_update_does_not_treat_corpus_rows_as_foundry_orphans(
         onnx_provider="cpu",
         release="new",
         cache_dir=tmp_path,
+        corpus_scope="local-full",
     )
     index_module.init_db(db_path, 2)
     conn = sqlite3.connect(str(db_path))
@@ -805,7 +816,10 @@ def test_incremental_update_does_not_treat_corpus_rows_as_foundry_orphans(
     pipeline._insert_chunk(
         conn, _source_chunk("corpus:rulebook", origin="corpus"), [1.0, 2.0], settings,
     )
-    conn.execute("INSERT INTO _meta(key, value) VALUES ('pf2e_release', 'old')")
+    conn.executemany(
+        "INSERT INTO _meta(key, value) VALUES (?, ?)",
+        [("pf2e_release", "old"), ("foundry_scope", "upstream-complete")],
+    )
     conn.commit()
     conn.close()
 

@@ -7,6 +7,8 @@ import os
 import re
 from typing import Any
 
+from .foundry_scope import owning_publication
+
 # Load aliases (pre-remaster to remaster name mapping)
 _ALIASES: dict[str, str] | None = None
 
@@ -26,7 +28,7 @@ def _load_aliases() -> dict[str, str]:
 def resolve_alias(name: str) -> str | None:
     """If name has a remaster alias, return the old (pre-remaster) name or None."""
     aliases = _load_aliases()
-    for old_lower, new_name in aliases.items():
+    for _old_lower, new_name in aliases.items():
         if name.lower() == new_name.lower():
             # Found that this is the remaster name — return original old name
             # But aliases are stored old→new, so we need to find new→old
@@ -540,6 +542,7 @@ class ChunkBuilder:
         journal_name = entry.get("name", "")
         pages = entry.get("pages", [])
         chunks = []
+        publication = owning_publication(entry)
         for i, page in enumerate(pages):
             title = page.get("name", f"Page {i + 1}")
             text_content = ""
@@ -569,7 +572,9 @@ class ChunkBuilder:
                 "has_description": bool(plain),
                 "refs": refs,
                 "source_hash": None,
-                "license": entry.get("system", {}).get("publication", {}).get("license", "OGL"),
+                "license": publication.get("license", "NONE"),
+                "remaster": publication.get("remaster"),
+                "publication_title": publication.get("title"),
             })
         return chunks
 
@@ -646,7 +651,7 @@ class ChunkBuilder:
             ref_names = sorted({r["name"] for r in all_refs})
             lines += ["", f"Related: {', '.join(ref_names)}"]
 
-        pub = system.get("publication", {})
+        pub = owning_publication(entry)
         if pub:
             parts = []
             if pub.get("title"):
@@ -675,6 +680,7 @@ class ChunkBuilder:
             "refs": all_refs,
             "license": license_val,
             "remaster": remaster_val,
+            "publication_title": pub.get("title"),
         }
 
     def _add_type_specific_fields(self, lines: list[str], etype: str, system: dict[str, Any]) -> None:

@@ -111,6 +111,18 @@ or would make exploration differ from the shipped extractor. PDF export and
 corpus parsing are intentionally separate: first generate the raw JSON, then
 design and test Paizo-specific parsing against that exact artifact.
 
+The licensed-review path may use `pdf_layout.py` to rasterize pages for
+PP-DocLayoutV3, but only as structural evidence. Its ONNX runtime emits region
+boxes and reading order, never OCR text; bindings contain opaque native anchors.
+Layout evidence may add review/stitch flags but must not alter source text or
+the complete native-word inventory. Automatic inference remains GPU-first and
+must refuse an unavailable requested provider or accidental CPU-only runtime on
+supported GPU hardware. The one-time Torch/Transformers exporter stays in the
+isolated PEP 723 script and lockfile because its Transformers 5 requirements
+conflict with the embedding exporter's current Optimum-ONNX constraint. Upgrade
+that lock periodically, but retain the pinned checkpoint and require ONNX
+validation plus provider/output-parity checks before accepting an upgrade.
+
 Paizo source recognition belongs to that parser stage. Preserve original PDF
 basenames such as `PZO12001E.pdf` and match a small explicit catalog of known
 `PZO` product codes and split-PDF filename patterns. Do not identify products
@@ -130,10 +142,17 @@ mtime. Persisted state may stabilize differently packaged or watermarked copies
 only inside the winning equivalent-content group; it must never pin an older
 same-printing errata revision.
 
-### Purchased corpus is private by default
+### Purchased corpus is private; reviewed licensed mechanics are a separate source
 
-Seed scope defaults to `redistributable`, which excludes every user-owned PDF
-source even when `.local-corpus/` exists. The clean and private scopes use
+Seed scope defaults to `redistributable`, which never reads user-owned PDF
+sources even when `.local-corpus/` exists. Clean seeds merge Foundry with the
+tracked `licensed-core` SQLite projection; that projection contains only
+independently approved functional mechanics plus sanitized product/reprinting,
+page, license, parser, policy, and notice provenance. Its ignored review DB may
+contain complete purchased text, claims, prompts, and AON corroboration, but
+none of those private review fields enter the tracked projection.
+
+The clean and private scopes use
 different files for every model: `pf2e_<model>.db` and
 `pf2e_<model>.local.db`. `local-full` is an explicit seed opt-in and must write
 `distribution_scope=local-full` into the private DB metadata. Corpus sync can
@@ -148,10 +167,105 @@ taint a clean DB in place. A default clean seed and a `local-full` seed may shar
 source inputs and model caches, but never their SQLite file.
 
 Pre-built upload and pull paths must call the distribution audit. Publication
-requires an explicit `redistributable` marker and every owned row to have
-`origin='foundry'`. Pull may accept legacy Foundry-only DBs that predate the
-marker. These guards prevent known private-PDF leakage but do not replace the
-required OGL, ORC, Community Use, attribution, and trademark notices.
+requires an explicit `redistributable` marker; rows may have `origin='foundry'`
+or `origin='licensed-core'`, while `origin='corpus'` and unknown ownership are
+always rejected. Every licensed-core row must match the embedded approved
+section manifest, revision, content hash, policy version, and OGL/ORC notice.
+Pull may accept legacy Foundry-only DBs that predate the marker. These guards
+prevent known private-PDF leakage but do not replace legal review.
+
+Clean Foundry ownership is necessary but not sufficient. New redistributable
+seeds include only entries whose owning publication title is one of Pathfinder
+Core Rulebook, Player Core, GM Core, Monster Core, or Player Core 2 and whose
+entry-level license is OGL or ORC. Resolve ownership from `system.publication`,
+falling back only to `system.details.publication`; never infer it from pack names
+or recursively nested citations. Persist `publication_title` on every Foundry
+chunk. Missing/blank titles and all other products fail closed in clean seeds,
+while local-full retains the upstream-complete Foundry snapshot.
+
+Strict publication audit must recompute the licensed-core IDs, content hashes,
+pages/headings, revision/policy provenance, and notices and match that contract
+to the packaged `licensed_core.sqlite3`. Hashes stored only inside the model DB
+are not a trust anchor. The versioned selection contract lives in
+`data/licensed_core_policy_v1.json`; public submissions require extraction
+metadata and pass the structural email/path/watermark guard before review.
+
+Complete parser runs are staged only through the trusted native-export bridge:
+it recomputes a canonical, watermark-independent word inventory from the raw
+export before segmentation, binds only opaque private anchors, and permits
+only constrained repeated-margin-furniture or printed-page-number ignores.
+Every other source word must occur in exactly one parser section. Do not add a
+caller-supplied inventory/manifest CLI; it would let a parser certify a
+truncated source. Anchors, paths, raw PDF hashes, and watermark data never
+enter the public projection.
+
+Use the quad-state draft screen before asking agents to reconstruct public
+rules. Ordinary screening workers read one claimed private section at a time
+and submit only `ADD`, `REJECT`, or `DEFER` with one bounded reason. `ADD`
+retains a section for later work; it is never a license decision, public
+candidate, approval, or publication authorization. `DEFER` is nonterminal and
+moves the record out of the ordinary queue into a separate escalation queue;
+an escalation worker must resolve it to `ADD` or `REJECT`. Preserve the
+original deferrer, reason, and timestamp after resolution. Screening decisions
+are scoped to an active trusted parser run, identical retries are idempotent,
+terminal conflicts fail, and a noncanonical exact-text duplicate is stored as
+`REJECT` with its canonical section reference. The public builder must continue
+to ignore all screening tables.
+
+The frozen `paizo-native-v1` and exploratory `paizo-native-v2` profiles must
+not change. Opt-in `paizo-native-v3` preserves v2 reading order, but uses a
+page-local x-band model to keep recurring condensed body-sized two-cell labels
+out of heading boundaries. It marks the containing section `table-cell`, which
+is a layout-review gate for public candidates.
+
+When a local-full seed has a complete PDF for a product, suppress the bundled
+licensed-core rows for that product; keep bundled rows for missing products.
+Corpus sync must apply the same rule in both directions. Archives of Nethys is
+review evidence only: a match can corroborate that an entry is public rules
+content, absence proves nothing, and AON text is never copied into the corpus.
+
+### The licensed review runner owns workflow state
+
+`review_runner.py` is the only automated supervisor for the licensed-core
+workflow. Codex workers never schedule work or mutate SQLite. They run through
+schema-constrained noninteractive `codex exec` in an isolated read-only sandbox
+with user configuration ignored. The supervisor validates the exact submitted
+ID set before any mutation, retains content-free attempt/session audit rows,
+and retries transport/schema failures no more than three times.
+
+Worker evidence goes only through `review_evidence.py`. Its claim context fixes
+the allowed section IDs, pre-authorized neighbors, review workspace, and one
+validated clean Foundry DB. It exposes no arbitrary SQL or path argument and
+must never query a preferred/private model DB or load embeddings. AON network
+access remains supervisor-owned, rate-limited, and body-free; cache only
+status/title/URL, and treat no-match/failure as inconclusive.
+
+Keep candidate-producer and reviewer session pools disjoint. Rotate a session
+after four completed batches, 256 KiB of submitted evidence, or any CLI,
+model, prompt, schema, or policy change. Spark screens; Luna classifies and
+reviews ordinary work; Terra extracts mixed mechanics and performs first
+rework; Sol is the one final rework tier. Exhaustion, stitch disagreement, or
+overlapping approved stitch groups must create `needs-maintainer` and block the
+base build. Use `inspect-maintainer` for the bounded private evidence and
+`resolve-maintainer` for the explicit decision; do not put private source text
+in `status`. Repaired runs must reuse only exact unchanged stitch judgments and
+repeat layout discovery/review to a fixed point before any screening begins.
+Exact unchanged stitch identity is the product plus ordered stable section-key
+set, not mutable proposal evidence such as the section offset. Carry both model
+votes and any explicit maintainer resolution; otherwise repaired runs repeatedly
+reopen already resolved interleavings and waste worker quota.
+Use `run --queue QUEUE --pilot` for the mandatory at-most-one-batch-per-product
+live pilots; a screening pilot must refuse to run while active layout work
+remains. Use `run --queue layout --sources PATH` to drain layout review and
+trusted repairs to a fixed point without entering semantic screening. Screening
+rejections remain as private source-scoped decisions and EXCLUDE candidates;
+never delete their source rows merely because the public projection omits them.
+
+The base is not an embedding database. `build-base` produces an ignored,
+model-independent audited sibling with public text and provenance only.
+`promote-base` is a separate explicit maintainer action. Never put Foundry rows,
+vectors, FTS, model names, worker prompts, private paths, or raw PDF hashes in
+the base, and never use it as a mutable template for final model databases.
 
 ### Daemon registration owns one configured data directory
 
@@ -223,7 +337,14 @@ pf2e_codex/
 ├── config.py       # Settings: env vars → TOML file → defaults (Pydantic)
 ├── fetcher.py      # Download json-assets.zip from GitHub releases
 ├── pdf_export.py   # Native PDF words/geometry → versioned ignored JSON
+├── pdf_layout.py   # GPU-first ONNX regions/order bound to opaque native anchors
 ├── corpus.py       # PZO discovery/revision selection + Paizo rulebook parsing
+├── licensed_corpus.py # Ignored review workspace + deterministic public builder
+├── licensed_core.py # Validate/load the bundled reviewed mechanics projection
+├── licensed_policy.py # Tracked mechanics-selection policy and digest
+├── review_runner.py # Deterministic Codex queues, sessions, retries, and base lifecycle
+├── review_evidence.py # Claimed-ID-only read-only local evidence executable
+├── foundry_scope.py # Owning-publication allowlist for clean Foundry rows
 ├── distribution.py # DB seed-scope audit for publication and pull boundaries
 ├── chunker.py      # Parse PF2E JSON → enriched text chunks, UUID resolution, OGL→ORC aliases
 ├── models.py       # Embedding model registry + hardware recommendations
@@ -256,7 +377,10 @@ SearchIndex.search(query) → top-k results
 ## Design Decisions
 
 ### One entry = one chunk
-Each Foundry pack entry becomes one text chunk. Journal entries are split into per-page chunks (essential for core rules retrieval).
+In local-full, each Foundry pack entry becomes one text chunk and journal entries
+are split into pages. Clean seeds first restrict entries by owning core
+publication and declared OGL/ORC license; journals without owning publication
+metadata are excluded.
 
 ### Rules-aware flattening
 `system.rules` arrays are flattened into plain English via 30+ rule-specific flatteners. Examples:
@@ -428,7 +552,7 @@ chunks*.json       # intermediate chunk files
 
 Quick smoke test after changes (requires package installed via PKGBUILD):
 ```bash
-pf2e-codex status                     # should show 28,837 chunks
+pf2e-codex status                     # count depends on clean vs local-full scope
 pf2e-codex search "flat-footed" -k 3   # hybrid search, should return Darting Monkey
 pf2e-codex get "fury-instinct"         # should return full Fury Instinct entry
 pf2e-codex related "off-guard" --direction incoming  # should show feats referencing Off-Guard
@@ -484,8 +608,9 @@ curl -sS -X POST http://127.0.0.1:8080/mcp \
 
 - **URL**: `https://github.com/foundryvtt/pf2e/releases/download/{version}/json-assets.zip`
 - **Contents**: All compendium packs as JSON + `lang/en.json`
-- **Size**: ~34MB zip, ~28,837 chunks after processing
-- **License**: Foundry code Apache 2.0; PF2E content ORC/OGL
+- **Size**: ~34MB zip; upstream-complete and clean-filtered chunk counts differ
+- **License**: Foundry code Apache 2.0; clean PF2E rows require allowlisted
+  owning core publication plus explicit OGL/ORC metadata
 - **Optional local corpus**: user-owned PDFs under `.local-corpus/` (never committed)
 - **Extraction**: native text only via `corpus-export` or automatic `corpus-sync`
 - **Parsing**: `corpus.py` recognizes the built-in PZO catalog, strips watermark-like
@@ -517,14 +642,17 @@ ONNX is auto-detected at runtime. MIGraphX is first priority on AMD.
 For local development (outside PKGBUILD):
 
 ```bash
-# CPU (explicit; never combine with a GPU runtime)
-uv pip install -e ".[cpu]"
-
-# AMD GPU (official AMD repo, ROCm 7.2+)
+# Auto-detect AMD/NVIDIA; CPU only if neither is usable
 make setup-dev
 
-# NVIDIA GPU
-uv pip install -e ".[cuda]"
+# Explicit AMD GPU (official AMD repo, ROCm 7.2+)
+PF2E_DEV_ACCELERATOR=amd make setup-dev
+
+# Explicit NVIDIA GPU
+PF2E_DEV_ACCELERATOR=nvidia make setup-dev
+
+# Explicit CPU fallback
+PF2E_DEV_ACCELERATOR=cpu make setup-dev
 ```
 
 The PKGBUILD auto-detects your GPU at build time and installs only the relevant variant.
@@ -544,6 +672,10 @@ MCP server this happens once at startup.
 ```bash
 # Check status & discover DB
 pf2e-codex status
+
+# Display or export embedded data-license notices
+pf2e-codex licenses
+pf2e-codex licenses --output-dir ./data-licenses
 
 # Build everything from scratch
 pf2e-codex index
@@ -631,3 +763,10 @@ The PKGBUILD also bundles the `corpus` extra: its wrapper uses `python -S`, so
 an Arch `python-pdfplumber` package would not be visible. The extra remains
 optional for ordinary pip/uv installs that only query a Foundry-only database.
 The only system dependency is `python`.
+
+Hatch source distributions use an explicit `only-include` allowlist. Do not
+remove it or rely solely on `.gitignore`: a misconfigured build can traverse
+ignored `.local-corpus/` PDFs/review artifacts or recursively include its own
+`dist/` output. Every packaging check must build into a fresh external staging
+directory, list the archive members, and fail if private/ignored path markers
+or unexpectedly large artifacts appear.

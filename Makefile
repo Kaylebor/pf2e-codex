@@ -105,7 +105,7 @@ test-chunker:
 	$(UV) run pytest tests/test_chunker.py -v
 
 test-integration:
-	$(UV) run pytest tests/test_integration.py -v
+	PF2E_RUN_INTEGRATION=1 $(UV) run pytest tests/test_integration.py -v
 
 # ── Build / install ──
 

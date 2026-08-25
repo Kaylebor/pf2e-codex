@@ -3,6 +3,7 @@
 PF2E rules knowledge base with MCP, CLI, and SDK interfaces.
 
 - **Primary data source**: Official FoundryVTT PF2E system JSON releases (`json-assets.zip`)
+- **Reviewed rules supplement**: Bundled, provenance-rich licensed mechanics from core books
 - **Optional local source**: User-owned rulebook PDFs exported to ignored native-text JSON
 - **Indexing**: Rules-aware chunking + semantic embeddings in sqlite-vec
 - **Interfaces**: MCP server, CLI commands, Python SDK
@@ -59,6 +60,13 @@ pf2e-codex/
 │   ├── fetcher.py         # Download json-assets.zip from GitHub releases
 │   ├── pdf_export.py      # Native PDF words/geometry → versioned local JSON
 │   ├── corpus.py          # PZO discovery, revision choice, and Paizo parsing
+│   ├── licensed_corpus.py # Private swarm review DB + public projection builder
+│   ├── review_runner.py   # Deterministic Codex queue/session supervisor
+│   ├── review_evidence.py # Claimed-ID-only read-only evidence boundary
+│   ├── licensed_core.py   # Validate/load the bundled reviewed projection
+│   ├── licensed_policy.py # Versioned mechanics-selection policy and digest
+│   ├── foundry_scope.py   # Clean owning-publication/license allowlist
+│   ├── distribution.py    # Publication and physical-slot ownership audits
 │   ├── chunker.py         # Rules-aware chunk builder
 │   ├── models.py          # Embedding model registry & recommendations
 │   ├── embeddings.py      # Pluggable embedding providers
@@ -105,12 +113,26 @@ older materially different errata revision.
 
 The native-text exporter runs automatically when its ignored JSON artifact is
 missing or stale. It preserves word coordinates, fonts, sizes, action glyphs,
-image bounds, and a local source SHA-256; OCR and secondary PDF tools are never
-used. The Paizo parser removes repeated page furniture and watermark-like email
-text, reconstructs reading order, and emits stable page/heading-anchored rule
+image bounds, and a local source SHA-256. The PDF's selectable words are always
+the authoritative text; OCR and image-to-text conversion are never used. The
+Paizo parser removes repeated page furniture and watermark-like email text,
+reconstructs reading order, and emits stable page/heading-anchored rule
 sections. A watermark-independent normalized fingerprint identifies actual
 rules content, while the raw hash is used only to detect changes to that local
 file.
+
+The normal local-full flow remains pinned to the frozen `paizo-native-v1`
+profile. Staged review runs may explicitly use `paizo-native-v2` or
+`paizo-native-v3`; v3 keeps v2 reading order but marks recurring condensed
+two-cell labels as `table-cell` rather than treating them as headings. That
+flag requires layout-aware review before a public candidate can be accepted.
+The licensed-review runner additionally rasterizes pages for an ONNX-only
+PP-DocLayoutV3 pass. Its separate private artifact contains boxes and reading
+order, not recognized text. Those regions bind back to opaque native-word
+anchors and may add review/stitch flags, but cannot replace, rewrite, omit, or
+certify the native text inventory. Automatic provider selection is GPU-first
+and refuses an accidental CPU-only runtime on supported GPU hardware; CPU is
+available only on hardware without a supported GPU or by explicit request.
 
 For a manual pip/uv installation, install the optional extraction dependency.
 The Arch package already includes it. Then inspect discovery and build or
@@ -118,8 +140,10 @@ refresh the corpus:
 
 ```bash
 uv pip install -e ".[corpus]"
+uv run --script scripts/export-layout-model.py  # one-time pinned ONNX export
 pf2e-codex corpus-status
-pf2e-codex index                              # clean Foundry-only DB
+pf2e-codex corpus-layout-export BOOK.pdf .local-corpus/layout/check.json
+pf2e-codex index                              # licensed core-Foundry subset + reviewed-core DB
 pf2e-codex index --corpus-scope local-full   # separate private complete DB
 pf2e-codex corpus-sync                       # refreshes only the private DB
 ```
@@ -138,12 +162,139 @@ only mutate the private slot, while pull, automatic download, and release
 tooling can only activate an audited clean artifact.
 
 Full seeds default to `--corpus-scope redistributable`, which selects the clean
-slot and excludes all purchased PDFs even when `.local-corpus/` exists.
-`pf2e-codex audit-db DB --strict` requires the explicit redistributable seed
-marker, exclusively Foundry-owned rows, and any requested release/model
-provenance. This is a technical fail-closed boundary, not a blanket legal
-conclusion; an uploaded release must still carry the notices required by its
-source licenses and policies.
+slot and never reads purchased PDFs even when `.local-corpus/` exists. It merges
+only Foundry entries whose owning publication is one of the five cataloged core
+rulebooks and whose entry declares OGL/ORC, plus the bundled `licensed-core`
+projection. Owning publication comes from `system.publication`, with
+`system.details.publication` as the sole fallback; pack names and nested source
+citations never grant clean-seed eligibility. Missing/blank publications,
+journals, adventures, PFS, Lost Omens, and other products fail closed. The
+reviewed projection contains only mechanics text that passed an independent
+private review, with product/reprinting,
+page, license, parser, policy, content-hash, and notice provenance. The complete
+private PDF text never enters the package or clean database. A local-full seed
+suppresses bundled rows product-by-product when the corresponding complete PDF
+is present, avoiding duplicate results, and restores them if that local product
+is later removed.
+
+`pf2e-codex audit-db DB --strict` requires the explicit redistributable and
+core-publication markers, rejects private/unknown/out-of-scope Foundry rows,
+recomputes the complete licensed-core contract, and compares it with the
+packaged trusted projection. The contract covers IDs, text hashes, pages,
+headings, revision/policy provenance, and notices. Use `pf2e-codex licenses` to
+display embedded notices or `--output-dir` to export them. This is a technical
+fail-closed boundary, not legal advice.
+
+The ignored review workspace is a WAL-mode SQLite database with atomic leases
+and a deterministic supervisor. `scripts/licensed-corpus-runner.py` owns PDF
+discovery, queue scheduling, prompt evidence, bounded retries, session rotation,
+exact-ID/schema validation, and every database mutation. Schema-constrained
+`codex exec` workers make semantic judgments only. They run in an isolated
+read-only sandbox with user configuration ignored and can inspect only their
+claimed IDs through `scripts/licensed-corpus-evidence.py`; no worker-controlled
+network or SQLite write path exists.
+
+The five source products have explicit, independent era metadata: `PZO2101` is
+legacy/pre-Remaster, while `PZO12001` through `PZO12004` are the current
+post-Remaster set. License never determines era. `prepare` stages all five
+selected combined PDFs through `paizo-native-v3` plus a source-bound layout
+artifact in a fresh sibling workspace. One GPU session is reused across all
+five books. It validates complete native-anchor coverage and replaces the
+obsolete workspace only after all five runs pass. Deterministic adjacent-section stitch proposals
+permit only complete groups of two or three; Luna selection needs independent
+Terra confirmation, and any disagreement or overlapping approved group fails
+closed as `needs-maintainer`. After a repair, exact unchanged no-merge decisions
+carry into the sibling parser run and layout review repeats to a fixed point
+before screening may begin.
+
+```bash
+# These admin artifacts remain below ignored .local-corpus/ paths.
+scripts/licensed-corpus-runner.py prepare \
+  .local-corpus/licensed-review.sqlite3 .local-corpus/sources
+scripts/licensed-corpus-runner.py status .local-corpus/licensed-review.sqlite3
+# If status reports a disagreement, inspect it locally and resolve explicitly:
+# scripts/licensed-corpus-runner.py inspect-maintainer WORKSPACE ITEM_ID --include-text
+# scripts/licensed-corpus-runner.py resolve-maintainer WORKSPACE ITEM_ID no-merge
+# Qualify one Luna selection batch and one Terra confirmation batch per book.
+scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
+  --queue stitch-select --pilot
+scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
+  --queue stitch-confirm --pilot
+# Drain layout review/repairs to a fixed point, then stop before screening.
+scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
+  --queue layout --sources .local-corpus/sources
+# After layout review is terminal, screen one batch from each of the five books.
+scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
+  --queue screen --pilot
+scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
+  --sources .local-corpus/sources --foundry-database /path/to/validated-clean.db
+scripts/licensed-corpus-runner.py verify \
+  .local-corpus/licensed-review.sqlite3 --complete
+scripts/licensed-corpus-runner.py build-base \
+  .local-corpus/licensed-review.sqlite3 \
+  .local-corpus/licensed_core.sqlite3 /path/to/reviewed-notices.json
+```
+
+Bulk screening uses Spark; Luna handles ordinary classification and review;
+Terra handles mixed mechanics extraction, difficult review, and first rework;
+Sol is reserved for one final rework. Sessions are disjoint between producers
+and reviewers and rotate after four batches, 256 KiB of evidence, or any
+model/prompt/schema/policy/CLI change. AON searches run outside Codex through a
+rate-limited cache and retain only status, title, and URL; no match or failure
+is inconclusive. Pilot mode processes at most one selected-queue batch per
+catalog product and refuses to screen while the active parser run has unresolved
+stitch work.
+Rejected screening records remain in the private workspace with their source
+section, decision, and provenance. They are excluded from the public projection,
+not deleted; activating a reparsed source creates a fresh screening scope while
+retaining the retired run for audit or later reconsideration.
+`build-base` stops at a validated, model-independent ignored
+SQLite artifact. `promote-base` is a separate explicit command; embedding DB
+builds, commits, pushes, and releases are later operations.
+
+Only the deterministic approved projection is tracked and bundled. Raw
+sections, prompts, decisions, rejected candidates, local paths, file hashes,
+native-word anchors, and watermark-derived data remain private. Complete parser
+runs still enter only through the direct-PDF bridge: cached JSON exports,
+caller-supplied inventories, and caller-supplied completeness manifests are
+intentionally not accepted.
+
+Before the expensive candidate-writing pass, a quad-state private screen can reduce
+the workload without generating rewritten rules. A screening worker claims a
+batch, reads exactly one parsed section at a time, and records `add`, `reject`,
+or a bounded `defer` reason:
+
+```bash
+scripts/licensed-corpus.py screen-status WORKSPACE
+scripts/licensed-corpus.py screen-claim WORKSPACE WORKER --product-code PZO12001
+scripts/licensed-corpus.py screen-next WORKSPACE SHARD_ID WORKER
+scripts/licensed-corpus.py screen-step WORKSPACE SHARD_ID WORKER INDEX add
+scripts/licensed-corpus.py screen-step WORKSPACE SHARD_ID WORKER INDEX defer \
+  --defer-reason complex-rule
+scripts/licensed-corpus.py screen-claim WORKSPACE SENIOR --queue deferred
+scripts/licensed-corpus.py screen-release WORKSPACE SHARD_ID WORKER
+```
+
+Decisions are scoped to the active trusted parser run. Identical retries are
+no-ops, conflicting retries fail, and exact duplicate source text has one
+deterministic canonical section; a requested `add` for another copy is stored
+as a duplicate rejection. `screen-next` skips already decided records when a
+batch resumes, while `screen-step` returns the next eligible record along with
+the persisted result, avoiding a second CLI launch per section. Screening
+`add` means only "retain in the private draft." It never creates a public
+candidate, satisfies independent review, or authorizes inclusion in the
+bundled projection. Deferred sections leave the ordinary queue and enter a
+separate escalation queue; the resolving worker must choose `add` or `reject`.
+The original worker, bounded reason, and timestamp remain recorded after
+resolution. Terminal decisions cannot be changed without an explicit future
+invalidation or policy migration.
+
+The exact selection contract is tracked as
+`pf2e_codex/data/licensed_core_policy_v1.json`. Public candidate text must have
+an extraction method and reason tags and is rejected if it contains obvious
+email, watermark, control-character, or local-path material. Clear review
+aliases distinguish `APPROVE_PUBLIC` from `CONFIRM_EXCLUSION`; both still
+require a separately claimed reviewer.
 
 Foundry and corpus rows have explicit ownership, so Foundry incremental updates
 cannot remove PDF-derived rules. Legacy and Remaster books coexist; default
@@ -169,6 +320,7 @@ corpus_prefer = { PZO12001 = "preferred-copy/PZO12001E.pdf" }
 | `pf2e-codex fetch` | Download json-assets.zip |
 | `pf2e-codex build` | Build enriched chunks (JSON output) |
 | `pf2e-codex corpus-export PDF JSON` | Export native PDF words/geometry without OCR |
+| `pf2e-codex corpus-layout-export PDF JSON` | Export private ONNX regions/order without recognizing text |
 | `pf2e-codex corpus-status` | Show discovered products and persisted revision choices |
 | `pf2e-codex corpus-sync` | Export, parse, and atomically refresh the private DB |
 | `pf2e-codex audit-db DB --strict` | Reject private/unmarked DBs before publication |
@@ -246,7 +398,7 @@ Create `~/.config/pf2e-codex/config.toml`:
 
 ```toml
 model = "snowflake-arctic-embed-s"
-release = "pf2e-8.2.0"
+release = "pf2e-8.4.1"
 ```
 
 Or use a project-local `pf2e-codex.toml` (gitignored by default).
@@ -259,8 +411,8 @@ Or use a project-local `pf2e-codex.toml` (gitignored by default).
 | `PF2E_DATA_DIR` | `~/.local/share/pf2e-codex` | Data directory |
 | `PF2E_MODEL` | `Snowflake/snowflake-arctic-embed-xs` | Embedding model |
 | `PF2E_PROVIDER` | `auto` | Embedding provider selection |
-| `PF2E_QUERY_PROVIDER` | `cpu` | ONNX provider for daemon queries |
-| `PF2E_RELEASE` | `pf2e-8.2.0` | PF2E system version |
+| `PF2E_QUERY_PROVIDER` | `auto` | GPU-first ONNX provider for daemon queries; `cpu` is an explicit fallback |
+| `PF2E_RELEASE` | `pf2e-8.4.1` | PF2E system version |
 
 ## MCP Tools
 
@@ -486,7 +638,12 @@ pf2e-codex mcp -t streamable-http --host 0.0.0.0 --port 8080
 ## Legal
 
 - Code: MIT (this repo)
-- Purchased-PDF derivatives: local-only and never included in pre-built DB releases
-- Foundry-derived releases: must retain applicable OGL/ORC/Paizo notices; the
-  distribution audit prevents private-corpus leakage but is not legal advice
-- No pre-computed embeddings or PF2E data shipped
+- Complete purchased-PDF exports and parses: local-only and never released
+- Reviewed core mechanics: redistributed only through the sanitized,
+  independently approved `licensed-core` projection with per-row OGL/ORC
+  provenance and notices
+- Foundry and licensed-core database releases retain applicable OGL/ORC/Paizo
+  notices; the distribution audit prevents known private-corpus leakage but is
+  not legal advice
+- The public clean seed includes only allowlisted core-publication Foundry rows;
+  the local-full seed retains the upstream-complete Foundry data privately

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from .model_manager import ModelManager
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 _CHUNK_PROVENANCE_COLUMNS = {
@@ -24,6 +24,7 @@ _CHUNK_PROVENANCE_COLUMNS = {
     "source_page_end": "INTEGER",
     "printed_page": "TEXT",
     "section_hash": "TEXT",
+    "publication_title": "TEXT",
 }
 
 
@@ -68,7 +69,8 @@ def init_db(db_path: Path, dim: int) -> None:
             source_page_start INTEGER,
             source_page_end INTEGER,
             printed_page TEXT,
-            section_hash TEXT
+            section_hash TEXT,
+            publication_title TEXT
         )
     """)
     conn.execute(f"""
@@ -143,6 +145,70 @@ def migrate_db(conn) -> None:
         WHERE EXISTS (
             SELECT 1 FROM chunks WHERE source_id = 'foundry:legacy'
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS license_notices (
+            notice_key TEXT PRIMARY KEY,
+            license TEXT NOT NULL,
+            text TEXT NOT NULL,
+            content_hash TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS licensed_revisions (
+            product_code TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            license TEXT NOT NULL,
+            era TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            source_schema_version TEXT,
+            printing_revision TEXT,
+            policy_versions TEXT NOT NULL,
+            PRIMARY KEY (product_code, content_fingerprint)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS licensed_sections (
+            public_id TEXT PRIMARY KEY,
+            product_code TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            source_section_id TEXT NOT NULL,
+            source_section_hash TEXT NOT NULL,
+            page_start INTEGER,
+            page_end INTEGER,
+            printed_page TEXT,
+            heading TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            license TEXT NOT NULL,
+            era TEXT NOT NULL,
+            extraction_method TEXT,
+            policy_version TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            printing_revision TEXT,
+            notice_key TEXT NOT NULL
+        )
+    """)
+    licensed_existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(licensed_sections)")
+    }
+    for name, declaration in {
+        "page_start": "INTEGER",
+        "page_end": "INTEGER",
+        "printed_page": "TEXT",
+        "heading": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if name not in licensed_existing:
+            conn.execute(f"ALTER TABLE licensed_sections ADD COLUMN {name} {declaration}")
+    licensed_revision_existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(licensed_revisions)")
+    }
+    if "printing_revision" not in licensed_revision_existing:
+        conn.execute("ALTER TABLE licensed_revisions ADD COLUMN printing_revision TEXT")
+    if "printing_revision" not in licensed_existing:
+        conn.execute("ALTER TABLE licensed_sections ADD COLUMN printing_revision TEXT")
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS licensed_sections_by_revision
+        ON licensed_sections(product_code, content_fingerprint)
     """)
     conn.execute(
         "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
@@ -353,6 +419,7 @@ def _chunk_result(row: tuple) -> dict:
             "source": row[11], "product": row[12], "revision": row[13],
             "parser": row[14], "license": row[15], "era": row[16],
             "provenance": _decode_json_object(row[17]),
+            "publication_title": row[18],
         },
     }
 
@@ -373,6 +440,7 @@ _FETCH_CHUNK_COLUMNS = """
            chunks.source_page_end, chunks.printed_page, chunks.section_hash,
            sources.source, sources.product, sources.revision, sources.parser,
            sources.license, sources.era, sources.provenance
+           ,chunks.publication_title
     FROM chunks LEFT JOIN sources ON sources.source_id = chunks.source_id
 """
 
@@ -383,7 +451,7 @@ _FETCH_LEGACY_CHUNK_COLUMNS = """
            chunks.license,
            CASE WHEN chunks.remaster = 1 THEN 'remaster'
                 WHEN chunks.remaster = 0 THEN 'legacy' ELSE 'unknown' END,
-           NULL
+           NULL, NULL
     FROM chunks
 """
 
@@ -762,7 +830,7 @@ class SearchIndex:
                        chunks.printed_page, chunks.section_hash,
                        sources.source, sources.product, sources.revision,
                        sources.parser, sources.license, sources.era,
-                       sources.provenance
+                       sources.provenance, chunks.publication_title
                 FROM chunks LEFT JOIN sources ON sources.source_id = chunks.source_id
                 WHERE chunks.id IN ({placeholders})
             """, ids).fetchall()
@@ -774,6 +842,7 @@ class SearchIndex:
                 "source": row[7], "product": row[8], "revision": row[9],
                 "parser": row[10], "license": row[11], "era": row[12],
                 "provenance": _decode_json_object(row[13]),
+                "publication_title": row[14],
             }
             for row in provenance_rows
         }
@@ -855,6 +924,7 @@ class SearchIndex:
                     else "unknown"
                 ),
                 "provenance": None,
+                "publication_title": None,
             })
             incoming: list[dict] = []
             seen_sources: set[str] = set()

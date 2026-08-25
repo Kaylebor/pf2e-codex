@@ -556,6 +556,56 @@ def corpus_status(
         )
 
 
+@app.command("corpus-layout-export")
+def corpus_layout_export(
+    source: Path = typer.Argument(..., help="Local born-digital rulebook PDF"),
+    output: Path = typer.Argument(..., help="Destination private layout JSON artifact"),
+    model_dir: Path | None = typer.Option(
+        None,
+        "--model-dir",
+        help="Validated ONNX layout-model directory (defaults to the user cache)",
+    ),
+    first_page: int = typer.Option(1, "--first-page", help="First physical PDF page (1-based)"),
+    last_page: int | None = typer.Option(
+        None, "--last-page", help="Last physical PDF page (inclusive)"
+    ),
+    provider: str = typer.Option(
+        "auto",
+        "--provider",
+        help="ONNX provider: auto, migraphx, rocm, cuda, or explicit cpu fallback",
+    ),
+    force: bool = typer.Option(False, "--force", help="Replace an existing output artifact"),
+) -> None:
+    """Export GPU-derived regions/order; native PDF text remains authoritative."""
+    from .pdf_layout import (
+        DEFAULT_LAYOUT_MODEL_DIR,
+        PdfLayoutDependencyError,
+        export_pdf_layout,
+    )
+
+    if provider not in {"auto", "migraphx", "rocm", "cuda", "cpu"}:
+        typer.echo(f"Error: unsupported ONNX provider: {provider}", err=True)
+        raise typer.Exit(1)
+    try:
+        summary = export_pdf_layout(
+            source,
+            output,
+            model_dir=model_dir or DEFAULT_LAYOUT_MODEL_DIR,
+            first_page=first_page,
+            last_page=last_page,
+            overwrite=force,
+            force_provider=provider,
+        )
+    except (FileNotFoundError, FileExistsError, RuntimeError, ValueError, PdfLayoutDependencyError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(
+        f"Exported layout for {summary.exported_pages}/{summary.source_pages} pages "
+        f"({summary.regions:,} regions, {summary.provider}) -> {summary.output_path}"
+    )
+
+
 @app.command("corpus-sync")
 def corpus_sync(
     corpus_dir: Path | None = typer.Option(
@@ -597,7 +647,7 @@ def embed(
     update: bool = typer.Option(False, "--update", "-u", help="Incremental update existing DBs instead of skipping"),
     rebuild: bool = typer.Option(False, "--rebuild", "-f", help="Rebuild existing DBs from scratch (for chunker changes)"),
     latest: bool = typer.Option(False, "--latest", "-l", help="Fetch and update to the latest PF2E release from GitHub"),
-    release: str | None = typer.Option(None, "--release", "-r", help="Specific PF2E release version (e.g. pf2e-8.4.0)"),
+    release: str | None = typer.Option(None, "--release", "-r", help="Specific PF2E release version (e.g. pf2e-8.4.1)"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
     corpus_scope: CorpusScope = typer.Option(
         CorpusScope.REDISTRIBUTABLE,
@@ -751,8 +801,66 @@ def audit_db(
     marker = audit.scope or "legacy Foundry-only"
     typer.echo(
         f"Clean ownership and provenance audit passed ({marker}). "
-        "Release packaging must still include all required source notices."
+        "Embedded source notices are available through `pf2e-codex licenses`."
     )
+
+
+@app.command("licenses")
+def licenses_command(
+    model: str | None = typer.Option(None, "--model", "-m", help="Embedding model"),
+    data_dir: str | None = typer.Option(None, "--data-dir", help="Data directory"),
+    database_scope: DatabaseScope = typer.Option(
+        DatabaseScope.AUTO,
+        "--db-scope",
+        help="auto prefers the private DB; clean/local force one slot",
+    ),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        help="Export each embedded notice as a UTF-8 text file",
+    ),
+) -> None:
+    """Display or export the OGL/ORC notices embedded in an indexed database."""
+    import sqlite3
+
+    from .distribution import audit_database_slot
+
+    settings = _settings(
+        data_dir=data_dir,
+        model=model,
+        database_scope=database_scope,
+    )
+    if not settings.db.is_file():
+        typer.echo(f"Error: database not found: {settings.db}", err=True)
+        raise typer.Exit(1)
+    expected_scope = (
+        "local" if settings.resolved_database_scope is DatabaseScope.LOCAL else "clean"
+    )
+    try:
+        audit_database_slot(settings.db, expected_scope)
+        conn = sqlite3.connect(f"file:{settings.db.resolve()}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT notice_key, license, text FROM license_notices ORDER BY notice_key"
+            ).fetchall()
+        finally:
+            conn.close()
+    except (RuntimeError, sqlite3.DatabaseError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if not rows:
+        typer.echo("No embedded data-license notices were found.", err=True)
+        raise typer.Exit(1)
+    if output_dir is not None:
+        target = output_dir.expanduser().resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        for notice_key, _license, text in rows:
+            (target / f"{notice_key}.txt").write_text(str(text) + "\n", encoding="utf-8")
+        typer.echo(f"Exported {len(rows)} notices to {target}")
+        return
+    for notice_key, license_name, notice_text in rows:
+        typer.echo(f"===== {notice_key} ({license_name}) =====")
+        typer.echo(str(notice_text))
 
 
 @app.command()
@@ -761,7 +869,7 @@ def pull(
     models: str | None = typer.Option(None, "--models", help="Comma-separated list of models"),
     all_models: bool = typer.Option(False, "--all", help="Download all available pre-built DBs"),
     data_dir: str | None = typer.Option(None, "--data-dir", help="Target data directory (default: user dir)"),
-    release: str | None = typer.Option(None, "--release", help="PF2E release version (e.g. 'pf2e-8.4.0')"),
+    release: str | None = typer.Option(None, "--release", help="PF2E release version (e.g. 'pf2e-8.4.1')"),
 ) -> None:
     """Download pre-built embedding databases from GitHub Releases.
 
@@ -814,12 +922,12 @@ def pull(
         if dest.exists():
             from .distribution import (
                 audit_database_slot,
-                audit_redistributable_database,
+                audit_downloadable_database,
             )
 
             try:
                 audit_database_slot(dest, "clean")
-                audit_redistributable_database(
+                audit_downloadable_database(
                     dest,
                     expected_release=rel,
                     expected_model=m,
@@ -849,11 +957,11 @@ def pull(
             _req.urlretrieve(url, temporary)
             from .distribution import (
                 audit_database_slot,
-                audit_redistributable_database,
+                audit_downloadable_database,
             )
 
             audit_database_slot(temporary, "clean")
-            audit_redistributable_database(
+            audit_downloadable_database(
                 temporary,
                 expected_release=rel,
                 expected_model=m,
