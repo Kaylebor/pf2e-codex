@@ -11,6 +11,9 @@ chunks_v2.json
 dist/
 *.egg-info/
 # Generated data
+licensed_core*.sqlite3
+licensed-core*.sqlite3
+!pf2e_codex/data/licensed_core.sqlite3
 # IDE
 .idea/
 # makepkg artifacts (srcdir = src/ — NOW safe for makepkg -C!)
