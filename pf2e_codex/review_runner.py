@@ -28,7 +28,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from .corpus import PRODUCT_CATALOG, CorpusSource, discover_sources, select_revisions
+from .corpus import (
+    PAIZO_NATIVE_PARSER_V4,
+    PRODUCT_CATALOG,
+    CorpusSource,
+    discover_sources,
+    select_revisions,
+)
+from .corpus_quality import audit_workspace, compare_quality, validate_quality
 from .licensed_core import licensed_core_digest, load_licensed_core
 from .licensed_corpus import (
     REVIEW_SCHEMA_VERSION,
@@ -44,6 +51,7 @@ from .licensed_corpus import (
     read_claimed_shard,
     reclaim_interrupted_shard,
     release_draft_screening_batch,
+    reopen_draft_screening,
     stage_trusted_native_pdf,
     stage_trusted_native_pdf_with_approved_stitches,
     submit_candidate,
@@ -751,16 +759,41 @@ def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -
     }
 
 
+def quality_workspace(
+    workspace: Path | str,
+    *,
+    parser_run_ids: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Return a deterministic content-free parser quality report."""
+    path = Path(workspace).expanduser().resolve()
+    _ensure_workspace_migrated(path)
+    return audit_workspace(path, parser_run_ids=parser_run_ids).as_dict()
+
+
+def compare_workspace_quality(
+    workspace: Path | str,
+    *,
+    baseline_parser_run_ids: Mapping[str, str],
+    candidate_parser_run_ids: Mapping[str, str],
+) -> dict[str, object]:
+    """Compare two complete product run selections inside one private workspace."""
+    path = Path(workspace).expanduser().resolve()
+    _ensure_workspace_migrated(path)
+    baseline = audit_workspace(path, parser_run_ids=baseline_parser_run_ids)
+    candidate = audit_workspace(path, parser_run_ids=candidate_parser_run_ids)
+    return compare_quality(baseline, candidate).as_dict()
+
+
 def prepare_workspace(
     workspace: Path | str,
     sources_root: Path | str,
     *,
-    parser_version: str = "paizo-native-v3",
+    parser_version: str = PAIZO_NATIVE_PARSER_V4,
     shard_size: int = MAX_BATCH_RECORDS,
     layout_model_dir: Path | str | None = None,
     layout_provider: str | None = None,
 ) -> dict[str, Any]:
-    """Build and validate a fresh five-product sibling, then activate it."""
+    """Build a validated sibling while carrying forward exact reviewed work."""
     target = Path(workspace).expanduser().resolve()
     sources_path = Path(sources_root).expanduser().resolve()
     found = discover_sources(sources_path, include=EXPECTED_PRODUCTS)
@@ -773,9 +806,29 @@ def prepare_workspace(
     sibling = target.with_name(f".{target.name}.rebuild-{os.getpid()}")
     if sibling.exists():
         raise FileExistsError(f"staging workspace already exists: {sibling}")
-    initialize_trusted_workspace(sibling)
+    baseline_runs: dict[str, str] = {}
+    if target.exists():
+        source_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=30)
+        destination_conn = sqlite3.connect(sibling, timeout=30)
+        try:
+            source_conn.backup(destination_conn)
+        finally:
+            destination_conn.close()
+            source_conn.close()
+        _ensure_workspace_migrated(sibling)
+        with _connect(sibling, readonly=True) as conn:
+            baseline_runs = {
+                str(row["product_code"]): str(row["parser_run_id"])
+                for row in conn.execute(
+                    """SELECT product_code, parser_run_id FROM parser_runs
+                       WHERE state='active' AND review_enabled=1 ORDER BY product_code"""
+                )
+            }
+    else:
+        initialize_trusted_workspace(sibling)
     try:
         staged = []
+        candidate_runs: dict[str, str] = {}
         layout_analyzer = None
         for product_code in EXPECTED_PRODUCTS:
             revision = by_product[product_code]
@@ -807,6 +860,7 @@ def prepare_workspace(
                 layout_artifact=layout_artifact,
             )
             activate_parser_run(sibling, str(result["parser_run_id"]))
+            candidate_runs[product_code] = str(result["parser_run_id"])
             with _connect(sibling, readonly=True) as conn:
                 section_count = int(conn.execute(
                     "SELECT COUNT(*) FROM source_sections WHERE parser_run_id=?",
@@ -816,6 +870,31 @@ def prepare_workspace(
         verification = verify_workspace(sibling)
         if not verification["ok"]:
             raise ValueError("fresh trusted workspace failed validation: " + ", ".join(verification["errors"]))
+        quality = audit_workspace(sibling, parser_run_ids=candidate_runs)
+        absolute_quality = validate_quality(quality)
+        if not absolute_quality["passed"]:
+            failed = sorted(
+                name
+                for name, passed in absolute_quality["checks"].items()
+                if not passed
+            )
+            raise ValueError(
+                "candidate parser failed the absolute quality gates: "
+                + ", ".join(failed)
+            )
+        comparison: dict[str, object] | None = None
+        if baseline_runs:
+            if set(baseline_runs) != set(candidate_runs):
+                raise ValueError("carry-forward workspace does not contain the complete five-product baseline")
+            baseline_quality = audit_workspace(sibling, parser_run_ids=baseline_runs)
+            compared = compare_quality(baseline_quality, quality)
+            comparison = compared.as_dict()
+            if not compared.passed:
+                failed = _failed_comparison_gates(comparison["gates"])
+                raise ValueError(
+                    "candidate parser failed the deterministic quality gates: "
+                    + ", ".join(failed)
+                )
         with _connect(sibling) as checkpoint_conn:
             checkpoint_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         journal_conn = sqlite3.connect(sibling, timeout=30)
@@ -824,12 +903,39 @@ def prepare_workspace(
         os.replace(sibling, target)
         for suffix in ("-wal", "-shm"):
             Path(str(target) + suffix).unlink(missing_ok=True)
-        return {"workspace": target.name, "products": staged, "verification": verification}
+        return {
+            "workspace": target.name,
+            "products": staged,
+            "verification": verification,
+            "quality": quality.as_dict(),
+            "comparison": comparison,
+            "carried_forward": bool(baseline_runs),
+        }
     except BaseException:
         sibling.unlink(missing_ok=True)
         Path(str(sibling) + "-wal").unlink(missing_ok=True)
         Path(str(sibling) + "-shm").unlink(missing_ok=True)
         raise
+
+
+def _failed_comparison_gates(gates: Mapping[str, object]) -> list[str]:
+    """Return content-free leaf paths for failed comparison gates."""
+    failed: list[str] = []
+    for name, value in sorted(gates.items()):
+        if isinstance(value, Mapping):
+            if "passed" in value:
+                if value["passed"] is not True:
+                    failed.append(name)
+                continue
+            for child, child_value in sorted(value.items()):
+                if isinstance(child_value, Mapping) and "passed" in child_value:
+                    if child_value["passed"] is not True:
+                        failed.append(f"{name}.{child}")
+                elif child_value is not True:
+                    failed.append(f"{name}.{child}")
+        elif value is not True:
+            failed.append(name)
+    return failed
 
 
 def generate_stitch_candidates(workspace: Path | str) -> dict[str, int]:
@@ -1133,10 +1239,11 @@ def refresh_aon_cache(
     and cannot reject a section.
     """
     path = Path(workspace).expanduser().resolve()
+    _ensure_workspace_migrated(path)
     with _connect(path, readonly=True) as conn:
         headings = [
             str(row[0]) for row in conn.execute(
-                """SELECT DISTINCT s.heading FROM draft_screening_decisions AS d
+                """SELECT DISTINCT s.heading FROM draft_screening_current AS d
                    JOIN source_sections AS s ON s.section_key=d.section_key
                    JOIN parser_runs AS p ON p.parser_run_id=d.parser_run_id
                    WHERE p.state='active' AND p.review_enabled=1
@@ -1191,6 +1298,22 @@ def refresh_aon_cache(
         if index + 1 < len(queries) and interval_seconds > 0:
             pause(interval_seconds)
     return counts
+
+
+def reopen_screening(
+    workspace: Path | str,
+    section_key: str,
+    *,
+    reason: str,
+    maintainer: str = "maintainer",
+) -> dict[str, object]:
+    """Explicitly reopen one screening result for maintainer re-review."""
+    return reopen_draft_screening(
+        workspace,
+        section_key,
+        maintainer=maintainer,
+        reason=reason,
+    )
 
 
 def runner_status(workspace: Path | str) -> dict[str, Any]:
@@ -1302,7 +1425,7 @@ def _candidate_records(workspace: Path, shard_id: int, worker: str) -> list[dict
                 continue
             screen = conn.execute(
                 """SELECT d.decision, d.defer_reason, rejection.reason AS reject_reason
-                   FROM draft_screening_decisions AS d
+                   FROM draft_screening_current AS d
                    JOIN source_sections AS s ON s.section_key=d.section_key
                    LEFT JOIN runner_screen_rejections AS rejection
                      ON rejection.section_key=d.section_key
@@ -1336,7 +1459,7 @@ def _process_screen(
             )
             row = conn.execute(
                 f"""SELECT s.shard_id FROM source_sections AS s
-                    JOIN draft_screening_decisions AS d
+                    JOIN draft_screening_current AS d
                       ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
                     JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
                     WHERE p.state='active' AND p.review_enabled=1 AND d.decision='DEFER'
@@ -1364,7 +1487,7 @@ def _process_screen(
                         AS luna_attempted
                FROM source_sections AS s
                JOIN source_revisions AS r USING(product_code, content_fingerprint)
-               LEFT JOIN draft_screening_decisions AS d
+               LEFT JOIN draft_screening_current AS d
                  ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
                WHERE s.shard_id=?
                ORDER BY s.source_section_id""",
@@ -1479,7 +1602,7 @@ def _process_candidates(workspace: Path, slot: int, foundry_db: Path | None, exe
         unresolved_screen = conn.execute(
             """SELECT 1 FROM source_sections AS s
                JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
-               LEFT JOIN draft_screening_decisions AS d
+               LEFT JOIN draft_screening_current AS d
                  ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
                WHERE p.state='active' AND p.review_enabled=1
                  AND (d.section_key IS NULL OR d.decision='DEFER') LIMIT 1"""
@@ -2278,11 +2401,14 @@ __all__ = [
     "RUNNER_VERSION",
     "SCHEMAS",
     "build_base",
+    "compare_workspace_quality",
     "generate_stitch_candidates",
     "maintainer_item_evidence",
     "pack_batches",
     "prepare_workspace",
     "promote_base",
+    "quality_workspace",
+    "reopen_screening",
     "refresh_aon_cache",
     "resolve_maintainer_item",
     "run_codex_batch",

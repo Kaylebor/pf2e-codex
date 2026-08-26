@@ -60,6 +60,7 @@ pf2e-codex/
 │   ├── fetcher.py         # Download json-assets.zip from GitHub releases
 │   ├── pdf_export.py      # Native PDF words/geometry → versioned local JSON
 │   ├── corpus.py          # PZO discovery, revision choice, and Paizo parsing
+│   ├── corpus_quality.py  # Content-free parser audits and acceptance gates
 │   ├── licensed_corpus.py # Private swarm review DB + public projection builder
 │   ├── review_runner.py   # Deterministic Codex queue/session supervisor
 │   ├── review_evidence.py # Claimed-ID-only read-only evidence boundary
@@ -122,10 +123,17 @@ rules content, while the raw hash is used only to detect changes to that local
 file.
 
 The normal local-full flow remains pinned to the frozen `paizo-native-v1`
-profile. Staged review runs may explicitly use `paizo-native-v2` or
-`paizo-native-v3`; v3 keeps v2 reading order but marks recurring condensed
-two-cell labels as `table-cell` rather than treating them as headings. That
-flag requires layout-aware review before a public candidate can be accepted.
+profile. The older v2 and v3 review profiles are also frozen. Licensed review
+preparation uses `paizo-native-v4`: it combines the authoritative native words
+with the structural layout artifact to produce ordered blocks, active sections,
+and bounded quarantine records. Section text must be the exact normalized
+projection of its blocks, and every native anchor must occur exactly once in an
+active block, quarantine record, or constrained ignore. Dense native stat-block
+text omitted by the layout model is ordered by native PDF geometry between the
+nearest detected regions and marked `native-layout-fallback`; it remains visible
+to classification and independent review. The flag is not by itself a forced
+mixed-extraction path because the recovered text and anchors are exact; workers
+still decide whether the section is clean, mixed, or excluded.
 The licensed-review runner additionally rasterizes pages for an ONNX-only
 PP-DocLayoutV3 pass. Its separate private artifact contains boxes and reading
 order, not recognized text. Those regions bind back to opaque native-word
@@ -197,10 +205,13 @@ network or SQLite write path exists.
 The five source products have explicit, independent era metadata: `PZO2101` is
 legacy/pre-Remaster, while `PZO12001` through `PZO12004` are the current
 post-Remaster set. License never determines era. `prepare` stages all five
-selected combined PDFs through `paizo-native-v3` plus a source-bound layout
+selected combined PDFs through `paizo-native-v4` plus a source-bound layout
 artifact in a fresh sibling workspace. One GPU session is reused across all
-five books. It validates complete native-anchor coverage and replaces the
-obsolete workspace only after all five runs pass. Deterministic adjacent-section stitch proposals
+five books. It validates complete native-anchor coverage, block/text equality,
+privacy, bounded quarantine, structural metrics, and aggregate general-rule
+probes. Preparation starts from a read-only backup when a workspace exists,
+carries forward only exact unchanged terminal work, and replaces the live file
+only after all five runs pass. Deterministic adjacent-section stitch proposals
 permit only complete groups of two or three; Luna selection needs independent
 Terra confirmation, and any disagreement or overlapping approved group fails
 closed as `needs-maintainer`. After a repair, exact unchanged no-merge decisions
@@ -212,6 +223,10 @@ before screening may begin.
 scripts/licensed-corpus-runner.py prepare \
   .local-corpus/licensed-review.sqlite3 .local-corpus/sources
 scripts/licensed-corpus-runner.py status .local-corpus/licensed-review.sqlite3
+scripts/licensed-corpus-runner.py quality .local-corpus/licensed-review.sqlite3
+# Compare explicit historical and candidate parser-run selections when needed.
+# scripts/licensed-corpus-runner.py compare-quality WORKSPACE \
+#   --baseline-runs baseline.json --candidate-runs candidate.json
 # If status reports a disagreement, inspect it locally and resolve explicitly:
 # scripts/licensed-corpus-runner.py inspect-maintainer WORKSPACE ITEM_ID --include-text
 # scripts/licensed-corpus-runner.py resolve-maintainer WORKSPACE ITEM_ID no-merge
@@ -246,8 +261,17 @@ catalog product and refuses to screen while the active parser run has unresolved
 stitch work.
 Rejected screening records remain in the private workspace with their source
 section, decision, and provenance. They are excluded from the public projection,
-not deleted; activating a reparsed source creates a fresh screening scope while
-retaining the retired run for audit or later reconsideration.
+not deleted. Decisions are append-only, so an explicit maintainer reopen records
+a new event while preserving the old rejection and reason. Activating a reparsed
+source carries exact unchanged terminal decisions into the new scope; changed,
+deferred, or reopened sections return to review while the retired run remains
+available for audit or later reconsideration.
+
+```bash
+scripts/licensed-corpus-runner.py reopen-screening \
+  .local-corpus/licensed-review.sqlite3 SECTION_KEY MAINTAINER \
+  parser-quality
+```
 `build-base` stops at a validated, model-independent ignored
 SQLite artifact. `promote-base` is a separate explicit command; embedding DB
 builds, commits, pushes, and releases are later operations.

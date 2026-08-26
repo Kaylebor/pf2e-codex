@@ -13,14 +13,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pf2e_codex.pdf_layout import DEFAULT_LAYOUT_MODEL_DIR  # noqa: E402
 from pf2e_codex.review_runner import (  # noqa: E402
     build_base,
+    compare_workspace_quality,
     maintainer_item_evidence,
     prepare_workspace,
     promote_base,
+    quality_workspace,
+    reopen_screening,
     resolve_maintainer_item,
     run_queues,
     runner_status,
     verify_workspace,
 )
+
+
+def _run_selection(values: list[str]) -> dict[str, str]:
+    selected: dict[str, str] = {}
+    for value in values:
+        product, separator, run_id = value.partition("=")
+        if not separator or not product.startswith("PZO") or not run_id or product in selected:
+            raise argparse.ArgumentTypeError(
+                "parser runs must be unique PRODUCT=RUN selections"
+            )
+        selected[product] = run_id
+    return selected
 
 
 def main() -> None:
@@ -30,7 +45,6 @@ def main() -> None:
     prepare = commands.add_parser("prepare", help="stage and activate a fresh trusted five-PDF workspace")
     prepare.add_argument("workspace", type=Path)
     prepare.add_argument("sources", type=Path)
-    prepare.add_argument("--parser-version", default="paizo-native-v3", choices=("paizo-native-v3",))
     prepare.add_argument("--shard-size", type=int, default=32)
     prepare.add_argument("--layout-model", type=Path, default=DEFAULT_LAYOUT_MODEL_DIR)
     prepare.add_argument(
@@ -57,6 +71,20 @@ def main() -> None:
     verify.add_argument("workspace", type=Path)
     verify.add_argument("--complete", action="store_true")
 
+    quality = commands.add_parser("quality", help="report content-free parser quality metrics")
+    quality.add_argument("workspace", type=Path)
+    quality.add_argument(
+        "--run", action="append", default=[], metavar="PRODUCT=RUN",
+        help="audit an explicit parser run instead of the active run; repeat per product",
+    )
+
+    compare = commands.add_parser(
+        "compare-quality", help="compare complete baseline and candidate parser-run selections"
+    )
+    compare.add_argument("workspace", type=Path)
+    compare.add_argument("--baseline-run", action="append", required=True, metavar="PRODUCT=RUN")
+    compare.add_argument("--candidate-run", action="append", required=True, metavar="PRODUCT=RUN")
+
     resolve = commands.add_parser(
         "resolve-maintainer",
         help="explicitly resolve one independent stitch disagreement",
@@ -76,6 +104,19 @@ def main() -> None:
         help="print private source text for the item's two or three sections",
     )
 
+    reopen = commands.add_parser(
+        "reopen-screening",
+        help="append an explicit maintainer screening reopen event",
+    )
+    reopen.add_argument("workspace", type=Path)
+    reopen.add_argument("section_key")
+    reopen.add_argument(
+        "--reason",
+        choices=("parser-quality", "scope-correction", "maintainer-review"),
+        required=True,
+    )
+    reopen.add_argument("--maintainer", default="maintainer")
+
     build = commands.add_parser("build-base", help="build an ignored audited model-independent base")
     build.add_argument("workspace", type=Path)
     build.add_argument("output", type=Path)
@@ -88,7 +129,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "prepare":
         result = prepare_workspace(
-            args.workspace, args.sources, parser_version=args.parser_version,
+            args.workspace, args.sources,
             shard_size=args.shard_size, layout_model_dir=args.layout_model,
             layout_provider=args.layout_provider,
         )
@@ -102,6 +143,17 @@ def main() -> None:
         )
     elif args.command == "verify":
         result = verify_workspace(args.workspace, require_complete=args.complete)
+    elif args.command == "quality":
+        selection = _run_selection(args.run)
+        result = quality_workspace(
+            args.workspace, parser_run_ids=selection or None
+        )
+    elif args.command == "compare-quality":
+        result = compare_workspace_quality(
+            args.workspace,
+            baseline_parser_run_ids=_run_selection(args.baseline_run),
+            candidate_parser_run_ids=_run_selection(args.candidate_run),
+        )
     elif args.command == "resolve-maintainer":
         result = resolve_maintainer_item(
             args.workspace,
@@ -114,12 +166,21 @@ def main() -> None:
             args.maintenance_id,
             include_text=args.include_text,
         )
+    elif args.command == "reopen-screening":
+        result = reopen_screening(
+            args.workspace,
+            args.section_key,
+            reason=args.reason,
+            maintainer=args.maintainer,
+        )
     elif args.command == "build-base":
         result = build_base(args.workspace, args.output, args.notices)
     else:
         result = promote_base(args.staged, args.tracked)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     if args.command == "verify" and not result["ok"]:
+        raise SystemExit(1)
+    if args.command == "compare-quality" and not result["passed"]:
         raise SystemExit(1)
 
 

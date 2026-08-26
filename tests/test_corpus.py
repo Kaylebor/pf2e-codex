@@ -509,6 +509,367 @@ def test_trusted_layout_requires_every_native_pdf_page(tmp_path, monkeypatch):
         )
 
 
+def test_v4_uses_layout_order_and_integrates_unbound_native_words():
+    page = _page(1, [
+        ("Left Rules", 30, 50, "Heading-Bold", 16),
+        ("left body", 30, 90, "Body", 9),
+        ("Right Rules", 330, 50, "Heading-Bold", 16),
+        ("right body", 330, 90, "Body", 9),
+        ("orphan", 280, 400, "Body", 9),
+    ])
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 600.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [320, 35, 500, 75]},
+                {"label": "text", "score": 0.99, "order": 1,
+                 "box": [320, 75, 500, 120]},
+                {"label": "paragraph_title", "score": 0.99, "order": 2,
+                 "box": [20, 35, 200, 75]},
+                {"label": "text", "score": 0.99, "order": 3,
+                 "box": [20, 75, 200, 120]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    binding = bind_layout_to_native_export(artifact, layout)
+    bundle = corpus.parse_verified_native_export(
+        artifact, parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=binding,
+    )
+
+    assert [section.heading for section in bundle.sections] == ["Right Rules", "Left Rules"]
+    assert "right body" in bundle.sections[0].text
+    assert "left body" in bundle.sections[1].text
+    fallback_section = next(section for section in bundle.sections if "orphan" in section.text)
+    assert "native-layout-fallback" in fallback_section.layout_flags
+    assert not bundle.quarantine
+    assigned = [
+        anchor
+        for group in (
+            *(section.coverage_anchors for section in bundle.sections),
+            *(item.coverage_anchors for item in bundle.quarantine),
+        )
+        for anchor in group
+    ]
+    expected = set(bundle.inventory.anchors) - set(bundle.inventory.ignored_anchor_reasons)
+    assert set(assigned) == expected and len(assigned) == len(set(assigned))
+    assert all(section.blocks for section in bundle.sections)
+    bundle.verify_seal()
+
+
+def test_v4_reconstructs_stable_native_table_and_quarantines_ambiguous_table():
+    page = _page(1, [
+        ("Rule Table", 30, 40, "Heading-Bold", 16),
+        ("Level", 30, 100, "Body-Bold", 9),
+        ("DC", 300, 100, "Body-Bold", 9),
+        ("One", 30, 125, "Body", 9),
+        ("15", 300, 125, "Body", 9),
+        ("Loose", 30, 250, "Body", 9),
+        ("Cells", 300, 250, "Body", 9),
+    ])
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 600.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 25, 200, 75]},
+                {"label": "table", "score": 0.99, "order": 1,
+                 "box": [20, 80, 420, 170]},
+                {"label": "table", "score": 0.99, "order": 2,
+                 "box": [20, 220, 420, 290]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    binding = bind_layout_to_native_export(artifact, layout)
+    bundle = corpus.parse_verified_native_export(
+        artifact, parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=binding,
+    )
+
+    assert len(bundle.sections) == 1
+    assert "structured-table" in bundle.sections[0].layout_flags
+    assert any(block.kind == "table" for block in bundle.sections[0].blocks)
+    assert {item.reason for item in bundle.quarantine} == {"unresolved-table"}
+    bundle.verify_seal()
+
+
+def test_v4_carries_consecutive_heading_chain_into_next_rule_section():
+    page = _page(1, [
+        ("Chapter Rules", 30, 40, "Heading-Bold", 18),
+        ("Specific Rule", 30, 80, "Heading-Bold", 15),
+        ("The complete mechanic follows this nested heading.", 30, 120, "Body", 9),
+    ])
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 600.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 25, 500, 70]},
+                {"label": "paragraph_title", "score": 0.99, "order": 1,
+                 "box": [20, 70, 500, 110]},
+                {"label": "text", "score": 0.99, "order": 2,
+                 "box": [20, 110, 500, 160]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    bundle = corpus.parse_verified_native_export(
+        artifact,
+        parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=bind_layout_to_native_export(artifact, layout),
+    )
+
+    assert len(bundle.sections) == 1
+    assert bundle.sections[0].heading == "Specific Rule"
+    assert "Chapter Rules Specific Rule" in bundle.sections[0].text
+    assert [block.kind for block in bundle.sections[0].blocks] == [
+        "heading", "heading", "body",
+    ]
+    assert not bundle.quarantine
+    bundle.verify_seal()
+
+
+def test_v4_splits_oversize_sections_on_existing_native_blocks():
+    pages = []
+    for page_number in (1, 2):
+        lines = []
+        if page_number == 1:
+            lines.append(("Long Rule", 30, 20, "Heading-Bold", 16))
+        lines.extend(
+            (
+                f"mechanic {page_number}-{index} " + "x" * 64,
+                30,
+                55 + index * 12,
+                "Body",
+                9,
+            )
+            for index in range(60)
+        )
+        pages.append(_page(page_number, lines))
+    payload = _trusted_payload(pages)
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=2, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout_pages = []
+    for page_number in (1, 2):
+        regions = []
+        if page_number == 1:
+            regions.append(
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 10, 500, 50]}
+            )
+        regions.append(
+            {"label": "text", "score": 0.99, "order": 1,
+             "box": [20, 50, 520, 790]}
+        )
+        layout_pages.append({
+            "number": page_number, "width": 600.0, "height": 800.0,
+            "regions": regions,
+        })
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 2},
+        "pages": layout_pages,
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    bundle = corpus.parse_verified_native_export(
+        artifact,
+        parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=bind_layout_to_native_export(artifact, layout),
+    )
+
+    assert len(bundle.sections) == 2
+    assert all(len(section.text) < 10_000 for section in bundle.sections)
+    assert all("oversize-split" in section.layout_flags for section in bundle.sections)
+    assert not bundle.sections[1].text.startswith("Long Rule")
+    assigned = [
+        anchor
+        for section in bundle.sections
+        for anchor in section.coverage_anchors
+    ]
+    expected = set(bundle.inventory.anchors) - set(bundle.inventory.ignored_anchor_reasons)
+    assert set(assigned) == expected and len(assigned) == len(set(assigned))
+    assert not bundle.quarantine
+    bundle.verify_seal()
+
+
+def test_v4_quarantines_contradictory_same_band_layout_order():
+    page = _page(1, [
+        ("Later Region", 30, 200, "Heading-Bold", 16),
+        ("Earlier region body", 30, 50, "Body", 9),
+    ])
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 600.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 180, 500, 240]},
+                {"label": "text", "score": 0.99, "order": 1,
+                 "box": [20, 30, 500, 90]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    bundle = corpus.parse_verified_native_export(
+        artifact,
+        parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=bind_layout_to_native_export(artifact, layout),
+    )
+
+    assert not bundle.sections
+    assert {item.reason for item in bundle.quarantine} == {"layout-order-conflict"}
+    bundle.verify_seal()
+
+
+def test_v4_sentence_like_model_title_cannot_bypass_heading_checks():
+    sentence = "This is a complete sentence that the model mislabeled as a paragraph title."
+    page = _page(1, [
+        (sentence, 30, 40, "Body", 9),
+        ("Actual Rule", 30, 100, "Heading-Bold", 16),
+        ("The actual mechanic remains active and correctly headed.", 30, 140, "Body", 9),
+    ])
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 600.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 25, 500, 80]},
+                {"label": "paragraph_title", "score": 0.99, "order": 1,
+                 "box": [20, 85, 500, 130]},
+                {"label": "text", "score": 0.99, "order": 2,
+                 "box": [20, 130, 500, 180]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    bundle = corpus.parse_verified_native_export(
+        artifact,
+        parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=bind_layout_to_native_export(artifact, layout),
+    )
+
+    assert [section.heading for section in bundle.sections] == ["Actual Rule"]
+    assert sentence not in bundle.sections[0].heading
+    assert {item.reason for item in bundle.quarantine} == {"unresolved-continuation"}
+    bundle.verify_seal()
+
+
+def test_v4_quarantines_one_indivisible_oversize_native_block():
+    long_line = "x" * 8_100
+    page = {
+        "number": 1,
+        "width": 50_000.0,
+        "height": 800.0,
+        "words": [
+            _word("Large Native Block", x=30, top=30, size=16, font="Heading-Bold"),
+            _word(long_line, x=30, top=100, size=9, font="Body"),
+        ],
+        "images": [],
+    }
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 50_000.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 15, 500, 70]},
+                {"label": "text", "score": 0.99, "order": 1,
+                 "box": [20, 80, 45_000, 160]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    bundle = corpus.parse_verified_native_export(
+        artifact,
+        parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
+        layout_binding=bind_layout_to_native_export(artifact, layout),
+    )
+
+    assert not bundle.sections
+    assert {item.reason for item in bundle.quarantine} == {"oversize-block"}
+    bundle.verify_seal()
+
+
 def test_parse_uses_geometry_for_two_column_reading_order(tmp_path):
     payload = {
         "schema_version": 1,

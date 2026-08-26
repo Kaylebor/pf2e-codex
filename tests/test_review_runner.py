@@ -15,6 +15,7 @@ import pytest
 
 from pf2e_codex.corpus import (
     PRODUCT_CATALOG,
+    TrustedBlock,
     TrustedParseBundle,
     TrustedSection,
     _trusted_bundle_seal,
@@ -256,16 +257,27 @@ def _aon_workspace(tmp_path: Path) -> Path:
         CREATE TABLE source_sections (
             section_key TEXT PRIMARY KEY, parser_run_id TEXT, heading TEXT
         );
-        CREATE TABLE draft_screening_decisions (
-            parser_run_id TEXT, section_key TEXT, decision TEXT, defer_reason TEXT
+        CREATE TABLE draft_screening_events (
+            event_id INTEGER PRIMARY KEY,
+            parser_run_id TEXT, section_key TEXT, event_type TEXT,
+            requested_decision TEXT, decision TEXT, duplicate_of_section_key TEXT,
+            reject_reason TEXT, defer_reason TEXT, deferred_by TEXT, deferred_at INTEGER,
+            worker TEXT, decided_at INTEGER, reopen_reason TEXT, supersedes_event_id INTEGER
         );
+        CREATE VIEW draft_screening_current AS
+            SELECT parser_run_id, section_key, requested_decision, decision,
+                   duplicate_of_section_key, reject_reason, defer_reason,
+                   deferred_by, deferred_at, worker, decided_at
+            FROM draft_screening_events WHERE event_type='DECISION';
         CREATE TABLE aon_cache (
             query_digest TEXT PRIMARY KEY, normalized_query TEXT, status TEXT,
             results_json TEXT, checked_at INTEGER
         );
         INSERT INTO parser_runs VALUES ('run','active',1);
         INSERT INTO source_sections VALUES ('section','run','Fireball');
-        INSERT INTO draft_screening_decisions VALUES ('run','section','DEFER','scope');
+        INSERT INTO draft_screening_events VALUES
+            (1,'run','section','DECISION','DEFER','DEFER',NULL,NULL,'scope',
+             'screen',1,'screen',1,NULL,NULL);
         """
     )
     conn.close()
@@ -317,11 +329,13 @@ def test_aon_absence_and_invalid_redirect_are_nonterminal(
 def _trusted_product_bundle(
     product_code: str,
     *,
+    parser_version: str = "paizo-native-v3",
     mixed: bool = False,
     section_count: int = 1,
     complete: bool = True,
     layout_flags: tuple[str, ...] = (),
     same_heading: bool = False,
+    changed_last: bool = False,
 ) -> TrustedParseBundle:
     product = PRODUCT_CATALOG[product_code]
     text = (
@@ -338,6 +352,10 @@ def _trusted_product_bundle(
     )
     ignored = hashlib.sha256(f"ignored-{product_code}".encode()).hexdigest()
     fingerprint = hashlib.sha256(f"source-{product_code}".encode()).hexdigest()
+    section_texts = tuple(
+        text + (" Updated mechanics." if changed_last and index == section_count - 1 else "")
+        for index in range(section_count)
+    )
     sections = tuple(
         TrustedSection(
             id=f"private:{product_code}:{index}",
@@ -350,8 +368,8 @@ def _trusted_product_bundle(
                 if same_heading
                 else "Mixed Rule" if mixed else f"Rule {product_code} {index}"
             ),
-            text=text,
-            text_hash=hashlib.sha256(text.encode()).hexdigest(),
+            text=section_texts[index],
+            text_hash=hashlib.sha256(section_texts[index].encode()).hexdigest(),
             physical_pages=(index + 1,),
             printed_page=str(index + 1),
             stable_section_identity=hashlib.sha256(
@@ -359,6 +377,16 @@ def _trusted_product_bundle(
             ).hexdigest(),
             layout_flags=layout_flags,
             coverage_anchors=(anchors[index],),
+            blocks=(
+                TrustedBlock(
+                    kind="body",
+                    physical_page=index + 1,
+                    ordinal=0,
+                    text=section_texts[index],
+                    text_hash=hashlib.sha256(section_texts[index].encode()).hexdigest(),
+                    coverage_anchors=(anchors[index],),
+                ),
+            ) if parser_version == "paizo-native-v4" else (),
         )
         for index in range(section_count)
     )
@@ -367,7 +395,7 @@ def _trusted_product_bundle(
         (*anchors, ignored),
         ({"anchor_hash": ignored, "reason": "watermark-email-span-v1"},),
         {},
-        {},
+        {ignored: "watermark-email-span-v1"},
     )
     attestation = {
         "product_verified": True,
@@ -378,9 +406,14 @@ def _trusted_product_bundle(
     }
     attestation_digest = hashlib.sha256(f"attestation-{product_code}".encode()).hexdigest()
     parser_digest = _trusted_parser_output_digest(sections)
+    layout_binding_digest = (
+        hashlib.sha256(f"layout-{product_code}".encode()).hexdigest()
+        if parser_version == "paizo-native-v4"
+        else None
+    )
     seal = _trusted_bundle_seal(
         product_code=product_code,
-        parser_version="paizo-native-v3",
+        parser_version=parser_version,
         exporter_profile_version=1,
         semantic_fingerprint=fingerprint,
         artifact_attestation=attestation,
@@ -388,10 +421,11 @@ def _trusted_product_bundle(
         inventory=inventory,
         sections=sections,
         parser_output_digest=parser_digest,
+        layout_binding_digest=layout_binding_digest,
     )
     return TrustedParseBundle(
         product_code,
-        "paizo-native-v3",
+        parser_version,
         1,
         fingerprint,
         attestation,
@@ -400,6 +434,7 @@ def _trusted_product_bundle(
         parser_digest,
         seal,
         artifact_attestation_digest=attestation_digest,
+        layout_binding_digest=layout_binding_digest,
     )
 
 
@@ -712,7 +747,7 @@ def test_layout_queue_stops_before_screening(tmp_path: Path):
         "repaired_products": 0,
     }
     with sqlite3.connect(workspace) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM draft_screening_decisions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM draft_screening_events").fetchone()[0] == 0
 
 
 def test_complex_screen_gets_luna_then_terra_and_defaults_to_add(tmp_path: Path):
@@ -760,6 +795,55 @@ def test_screening_pilot_processes_one_batch_per_product_without_draining(tmp_pa
     products = result["status"]["screening"]["products"]
     assert sum(product["accepted"] + product["rejected"] for product in products) == 5
     assert sum(product["unprocessed"] for product in products) == 5
+
+
+def test_replacement_run_carries_only_exact_terminal_screening_work(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    original = _trusted_product_bundle("PZO12001", section_count=2)
+    with patch(
+        "pf2e_codex.licensed_corpus.load_and_parse_verified_pdf",
+        return_value=original,
+    ):
+        staged = stage_trusted_native_pdf(
+            workspace,
+            tmp_path / "PZO12001E.pdf",
+            product_code="PZO12001",
+            parser_version="paizo-native-v3",
+            shard_size=2,
+        )
+    activate_parser_run(workspace, str(staged["parser_run_id"]))
+    run_queues(workspace, queue="screen", concurrency=1, executor=WorkflowCodex())
+
+    replacement = _trusted_product_bundle(
+        "PZO12001",
+        parser_version="paizo-native-v4",
+        section_count=2,
+        changed_last=True,
+    )
+    with patch(
+        "pf2e_codex.licensed_corpus.load_and_parse_verified_pdf",
+        return_value=replacement,
+    ):
+        restaged = stage_trusted_native_pdf(
+            workspace,
+            tmp_path / "PZO12001E.pdf",
+            product_code="PZO12001",
+            parser_version="paizo-native-v4",
+            shard_size=2,
+        )
+    assert restaged["screening_reused"] == 1
+    activate_parser_run(workspace, str(restaged["parser_run_id"]))
+
+    product = runner_status(workspace)["screening"]["products"][0]
+    assert product["accepted"] == 1
+    assert product["unprocessed"] == 1
+    with sqlite3.connect(workspace) as conn:
+        carried = conn.execute(
+            """SELECT COUNT(*) FROM draft_screening_events
+               WHERE parser_run_id=? AND supersedes_event_id IS NOT NULL""",
+            (restaged["parser_run_id"],),
+        ).fetchone()[0]
+    assert carried == 1
 
 
 def test_stitch_pilot_targets_at_most_one_batch_per_product(tmp_path: Path):
@@ -945,16 +1029,16 @@ def _source_directory(tmp_path: Path) -> Path:
     return root
 
 
-def test_prepare_replaces_obsolete_workspace_only_after_all_five_validate(tmp_path: Path):
+def test_prepare_creates_workspace_only_after_all_five_validate(tmp_path: Path):
     sources = _source_directory(tmp_path)
     target = tmp_path / "review.sqlite3"
-    target.write_bytes(b"obsolete workspace")
 
     def bundle_for(_path: Path, *, product_code: str, **_kwargs: object) -> TrustedParseBundle:
-        return _trusted_product_bundle(product_code)
+        return _trusted_product_bundle(product_code, parser_version="paizo-native-v4")
 
     with (
         patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", side_effect=bundle_for),
+        patch("pf2e_codex.review_runner.validate_quality", return_value={"passed": True}),
         patch(
             "pf2e_codex.corpus._candidate_content_fingerprint",
             side_effect=lambda source, _root: hashlib.sha256(source.product.code.encode()).hexdigest(),
@@ -980,8 +1064,8 @@ def test_prepare_reuses_one_layout_session_for_all_five_products(tmp_path: Path)
         layout_artifact: Path | None = None,
         **_kwargs: object,
     ) -> TrustedParseBundle:
-        bundle = _trusted_product_bundle(product_code)
-        return apply_layout_evidence(bundle, _layout_binding_for(bundle)) if layout_artifact else bundle
+        del layout_artifact
+        return _trusted_product_bundle(product_code, parser_version="paizo-native-v4")
 
     def export_layout(_source: Path, output: Path, *, analyzer: object, **_kwargs: object) -> None:
         exported_analyzers.append(analyzer)
@@ -990,6 +1074,7 @@ def test_prepare_reuses_one_layout_session_for_all_five_products(tmp_path: Path)
 
     with (
         patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", side_effect=bundle_for),
+        patch("pf2e_codex.review_runner.validate_quality", return_value={"passed": True}),
         patch(
             "pf2e_codex.corpus._candidate_content_fingerprint",
             side_effect=lambda source, _root: hashlib.sha256(source.product.code.encode()).hexdigest(),
@@ -1009,15 +1094,16 @@ def test_prepare_reuses_one_layout_session_for_all_five_products(tmp_path: Path)
     assert exported_analyzers == [analyzer] * len(EXPECTED_PRODUCTS)
 
 
-def test_prepare_failure_preserves_obsolete_workspace(tmp_path: Path):
+def test_prepare_failure_preserves_valid_existing_workspace(tmp_path: Path):
     sources = _source_directory(tmp_path)
     target = tmp_path / "review.sqlite3"
-    target.write_bytes(b"keep me")
+    initialize_trusted_workspace(target)
+    original = target.read_bytes()
 
     def fail_last(_path: Path, *, product_code: str, **_kwargs: object) -> TrustedParseBundle:
         if product_code == "PZO12004":
             raise ValueError("synthetic parser failure")
-        return _trusted_product_bundle(product_code)
+        return _trusted_product_bundle(product_code, parser_version="paizo-native-v4")
 
     with (
         patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", side_effect=fail_last),
@@ -1029,5 +1115,5 @@ def test_prepare_failure_preserves_obsolete_workspace(tmp_path: Path):
     ):
         prepare_workspace(target, sources, shard_size=2)
 
-    assert target.read_bytes() == b"keep me"
+    assert target.read_bytes() == original
     assert not list(tmp_path.glob(".review.sqlite3.rebuild-*"))

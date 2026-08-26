@@ -24,12 +24,31 @@ Ordered by impact. Check items off as completed.
     v1/v2 output, identifies recurring condensed two-cell labels from
     page-local geometry, and marks affected sections for mandatory layout
     review rather than silently creating publicable headings.
+  - Implemented: default `paizo-native-v4` review parsing. Native text remains
+    authoritative while GPU layout evidence supplies structural regions and
+    order. V4 stores ordered blocks and bounded quarantine, enforces exact-once
+    anchor coverage plus exact block-to-section text projection, and isolates
+    ambiguous order, unresolved layout/table material, and indivisible
+    oversize blocks instead of guessing or dropping them.
+  - Implemented: content-free parser qualification and atomic one-way workspace
+    preparation. Five-book candidates must pass coverage, privacy, layout,
+    quarantine-volume, structural, aggregate general-rule probe, and historical
+    improvement gates before a sibling file replaces the live workspace. Exact
+    unchanged terminal work is retained; changed work is reviewed again.
+  - Implemented: deterministic native-layout fallback for dense stat blocks
+    omitted by PP-DocLayout. It brackets native lines between nearby detected
+    regions, keeps exact anchor/text coverage, and exposes the fallback to
+    classification/review rather than quarantining a third of Monster Core or
+    forcing every partly recovered section through expensive extraction.
   - Implemented: a parser-run-scoped quad-state screening queue. Parallel cheap
     workers emit only `add`, `reject`, or `defer` with a bounded reason; deferred
     records move to a separate senior-model queue. Exact duplicates collapse
     deterministically, retries are idempotent, escalation provenance is
     retained, and the private draft remains separate from publication
     candidates and independent approval.
+  - Implemented: append-only screening decisions and explicit maintainer reopen.
+    Rejections and their bounded reasons remain available for audit and later
+    reconsideration; reopen adds history rather than deleting prior work.
   - Implemented: deterministic `licensed-corpus-runner` and claimed-ID-only
     evidence executable. The supervisor owns fresh five-PDF staging, bounded
     queue leases, 32-record/64-KiB packing, exact output schemas and ID sets,

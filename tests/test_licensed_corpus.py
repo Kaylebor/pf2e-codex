@@ -14,7 +14,10 @@ from unittest.mock import patch
 import pytest
 
 from pf2e_codex.corpus import (
+    PAIZO_NATIVE_PARSER_V4,
+    TrustedBlock,
     TrustedParseBundle,
+    TrustedQuarantine,
     TrustedSection,
     _trusted_bundle_seal,
     _trusted_parser_output_digest,
@@ -40,6 +43,7 @@ from pf2e_codex.licensed_corpus import (
     read_claimed_shard,
     read_draft_screening_record,
     release_draft_screening_batch,
+    reopen_draft_screening,
     stage_trusted_native_pdf,
     step_draft_screening,
     submit_candidate,
@@ -1513,6 +1517,141 @@ def _stage_bundle(workspace: Path, tmp_path: Path, bundle: TrustedParseBundle) -
         )
 
 
+def test_v4_stage_persists_structural_blocks_and_quarantine(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    heading_anchor = hashlib.sha256(b"v4-heading").hexdigest()
+    body_anchor = hashlib.sha256(b"v4-body").hexdigest()
+    quarantine_anchor = hashlib.sha256(b"v4-quarantine").hexdigest()
+    ignored_anchor = hashlib.sha256(b"v4-ignored").hexdigest()
+    fingerprint = hashlib.sha256(b"v4-source").hexdigest()
+    heading = "Rule Heading"
+    body = "A creature gains a circumstance bonus."
+    text = f"{heading} {body}"
+    blocks = (
+        TrustedBlock(
+            "heading", 1, 0, heading, hashlib.sha256(heading.encode()).hexdigest(),
+            (heading_anchor,),
+        ),
+        TrustedBlock(
+            "body", 1, 1, body, hashlib.sha256(body.encode()).hexdigest(),
+            (body_anchor,),
+        ),
+    )
+    section = TrustedSection(
+        id="private:v4:1",
+        source_section_id="pzo12001:player-core:p1:h0123456789abcdef:i0",
+        heading=heading,
+        text=text,
+        text_hash=hashlib.sha256(text.encode()).hexdigest(),
+        physical_pages=(1,),
+        printed_page="1",
+        stable_section_identity=hashlib.sha256(b"v4-stable").hexdigest(),
+        layout_flags=(),
+        coverage_anchors=(heading_anchor, body_anchor),
+        blocks=blocks,
+    )
+    quarantine = TrustedQuarantine(
+        "pzo12001:player-core:p1:q0:0123456789abcdef",
+        "unbound-layout",
+        1,
+        "Private unresolved fragment.",
+        hashlib.sha256(b"Private unresolved fragment.").hexdigest(),
+        (quarantine_anchor,),
+    )
+    inventory = NativeWordInventory(
+        fingerprint,
+        (heading_anchor, body_anchor, quarantine_anchor, ignored_anchor),
+        ({"anchor_hash": ignored_anchor, "reason": "watermark-email-span-v1"},),
+        {},
+        {ignored_anchor: "watermark-email-span-v1"},
+    )
+    attestation = {
+        "product_verified": True, "page_count": 1, "title_marker_verified": True,
+        "matched_product_count": 1, "conflict_product_count": 0,
+    }
+    attestation_digest = hashlib.sha256(b"v4-attestation").hexdigest()
+    parser_digest = _trusted_parser_output_digest((section,), (quarantine,))
+    layout_digest = hashlib.sha256(b"v4-layout").hexdigest()
+    seal = _trusted_bundle_seal(
+        product_code="PZO12001", parser_version=PAIZO_NATIVE_PARSER_V4,
+        exporter_profile_version=1, semantic_fingerprint=fingerprint,
+        artifact_attestation=attestation, artifact_attestation_digest=attestation_digest,
+        inventory=inventory, sections=(section,), quarantine=(quarantine,),
+        parser_output_digest=parser_digest, layout_binding_digest=layout_digest,
+    )
+    bundle = TrustedParseBundle(
+        "PZO12001", PAIZO_NATIVE_PARSER_V4, 1, fingerprint, attestation, inventory,
+        (section,), parser_digest, seal, artifact_attestation_digest=attestation_digest,
+        layout_binding_digest=layout_digest, quarantine=(quarantine,),
+    )
+    with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
+        staged = stage_trusted_native_pdf(
+            workspace, tmp_path / "PZO12001E.pdf", product_code="PZO12001",
+            parser_version=PAIZO_NATIVE_PARSER_V4, layout_artifact={},
+        )
+    activate_parser_run(workspace, str(staged["parser_run_id"]))
+
+    with sqlite3.connect(workspace) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM parser_section_blocks").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM parser_section_block_anchors").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM parser_quarantine").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM parser_quarantine_anchors").fetchone()[0] == 1
+
+
+def test_quarantine_schema_upgrade_preserves_records_and_anchors(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    with sqlite3.connect(workspace) as conn:
+        parser_run_id = conn.execute(
+            "SELECT parser_run_id FROM parser_runs ORDER BY parser_run_id LIMIT 1"
+        ).fetchone()[0]
+        conn.executescript(
+            """
+            DROP TABLE parser_quarantine_anchors;
+            DROP INDEX parser_quarantine_by_product;
+            DROP TABLE parser_quarantine;
+            CREATE TABLE parser_quarantine (
+                parser_run_id TEXT NOT NULL,
+                quarantine_id TEXT NOT NULL,
+                product_code TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN ('unbound-layout')),
+                physical_page INTEGER NOT NULL,
+                source_text TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                anchor_count INTEGER NOT NULL,
+                anchor_digest TEXT NOT NULL,
+                PRIMARY KEY(parser_run_id, quarantine_id)
+            );
+            CREATE TABLE parser_quarantine_anchors (
+                parser_run_id TEXT NOT NULL,
+                quarantine_id TEXT NOT NULL,
+                anchor_hash TEXT NOT NULL,
+                PRIMARY KEY(parser_run_id, anchor_hash)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO parser_quarantine VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (parser_run_id, "q1", "PZO12001", "unbound-layout", 1,
+             "private fragment", hashlib.sha256(b"private fragment").hexdigest(),
+             1, hashlib.sha256(b"anchor").hexdigest()),
+        )
+        conn.execute(
+            "INSERT INTO parser_quarantine_anchors VALUES (?, ?, ?)",
+            (parser_run_id, "q1", hashlib.sha256(b"native anchor").hexdigest()),
+        )
+
+    workspace_status(workspace)
+
+    with sqlite3.connect(workspace) as conn:
+        assert conn.execute("SELECT reason FROM parser_quarantine").fetchone()[0] == "unbound-layout"
+        assert conn.execute("SELECT COUNT(*) FROM parser_quarantine_anchors").fetchone()[0] == 1
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='parser_quarantine'"
+        ).fetchone()[0]
+        assert "layout-order-conflict" in sql
+        assert "oversize-block" in sql
+
+
 def _trusted_multi_section_bundle(texts: tuple[str, ...]) -> TrustedParseBundle:
     """Build a sealed direct-PDF fixture with deterministic, distinct sections."""
     fingerprint = hashlib.sha256(b"multi-section-source-fingerprint").hexdigest()
@@ -1836,7 +1975,7 @@ def test_binary_screen_defer_uses_a_separate_escalation_queue(tmp_path: Path):
         row = conn.execute(
             """SELECT requested_decision, decision, defer_reason, deferred_by,
                       deferred_at, worker
-               FROM draft_screening_decisions WHERE decision='ADD'"""
+               FROM draft_screening_current WHERE decision='ADD'"""
         ).fetchone()
         assert row is not None
         assert row["defer_reason"] == "complex-rule"
@@ -1878,82 +2017,35 @@ def test_binary_screen_defer_requires_a_bounded_reason(tmp_path: Path):
         )
 
 
-def test_v10_screening_migration_preserves_v9_terminal_decisions(tmp_path: Path):
+def test_screening_reopen_is_append_only_and_requeues_latest_state(tmp_path: Path):
     workspace = _workspace(tmp_path)
     _activate_bundle(workspace, tmp_path, _trusted_bundle())
     claim = claim_draft_screening_batch(workspace, "screen-a")
     assert claim is not None
     submit_draft_screening_decision(
-        workspace, int(claim["shard_id"]), "screen-a", 0, "add"
+        workspace, int(claim["shard_id"]), "screen-a", 0, "reject"
     )
+    with sqlite3.connect(workspace) as conn:
+        section_key = str(conn.execute(
+            "SELECT section_key FROM draft_screening_current"
+        ).fetchone()[0])
 
-    conn = sqlite3.connect(workspace)
-    try:
-        conn.executescript(
-            """
-            DROP INDEX draft_screening_claims_by_claimant;
-            ALTER TABLE draft_screening_claims RENAME TO draft_screening_claims_v10;
-            CREATE TABLE draft_screening_claims (
-                parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
-                shard_id INTEGER NOT NULL REFERENCES review_shards(shard_id),
-                claimant TEXT NOT NULL,
-                claimed_at INTEGER NOT NULL,
-                lease_expires_at INTEGER NOT NULL,
-                PRIMARY KEY(parser_run_id, shard_id)
-            );
-            INSERT INTO draft_screening_claims
-            SELECT parser_run_id, shard_id, claimant, claimed_at, lease_expires_at
-            FROM draft_screening_claims_v10;
-            DROP TABLE draft_screening_claims_v10;
-            CREATE INDEX draft_screening_claims_by_claimant
-                ON draft_screening_claims(claimant, lease_expires_at);
-
-            DROP INDEX draft_screening_decisions_by_result;
-            ALTER TABLE draft_screening_decisions RENAME TO draft_screening_decisions_v10;
-            CREATE TABLE draft_screening_decisions (
-                parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
-                section_key TEXT NOT NULL REFERENCES source_sections(section_key),
-                requested_decision TEXT NOT NULL
-                    CHECK(requested_decision IN ('ADD', 'REJECT')),
-                decision TEXT NOT NULL CHECK(decision IN ('ADD', 'REJECT')),
-                duplicate_of_section_key TEXT REFERENCES source_sections(section_key),
-                worker TEXT NOT NULL,
-                decided_at INTEGER NOT NULL,
-                PRIMARY KEY(parser_run_id, section_key)
-            );
-            INSERT INTO draft_screening_decisions
-            SELECT parser_run_id, section_key, requested_decision, decision,
-                   duplicate_of_section_key, worker, decided_at
-            FROM draft_screening_decisions_v10;
-            DROP TABLE draft_screening_decisions_v10;
-            CREATE INDEX draft_screening_decisions_by_result
-                ON draft_screening_decisions(parser_run_id, decision);
-            UPDATE metadata SET value='9' WHERE key='review_schema_version';
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
+    reopened = reopen_draft_screening(
+        workspace, section_key, maintainer="maintainer-a", reason="scope-correction"
+    )
+    assert reopened["state"] == "reopened"
     status = draft_screening_status(workspace)["products"][0]
-    assert status["accepted"] == 1
-    assert status["unprocessed"] == 0
-    conn = sqlite3.connect(workspace)
-    try:
+    assert status["unprocessed"] == 1
+    assert status["rejected"] == 0
+    with sqlite3.connect(workspace) as conn:
         assert conn.execute(
-            "SELECT value FROM metadata WHERE key='review_schema_version'"
-        ).fetchone()[0] == str(REVIEW_SCHEMA_VERSION)
-        assert "DEFER" in conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name='draft_screening_decisions'"
-        ).fetchone()[0]
-        assert "claim_mode" in {
-            row[1] for row in conn.execute("PRAGMA table_info(draft_screening_claims)")
-        }
+            "SELECT COUNT(*) FROM draft_screening_events WHERE section_key=?",
+            (section_key,),
+        ).fetchone()[0] == 2
         assert conn.execute(
-            "SELECT requested_decision, decision FROM draft_screening_decisions"
-        ).fetchone() == ("ADD", "ADD")
-    finally:
-        conn.close()
+            "SELECT COUNT(*) FROM draft_screening_current WHERE section_key=?",
+            (section_key,),
+        ).fetchone()[0] == 0
 
 
 def test_binary_screen_claims_split_work_and_release_keeps_decisions(tmp_path: Path):
@@ -2015,11 +2107,11 @@ def test_binary_screen_decisions_are_scoped_to_parser_run(tmp_path: Path):
     conn = sqlite3.connect(workspace)
     try:
         assert conn.execute(
-            "SELECT COUNT(*) FROM draft_screening_decisions WHERE parser_run_id=?",
+            "SELECT COUNT(*) FROM draft_screening_events WHERE parser_run_id=? AND decision<>'REOPEN'",
             (first["parser_run_id"],),
         ).fetchone()[0] == 1
         assert conn.execute(
-            "SELECT COUNT(*) FROM draft_screening_decisions WHERE parser_run_id=?",
+            "SELECT COUNT(*) FROM draft_screening_events WHERE parser_run_id=? AND decision<>'REOPEN'",
             (second["parser_run_id"],),
         ).fetchone()[0] == 0
     finally:
@@ -2221,7 +2313,12 @@ def test_complex_layout_and_table_cells_are_visible_to_reviewer_and_gate_public_
     staged = _stage_bundle(
         workspace,
         tmp_path,
-        _trusted_bundle(flags=("complex-layout", "table-ambiguous", "table-cell")),
+        _trusted_bundle(
+            flags=(
+                "complex-layout", "native-layout-fallback",
+                "table-ambiguous", "table-cell",
+            )
+        ),
     )
     activate_parser_run(workspace, str(staged["parser_run_id"]))
     _, section = _claim_and_read(workspace)
@@ -2238,7 +2335,7 @@ def test_complex_layout_and_table_cells_are_visible_to_reviewer_and_gate_public_
     claim = claim_review(workspace, "reviewer-b")
     assert claim is not None and claim["candidate_id"] == candidate_id
     assert json.loads(str(read_claimed_review(workspace, str(candidate_id), "reviewer-b")["layout_flags"])) == [
-        "complex-layout", "table-ambiguous", "table-cell",
+        "complex-layout", "native-layout-fallback", "table-ambiguous", "table-cell",
     ]
 
 

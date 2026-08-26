@@ -19,6 +19,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from .corpus import (
+    PAIZO_NATIVE_PARSER_V4,
     PRODUCT_CATALOG,
     TrustedParseBundle,
     load_and_parse_verified_pdf,
@@ -26,7 +27,7 @@ from .corpus import (
 )
 from .licensed_policy import LICENSED_CORE_POLICY_VERSION, licensed_policy_digest
 
-REVIEW_SCHEMA_VERSION = 15
+REVIEW_SCHEMA_VERSION = 18
 PUBLIC_SCHEMA_VERSION = 1
 POLICY_DECISIONS = {
     "PUBLIC_AS_IS",
@@ -45,6 +46,7 @@ SCREENING_DEFER_REASONS = {
     "insufficient-context",
 }
 SCREENING_REJECT_REASONS = {"no-mechanics", "duplicate", "setting-prose"}
+SCREENING_REOPEN_REASONS = {"parser-quality", "scope-correction", "maintainer-review"}
 PUBLIC_DECISIONS = {"PUBLIC_AS_IS", "MIXED_NEEDS_EXTRACTION"}
 _REVIEW_VERDICT_ALIASES = {
     "APPROVE_PUBLIC": "APPROVE",
@@ -258,7 +260,10 @@ def _parser_output_digest(records: Iterable[Mapping[str, object]]) -> str:
     return _digest("parser-output-v1", _canonical_json(canonical))
 
 
-def _native_word_coverage_digest(records: Iterable[Mapping[str, object]]) -> str:
+def _native_word_coverage_digest(
+    records: Iterable[Mapping[str, object]],
+    quarantine: Iterable[Mapping[str, object]] = (),
+) -> str:
     """Bind a complete manifest to independently recorded native-word coverage.
 
     The parser seam does not itself have native-word pages available.  A run
@@ -279,7 +284,26 @@ def _native_word_coverage_digest(records: Iterable[Mapping[str, object]]) -> str
         for record in records
     ]
     canonical.sort(key=lambda record: str(record["stable_identity"]))
-    return _digest("native-word-coverage-v1", _canonical_json(canonical))
+    quarantined = [
+        {
+            "quarantine_id": record.get("quarantine_id"),
+            "reason": record.get("reason"),
+            "physical_page": record.get("physical_page"),
+            "native_word_count": record.get("native_word_count"),
+            "native_word_digest": record.get("native_word_digest"),
+            "native_word_anchors": sorted(
+                str(anchor) for anchor in (record.get("native_word_anchors") or [])
+            ),
+        }
+        for record in quarantine
+    ]
+    quarantined.sort(key=lambda record: str(record["quarantine_id"]))
+    if not quarantined:
+        return _digest("native-word-coverage-v1", _canonical_json(canonical))
+    return _digest(
+        "native-word-coverage-v2",
+        _canonical_json({"sections": canonical, "quarantine": quarantined}),
+    )
 
 
 def _anchor_digest(namespace: str, anchors: Iterable[str]) -> str:
@@ -710,6 +734,8 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
     Version 14 retains the bounded Spark rejection reason used by each
     deterministic EXCLUDE candidate. Version 15 adds database-backed stitch
     leases so concurrent selector/confirmer workers cannot claim one proposal.
+    Version 16 replaces mutable screening rows with an append-only event log;
+    legacy rows are copied once and a read-only latest-state view is derived.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -823,6 +849,56 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
                 reason TEXT NOT NULL,
                 PRIMARY KEY(parser_run_id, anchor_hash)
             );
+            CREATE TABLE IF NOT EXISTS parser_section_blocks (
+                parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
+                section_key TEXT NOT NULL REFERENCES source_sections(section_key),
+                block_ordinal INTEGER NOT NULL CHECK(block_ordinal >= 0),
+                kind TEXT NOT NULL CHECK(kind IN ('heading', 'body', 'sidebar', 'table')),
+                physical_page INTEGER NOT NULL CHECK(physical_page >= 1),
+                source_text TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                table_json TEXT,
+                anchor_digest TEXT NOT NULL,
+                PRIMARY KEY(parser_run_id, section_key, block_ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS parser_section_block_anchors (
+                parser_run_id TEXT NOT NULL,
+                section_key TEXT NOT NULL,
+                block_ordinal INTEGER NOT NULL,
+                anchor_ordinal INTEGER NOT NULL CHECK(anchor_ordinal >= 0),
+                anchor_hash TEXT NOT NULL,
+                PRIMARY KEY(parser_run_id, section_key, block_ordinal, anchor_ordinal),
+                UNIQUE(parser_run_id, section_key, anchor_hash),
+                FOREIGN KEY(parser_run_id, section_key, block_ordinal)
+                    REFERENCES parser_section_blocks(parser_run_id, section_key, block_ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS parser_quarantine (
+                parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
+                quarantine_id TEXT NOT NULL,
+                product_code TEXT NOT NULL,
+                reason TEXT NOT NULL CHECK(reason IN (
+                    'repeated-furniture', 'page-number', 'contents-index',
+                    'credits-legal', 'unresolved-table', 'unbound-layout',
+                    'heading-artifact', 'unresolved-continuation', 'unresolved-layout',
+                    'layout-order-conflict', 'oversize-block'
+                )),
+                physical_page INTEGER NOT NULL CHECK(physical_page >= 1),
+                source_text TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                anchor_count INTEGER NOT NULL CHECK(anchor_count >= 1),
+                anchor_digest TEXT NOT NULL,
+                PRIMARY KEY(parser_run_id, quarantine_id)
+            );
+            CREATE INDEX IF NOT EXISTS parser_quarantine_by_product
+                ON parser_quarantine(parser_run_id, product_code, reason);
+            CREATE TABLE IF NOT EXISTS parser_quarantine_anchors (
+                parser_run_id TEXT NOT NULL,
+                quarantine_id TEXT NOT NULL,
+                anchor_hash TEXT NOT NULL,
+                PRIMARY KEY(parser_run_id, anchor_hash),
+                FOREIGN KEY(parser_run_id, quarantine_id)
+                    REFERENCES parser_quarantine(parser_run_id, quarantine_id)
+            );
             CREATE TABLE IF NOT EXISTS draft_screening_claims (
                 parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
                 shard_id INTEGER NOT NULL REFERENCES review_shards(shard_id),
@@ -835,13 +911,18 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
             );
             CREATE INDEX IF NOT EXISTS draft_screening_claims_by_claimant
                 ON draft_screening_claims(claimant, lease_expires_at);
-            CREATE TABLE IF NOT EXISTS draft_screening_decisions (
+            CREATE TABLE IF NOT EXISTS draft_screening_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
                 section_key TEXT NOT NULL REFERENCES source_sections(section_key),
-                requested_decision TEXT NOT NULL
-                    CHECK(requested_decision IN ('ADD', 'REJECT', 'DEFER')),
-                decision TEXT NOT NULL CHECK(decision IN ('ADD', 'REJECT', 'DEFER')),
+                event_type TEXT NOT NULL CHECK(event_type IN ('DECISION', 'REOPEN')),
+                requested_decision TEXT CHECK(requested_decision IN ('ADD', 'REJECT', 'DEFER')
+                    OR requested_decision IS NULL),
+                decision TEXT CHECK(decision IN ('ADD', 'REJECT', 'DEFER') OR decision IS NULL),
                 duplicate_of_section_key TEXT REFERENCES source_sections(section_key),
+                reject_reason TEXT CHECK(reject_reason IN
+                    ('no-mechanics', 'duplicate', 'setting-prose')
+                    OR reject_reason IS NULL),
                 defer_reason TEXT CHECK(defer_reason IN
                     ('layout', 'scope', 'complex-rule', 'insufficient-context')
                     OR defer_reason IS NULL),
@@ -849,15 +930,27 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
                 deferred_at INTEGER,
                 worker TEXT NOT NULL,
                 decided_at INTEGER NOT NULL,
+                reopen_reason TEXT,
+                supersedes_event_id INTEGER REFERENCES draft_screening_events(event_id),
                 CHECK(
-                    (decision='DEFER' AND defer_reason IS NOT NULL
-                     AND deferred_by IS NOT NULL AND deferred_at IS NOT NULL)
-                    OR decision<>'DEFER'
+                    (event_type='DECISION' AND requested_decision IS NOT NULL
+                     AND decision IS NOT NULL
+                     AND ((decision='DEFER' AND defer_reason IS NOT NULL
+                           AND deferred_by IS NOT NULL AND deferred_at IS NOT NULL)
+                          OR decision<>'DEFER')
+                        AND (decision='REJECT' OR reject_reason IS NULL)
+                        AND reopen_reason IS NULL)
+                    OR (event_type='REOPEN' AND requested_decision IS NULL
+                        AND decision IS NULL AND reopen_reason IS NOT NULL
+                        AND duplicate_of_section_key IS NULL AND defer_reason IS NULL
+                        AND deferred_by IS NULL AND deferred_at IS NULL)
                 ),
-                PRIMARY KEY(parser_run_id, section_key)
+                UNIQUE(parser_run_id, section_key, event_type, decided_at, worker)
             );
-            CREATE INDEX IF NOT EXISTS draft_screening_decisions_by_result
-                ON draft_screening_decisions(parser_run_id, decision);
+            CREATE INDEX IF NOT EXISTS draft_screening_events_by_section
+                ON draft_screening_events(parser_run_id, section_key, event_id);
+            CREATE INDEX IF NOT EXISTS draft_screening_events_by_result
+                ON draft_screening_events(parser_run_id, decision, event_id);
             """
         )
         # sqlite3.executescript() commits any pending transaction before it
@@ -868,6 +961,63 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
         conn.executescript(_RUNNER_SCHEMA_SQL)
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
+        quarantine_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='parser_quarantine'"
+        ).fetchone()
+        if quarantine_sql is not None and "oversize-block" not in str(quarantine_sql[0]):
+            conn.execute(
+                """CREATE TEMP TABLE parser_quarantine_anchors_v18 AS
+                   SELECT parser_run_id, quarantine_id, anchor_hash
+                   FROM parser_quarantine_anchors"""
+            )
+            conn.execute(
+                """CREATE TABLE parser_quarantine_v18 (
+                    parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
+                    quarantine_id TEXT NOT NULL,
+                    product_code TEXT NOT NULL,
+                    reason TEXT NOT NULL CHECK(reason IN (
+                        'repeated-furniture', 'page-number', 'contents-index',
+                        'credits-legal', 'unresolved-table', 'unbound-layout',
+                        'heading-artifact', 'unresolved-continuation', 'unresolved-layout',
+                        'layout-order-conflict', 'oversize-block'
+                    )),
+                    physical_page INTEGER NOT NULL CHECK(physical_page >= 1),
+                    source_text TEXT NOT NULL,
+                    text_hash TEXT NOT NULL,
+                    anchor_count INTEGER NOT NULL CHECK(anchor_count >= 1),
+                    anchor_digest TEXT NOT NULL,
+                    PRIMARY KEY(parser_run_id, quarantine_id)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO parser_quarantine_v18
+                   SELECT parser_run_id, quarantine_id, product_code, reason,
+                          physical_page, source_text, text_hash, anchor_count, anchor_digest
+                   FROM parser_quarantine"""
+            )
+            conn.execute("DROP TABLE parser_quarantine_anchors")
+            conn.execute("DROP TABLE parser_quarantine")
+            conn.execute("ALTER TABLE parser_quarantine_v18 RENAME TO parser_quarantine")
+            conn.execute(
+                """CREATE INDEX parser_quarantine_by_product
+                   ON parser_quarantine(parser_run_id, product_code, reason)"""
+            )
+            conn.execute(
+                """CREATE TABLE parser_quarantine_anchors (
+                    parser_run_id TEXT NOT NULL,
+                    quarantine_id TEXT NOT NULL,
+                    anchor_hash TEXT NOT NULL,
+                    PRIMARY KEY(parser_run_id, anchor_hash),
+                    FOREIGN KEY(parser_run_id, quarantine_id)
+                        REFERENCES parser_quarantine(parser_run_id, quarantine_id)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO parser_quarantine_anchors
+                   SELECT parser_run_id, quarantine_id, anchor_hash
+                   FROM parser_quarantine_anchors_v18"""
+            )
+            conn.execute("DROP TABLE parser_quarantine_anchors_v18")
         session_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(runner_sessions)")}
         if "cli_version" not in session_columns:
             conn.execute("ALTER TABLE runner_sessions ADD COLUMN cli_version TEXT NOT NULL DEFAULT ''")
@@ -883,51 +1033,75 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
                    NOT NULL DEFAULT 'ordinary'
                    CHECK(claim_mode IN ('ordinary', 'escalation'))"""
             )
-        screening_decision_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(draft_screening_decisions)")
-        }
-        if schema_row is not None and stored_schema < 10:
-            conn.execute("ALTER TABLE draft_screening_decisions RENAME TO draft_screening_decisions_v9")
-            conn.execute(
-                """CREATE TABLE draft_screening_decisions (
-                    parser_run_id TEXT NOT NULL REFERENCES parser_runs(parser_run_id),
-                    section_key TEXT NOT NULL REFERENCES source_sections(section_key),
-                    requested_decision TEXT NOT NULL
-                        CHECK(requested_decision IN ('ADD', 'REJECT', 'DEFER')),
-                    decision TEXT NOT NULL CHECK(decision IN ('ADD', 'REJECT', 'DEFER')),
-                    duplicate_of_section_key TEXT REFERENCES source_sections(section_key),
-                    defer_reason TEXT CHECK(defer_reason IN
-                        ('layout', 'scope', 'complex-rule', 'insufficient-context')
-                        OR defer_reason IS NULL),
-                    deferred_by TEXT,
-                    deferred_at INTEGER,
-                    worker TEXT NOT NULL,
-                    decided_at INTEGER NOT NULL,
-                    CHECK(
-                        (decision='DEFER' AND defer_reason IS NOT NULL
-                         AND deferred_by IS NOT NULL AND deferred_at IS NOT NULL)
-                        OR decision<>'DEFER'
+        # Screening decisions are an append-only event log.  Older workspaces
+        # had one mutable row per section; copy those rows into the event log
+        # once, then remove the mutable table.  The current-state view below
+        # is read-only and always derives from the newest event.
+        screening_object = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name='draft_screening_decisions'"
+        ).fetchone()
+        if screening_object is not None and str(screening_object[0]) == "table":
+            legacy_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(draft_screening_decisions)")
+            }
+            conn.execute("ALTER TABLE draft_screening_decisions RENAME TO draft_screening_decisions_legacy")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            legacy_rows = conn.execute("SELECT * FROM draft_screening_decisions_legacy").fetchall()
+
+            def _legacy_value(
+                row: sqlite3.Row, name: str, default: object = None
+            ) -> object:
+                return row[name] if name in legacy_columns else default
+
+            for legacy in legacy_rows:
+                requested = _legacy_value(legacy, "requested_decision")
+                decision = _legacy_value(legacy, "decision")
+                if requested not in SCREENING_DECISIONS or decision not in SCREENING_DECISIONS:
+                    raise ValueError("review workspace has an invalid legacy screening decision")
+                legacy_worker = _legacy_value(legacy, "worker", "legacy-migration") or "legacy-migration"
+                legacy_decided_at = _legacy_value(legacy, "decided_at", int(time.time())) or int(time.time())
+                legacy_defer_reason = _legacy_value(legacy, "defer_reason")
+                legacy_deferred_by = _legacy_value(legacy, "deferred_by")
+                legacy_deferred_at = _legacy_value(legacy, "deferred_at")
+                if decision == "DEFER":
+                    legacy_defer_reason = legacy_defer_reason or "scope"
+                    legacy_deferred_by = legacy_deferred_by or legacy_worker
+                    legacy_deferred_at = legacy_deferred_at or legacy_decided_at
+                conn.execute(
+                    """INSERT INTO draft_screening_events
+                       (parser_run_id, section_key, event_type, requested_decision, decision,
+                        duplicate_of_section_key, reject_reason, defer_reason, deferred_by, deferred_at,
+                        worker, decided_at)
+                       VALUES (?, ?, 'DECISION', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        legacy["parser_run_id"], legacy["section_key"], requested, decision,
+                        _legacy_value(legacy, "duplicate_of_section_key"),
+                        _legacy_value(legacy, "reject_reason"), legacy_defer_reason,
+                        legacy_deferred_by, legacy_deferred_at, legacy_worker, legacy_decided_at,
                     ),
-                    PRIMARY KEY(parser_run_id, section_key)
-                )"""
-            )
-            conn.execute(
-                """INSERT INTO draft_screening_decisions
-                   (parser_run_id, section_key, requested_decision, decision,
-                    duplicate_of_section_key, worker, decided_at)
-                   SELECT parser_run_id, section_key, requested_decision, decision,
-                          duplicate_of_section_key, worker, decided_at
-                   FROM draft_screening_decisions_v9"""
-            )
-            conn.execute("DROP TABLE draft_screening_decisions_v9")
-            conn.execute(
-                """CREATE INDEX draft_screening_decisions_by_result
-                   ON draft_screening_decisions(parser_run_id, decision)"""
-            )
-        elif not {"defer_reason", "deferred_by", "deferred_at"}.issubset(
-            screening_decision_columns
-        ):
-            raise ValueError("review workspace screening schema does not match its version")
+                )
+            conn.execute("DROP TABLE draft_screening_decisions_legacy")
+        # A manually-created current-state view from a pre-event fixture is
+        # not part of the runtime schema; replace it with the canonical view.
+        if conn.execute(
+            "SELECT type FROM sqlite_master WHERE name='draft_screening_decisions'"
+        ).fetchone() is not None:
+            conn.execute("DROP VIEW IF EXISTS draft_screening_decisions")
+        conn.execute(
+            """CREATE VIEW IF NOT EXISTS draft_screening_current AS
+               SELECT e.parser_run_id, e.section_key, e.requested_decision,
+                      e.decision, e.duplicate_of_section_key, e.reject_reason, e.defer_reason,
+                      e.deferred_by, e.deferred_at, e.worker, e.decided_at
+                 FROM draft_screening_events AS e
+                WHERE e.event_type='DECISION'
+                  AND e.event_id=(
+                      SELECT MAX(newer.event_id)
+                        FROM draft_screening_events AS newer
+                       WHERE newer.parser_run_id=e.parser_run_id
+                         AND newer.section_key=e.section_key
+                  )"""
+        )
         section_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(source_sections)")}
         revision_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(source_revisions)")}
         if "printing_revision" not in revision_columns:
@@ -1147,7 +1321,7 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_workspace_migrated(workspace: Path | str) -> None:
-    """Apply a compatible private-workspace migration before a read-only path."""
+    """Apply the one-way current private-workspace upgrade before access."""
     conn = _connect(workspace)
     try:
         _migrate_review_workspace(conn)
@@ -1785,6 +1959,18 @@ def _screening_run_sql(alias: str) -> str:
     )
 
 
+def _screening_latest_event(
+    conn: sqlite3.Connection, run_id: str, section_key: str
+) -> sqlite3.Row | None:
+    """Return the newest screening event for one parser-run section."""
+    return conn.execute(
+        """SELECT * FROM draft_screening_events
+           WHERE parser_run_id=? AND section_key=?
+           ORDER BY event_id DESC LIMIT 1""",
+        (run_id, section_key),
+    ).fetchone()
+
+
 def draft_screening_status(workspace: Path | str) -> dict[str, object]:
     """Return aggregate state for the private quad-state draft screen."""
     _ensure_workspace_migrated(workspace)
@@ -1806,7 +1992,7 @@ def draft_screening_status(workspace: Path | str) -> dict[str, object]:
                           SUM(CASE WHEN d.duplicate_of_section_key IS NOT NULL THEN 1 ELSE 0 END)
                               AS duplicate_rejected
                    FROM parser_run_sections AS membership
-                   LEFT JOIN draft_screening_decisions AS d
+                   LEFT JOIN draft_screening_current AS d
                      ON d.parser_run_id=membership.parser_run_id
                     AND d.section_key=membership.section_key
                    WHERE membership.parser_run_id=?
@@ -1832,7 +2018,7 @@ def draft_screening_status(workspace: Path | str) -> dict[str, object]:
                              SELECT 1 FROM source_sections AS s
                              WHERE s.shard_id=sh.shard_id
                                AND NOT EXISTS (
-                                   SELECT 1 FROM draft_screening_decisions AS d
+                                   SELECT 1 FROM draft_screening_current AS d
                                    WHERE d.parser_run_id=sh.parser_run_id
                                      AND d.section_key=s.section_key
                                )
@@ -1852,7 +2038,7 @@ def draft_screening_status(workspace: Path | str) -> dict[str, object]:
                          )
                          AND EXISTS (
                              SELECT 1 FROM source_sections AS s
-                             JOIN draft_screening_decisions AS d
+                             JOIN draft_screening_current AS d
                                ON d.parser_run_id=sh.parser_run_id
                               AND d.section_key=s.section_key
                              WHERE s.shard_id=sh.shard_id AND d.decision='DEFER'
@@ -1934,10 +2120,10 @@ def claim_draft_screening_batch(
                     f"claimant already holds screening batch {active['shard_id']}"
                 )
             active_eligibility = (
-                "NOT EXISTS (SELECT 1 FROM draft_screening_decisions AS d "
+                "NOT EXISTS (SELECT 1 FROM draft_screening_current AS d "
                 "WHERE d.parser_run_id=? AND d.section_key=s.section_key)"
                 if queue == "unprocessed"
-                else "EXISTS (SELECT 1 FROM draft_screening_decisions AS d "
+                else "EXISTS (SELECT 1 FROM draft_screening_current AS d "
                 "WHERE d.parser_run_id=? AND d.section_key=s.section_key "
                 "AND d.decision='DEFER')"
             )
@@ -1960,10 +2146,10 @@ def claim_draft_screening_batch(
             }
 
         eligibility = (
-            "NOT EXISTS (SELECT 1 FROM draft_screening_decisions AS d "
+            "NOT EXISTS (SELECT 1 FROM draft_screening_current AS d "
             "WHERE d.parser_run_id=sh.parser_run_id AND d.section_key=s.section_key)"
             if queue == "unprocessed"
-            else "EXISTS (SELECT 1 FROM draft_screening_decisions AS d "
+            else "EXISTS (SELECT 1 FROM draft_screening_current AS d "
             "WHERE d.parser_run_id=sh.parser_run_id AND d.section_key=s.section_key "
             "AND d.decision='DEFER')"
         )
@@ -2011,10 +2197,10 @@ def claim_draft_screening_batch(
             (row["parser_run_id"], row["shard_id"], claimant, now, expiry, claim_mode),
         )
         count_eligibility = (
-            "NOT EXISTS (SELECT 1 FROM draft_screening_decisions AS d "
+            "NOT EXISTS (SELECT 1 FROM draft_screening_current AS d "
             "WHERE d.parser_run_id=? AND d.section_key=s.section_key)"
             if queue == "unprocessed"
-            else "EXISTS (SELECT 1 FROM draft_screening_decisions AS d "
+            else "EXISTS (SELECT 1 FROM draft_screening_current AS d "
             "WHERE d.parser_run_id=? AND d.section_key=s.section_key "
             "AND d.decision='DEFER')"
         )
@@ -2073,7 +2259,7 @@ def read_draft_screening_record(
         existing = conn.execute(
             """SELECT requested_decision, decision, duplicate_of_section_key,
                       defer_reason, deferred_by
-               FROM draft_screening_decisions
+               FROM draft_screening_current
                WHERE parser_run_id=? AND section_key=?""",
             (claim["parser_run_id"], row["section_key"]),
         ).fetchone()
@@ -2144,7 +2330,7 @@ def _screening_batch_complete(
         pending = conn.execute(
             """SELECT 1 FROM source_sections AS s
                WHERE s.shard_id=? AND NOT EXISTS (
-                   SELECT 1 FROM draft_screening_decisions AS d
+                   SELECT 1 FROM draft_screening_current AS d
                    WHERE d.parser_run_id=? AND d.section_key=s.section_key
                ) LIMIT 1""",
             (shard_id, run_id),
@@ -2152,7 +2338,7 @@ def _screening_batch_complete(
     else:
         pending = conn.execute(
             """SELECT 1 FROM source_sections AS s
-               JOIN draft_screening_decisions AS d
+               JOIN draft_screening_current AS d
                  ON d.parser_run_id=? AND d.section_key=s.section_key
                WHERE s.shard_id=? AND d.decision='DEFER' LIMIT 1""",
             (run_id, shard_id),
@@ -2212,10 +2398,11 @@ def submit_draft_screening_decision(
         existing = conn.execute(
             """SELECT requested_decision, decision, duplicate_of_section_key,
                       defer_reason, deferred_by, deferred_at, worker, decided_at
-               FROM draft_screening_decisions
+               FROM draft_screening_current
                WHERE parser_run_id=? AND section_key=?""",
             (run_id, section["section_key"]),
         ).fetchone()
+        latest_event = _screening_latest_event(conn, run_id, str(section["section_key"]))
         claim = conn.execute(
             """SELECT claim_mode FROM draft_screening_claims
                WHERE parser_run_id=? AND shard_id=? AND claimant=?
@@ -2231,19 +2418,27 @@ def submit_draft_screening_decision(
             stored, duplicate_of = _screening_stored_decision(
                 conn, run_id, section, requested
             )
+            if latest_event is None or str(latest_event["event_type"]) != "DECISION":
+                raise ValueError("screening record has no deferred event to resolve")
             conn.execute(
-                """UPDATE draft_screening_decisions
-                   SET requested_decision=?, decision=?, duplicate_of_section_key=?,
-                       worker=?, decided_at=?
-                   WHERE parser_run_id=? AND section_key=? AND decision='DEFER'""",
+                """INSERT INTO draft_screening_events
+                   (parser_run_id, section_key, event_type, requested_decision, decision,
+                    duplicate_of_section_key, reject_reason, defer_reason, deferred_by, deferred_at,
+                    worker, decided_at, supersedes_event_id)
+                   VALUES (?, ?, 'DECISION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    run_id,
+                    section["section_key"],
                     requested,
                     stored,
                     duplicate_of,
+                    reject_reason if requested == "REJECT" else None,
+                    latest_event["defer_reason"],
+                    latest_event["deferred_by"],
+                    latest_event["deferred_at"],
                     claimant,
                     now,
-                    run_id,
-                    section["section_key"],
+                    latest_event["event_id"],
                 ),
             )
             if requested == "REJECT" and reject_reason is not None:
@@ -2299,17 +2494,18 @@ def submit_draft_screening_decision(
             conn, run_id, section, requested
         )
         conn.execute(
-            """INSERT INTO draft_screening_decisions
-               (parser_run_id, section_key, requested_decision, decision,
-                duplicate_of_section_key, defer_reason, deferred_by, deferred_at,
+            """INSERT INTO draft_screening_events
+               (parser_run_id, section_key, event_type, requested_decision, decision,
+                duplicate_of_section_key, reject_reason, defer_reason, deferred_by, deferred_at,
                 worker, decided_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, 'DECISION', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 section["section_key"],
                 requested,
                 stored,
                 duplicate_of,
+                reject_reason if requested == "REJECT" else None,
                 defer_reason,
                 claimant if requested == "DEFER" else None,
                 now if requested == "DEFER" else None,
@@ -2398,6 +2594,101 @@ def step_draft_screening(
     if record is None:
         raise RuntimeError("screening batch reports pending work but no pending record exists")
     return {"result": result, "next_record": record}
+
+
+def reopen_draft_screening(
+    workspace: Path | str,
+    section_key: str,
+    *,
+    maintainer: str = "maintainer",
+    reason: str,
+) -> dict[str, object]:
+    """Append a maintainer reopen event for an active screening section.
+
+    Reopen is deliberately an explicit maintainer operation.  It never edits
+    or deletes the previous decision and refuses while either the section's
+    shard or its screening batch has a live lease.
+    """
+    if not section_key or not maintainer or reason not in SCREENING_REOPEN_REASONS:
+        raise ValueError(
+            "screening reopen requires a section key, maintainer, and bounded reason"
+        )
+    now = int(time.time())
+    conn = _connect(workspace)
+    try:
+        _migrate_review_workspace(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        section = conn.execute(
+            """SELECT s.section_key, s.parser_run_id, s.shard_id
+                 FROM source_sections AS s
+                 JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
+                WHERE s.section_key=? AND """ + _screening_run_sql("p"),
+            (section_key,),
+        ).fetchone()
+        if section is None:
+            raise ValueError("section is not part of the active trusted screening run")
+        live = conn.execute(
+            """SELECT 1 FROM review_shards
+                WHERE shard_id=? AND claimant IS NOT NULL AND lease_expires_at>=?
+               UNION ALL
+              SELECT 1 FROM draft_screening_claims
+                WHERE parser_run_id=? AND shard_id=? AND lease_expires_at>=?
+               LIMIT 1""",
+            (section["shard_id"], now, section["parser_run_id"], section["shard_id"], now),
+        ).fetchone()
+        if live is not None:
+            raise PermissionError("cannot reopen screening while the section has a live claim")
+        latest = _screening_latest_event(conn, str(section["parser_run_id"]), section_key)
+        if latest is None or str(latest["event_type"]) != "DECISION":
+            raise ValueError("section has no current terminal screening decision")
+        current = conn.execute(
+            """SELECT decision FROM draft_screening_current
+               WHERE parser_run_id=? AND section_key=?""",
+            (section["parser_run_id"], section_key),
+        ).fetchone()
+        if current is None:
+            raise ValueError("section has no current terminal screening decision")
+        # Retrying the exact maintainer action is idempotent; a different
+        # reopen after one has already been recorded must be explicit in a
+        # future decision event rather than silently extending the history.
+        prior = conn.execute(
+            """SELECT event_id, reopen_reason, worker FROM draft_screening_events
+                WHERE parser_run_id=? AND section_key=? AND event_type='REOPEN'
+                ORDER BY event_id DESC LIMIT 1""",
+            (section["parser_run_id"], section_key),
+        ).fetchone()
+        if prior is not None:
+            if str(prior["reopen_reason"]) == reason and str(prior["worker"]) == maintainer:
+                conn.commit()
+                return {
+                    "section_key": section_key,
+                    "state": "unchanged",
+                    "previous_decision": str(current["decision"]).lower(),
+                    "event_id": int(prior["event_id"]),
+                }
+            raise ValueError("screening section has already been reopened")
+        cursor = conn.execute(
+            """INSERT INTO draft_screening_events
+               (parser_run_id, section_key, event_type, worker, decided_at,
+                reopen_reason, supersedes_event_id)
+               VALUES (?, ?, 'REOPEN', ?, ?, ?, ?)""",
+            (
+                section["parser_run_id"], section_key, maintainer, now, reason,
+                latest["event_id"],
+            ),
+        )
+        conn.commit()
+        return {
+            "section_key": section_key,
+            "state": "reopened",
+            "previous_decision": str(current["decision"]).lower(),
+            "event_id": int(cursor.lastrowid),
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def release_draft_screening_batch(
@@ -2921,6 +3212,63 @@ def _clone_resolution(
     return True
 
 
+def _clone_screening_resolutions(
+    conn: sqlite3.Connection,
+    *,
+    parser_run_id: str,
+    old_to_new: Mapping[str, str],
+    now: int,
+) -> int:
+    """Carry exact terminal screening judgments into a replacement run.
+
+    The original event history stays immutable on the retired run. Deferred
+    and reopened sections are deliberately not copied because they are not a
+    terminal semantic judgment. Duplicate rejections are copied only when the
+    canonical section was also mapped exactly into the new run.
+    """
+    copied = 0
+    for old_section_key, new_section_key in sorted(old_to_new.items()):
+        event = conn.execute(
+            """SELECT * FROM draft_screening_events
+               WHERE section_key=? ORDER BY event_id DESC LIMIT 1""",
+            (old_section_key,),
+        ).fetchone()
+        if (
+            event is None
+            or event["event_type"] != "DECISION"
+            or event["decision"] not in {"ADD", "REJECT"}
+        ):
+            continue
+        duplicate_of = event["duplicate_of_section_key"]
+        if duplicate_of is not None:
+            duplicate_of = old_to_new.get(str(duplicate_of))
+            if duplicate_of is None:
+                continue
+        conn.execute(
+            """INSERT INTO draft_screening_events
+               (parser_run_id, section_key, event_type, requested_decision, decision,
+                duplicate_of_section_key, reject_reason, defer_reason, deferred_by, deferred_at,
+                worker, decided_at, supersedes_event_id)
+               VALUES (?, ?, 'DECISION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                parser_run_id,
+                new_section_key,
+                event["requested_decision"],
+                event["decision"],
+                duplicate_of,
+                event["reject_reason"],
+                event["defer_reason"],
+                event["deferred_by"],
+                event["deferred_at"],
+                event["worker"],
+                now,
+                event["event_id"],
+            ),
+        )
+        copied += 1
+    return copied
+
+
 def _bind_source_asset_inventory(
     workspace: Path | str,
     product_code: str,
@@ -3095,7 +3443,11 @@ def stage_trusted_native_pdf(
         layout_artifact=layout_artifact,
     )
     bundle.verify_seal()
-    expected_parser = "paizo-native-v3+pp-doclayout-v3-v1" if layout_artifact is not None else parser_version
+    expected_parser = (
+        parser_version
+        if parser_version == PAIZO_NATIVE_PARSER_V4 or layout_artifact is None
+        else "paizo-native-v3+pp-doclayout-v3-v1"
+    )
     if bundle.product_code != product_code or bundle.parser_version != expected_parser or not _is_sha256(bundle.sealed_digest):
         raise ValueError("direct PDF parser bundle is malformed")
     capability = object()
@@ -3211,6 +3563,7 @@ def _stage_trusted_bundle(
         raise ValueError("printing revision must be a bounded public-safe identifier")
     ignored = list(bundle.inventory.ignored_anchors)
     records: list[dict[str, object]] = []
+    block_records: list[dict[str, object]] = []
     for section in bundle.sections:
         if (
             not section.id or not section.heading or not section.text
@@ -3230,8 +3583,12 @@ def _stage_trusted_bundle(
             section.source_section_id, min(section.physical_pages), max(section.physical_pages)
         )
         provenance_hash = _digest(
-            "trusted-section-provenance-v1", str(bundle.parser_version),
-            _canonical_json(list(section.physical_pages)), str(section.printed_page or ""), section.heading,
+            "trusted-section-provenance-v2",
+            section.source_section_id,
+            str(min(section.physical_pages)),
+            str(max(section.physical_pages)),
+            str(section.printed_page or ""),
+            section.heading,
         )
         records.append({
             "source_section_id": section.source_section_id,
@@ -3249,13 +3606,66 @@ def _stage_trusted_bundle(
             "native_word_anchors": list(section.coverage_anchors),
             "layout_flags": list(section.layout_flags),
         })
+        block_anchors: list[str] = []
+        for expected_ordinal, block in enumerate(section.blocks):
+            if (
+                block.ordinal != expected_ordinal
+                or block.kind not in {"heading", "body", "sidebar", "table"}
+                or block.physical_page not in section.physical_pages
+                or hashlib.sha256(block.text.encode("utf-8")).hexdigest() != block.text_hash
+                or not block.coverage_anchors
+            ):
+                raise ValueError("trusted parser bundle contains an invalid structural block")
+            block_anchors.extend(block.coverage_anchors)
+            block_records.append({
+                "source_section_id": section.source_section_id,
+                "block_ordinal": block.ordinal,
+                "kind": block.kind,
+                "physical_page": block.physical_page,
+                "source_text": block.text,
+                "text_hash": block.text_hash,
+                "table_json": (
+                    _canonical_json([list(row) for row in block.table_cells])
+                    if block.table_cells else None
+                ),
+                "native_word_anchors": list(block.coverage_anchors),
+                "anchor_digest": _anchor_digest(
+                    "section-block-native-word-anchors-v1", block.coverage_anchors
+                ),
+            })
+        if section.blocks and block_anchors != list(section.coverage_anchors):
+            raise ValueError("trusted structural blocks do not exactly cover their section")
+    quarantine_records: list[dict[str, object]] = []
+    for item in bundle.quarantine:
+        if (
+            not item.quarantine_id
+            or not item.coverage_anchors
+            or hashlib.sha256(item.text.encode("utf-8")).hexdigest() != item.text_hash
+            or item.physical_page < 1
+        ):
+            raise ValueError("trusted parser bundle contains an invalid quarantine record")
+        quarantine_records.append({
+            "quarantine_id": item.quarantine_id,
+            "reason": item.reason,
+            "physical_page": item.physical_page,
+            "source_text": item.text,
+            "text_hash": item.text_hash,
+            "native_word_count": len(item.coverage_anchors),
+            "native_word_digest": _anchor_digest(
+                "quarantine-native-word-anchors-v1", item.coverage_anchors
+            ),
+            "native_word_anchors": list(item.coverage_anchors),
+        })
     output_digest = _parser_output_digest(records)
     anchors_digest = _anchor_digest("asset-native-word-inventory-v1", bundle.inventory.anchors)
     ignored_digest = _ignored_anchor_digest(ignored)
     asset_provenance = _digest(
-        "trusted-direct-pdf-asset-v1", bundle.product_code, bundle.semantic_fingerprint,
-        str(bundle.exporter_profile_version), anchors_digest, ignored_digest,
-        str(bundle.layout_binding_digest or ""),
+        "trusted-direct-pdf-asset-v2",
+        bundle.product_code,
+        bundle.semantic_fingerprint,
+        str(bundle.exporter_profile_version),
+        anchors_digest,
+        ignored_digest,
     )
     run = {
         "product_code": bundle.product_code,
@@ -3270,11 +3680,15 @@ def _stage_trusted_bundle(
         "asset_provenance_hash": asset_provenance,
         "bundle_seal": bundle.sealed_digest,
         "trusted_bundle": bundle,
+        "trusted_blocks": block_records,
+        "trusted_quarantine": quarantine_records,
         "complete_manifest": {
             "version": _TRUSTED_MANIFEST_VERSION,
             "declared_section_count": len(records),
             "output_digest": output_digest,
-            "native_word_coverage_digest": _native_word_coverage_digest(records),
+            "native_word_coverage_digest": _native_word_coverage_digest(
+                records, quarantine_records
+            ),
             # Calculated under the staging transaction against the selected
             # review target; callers cannot waive source removals.
             "removed_stable_identities": None,
@@ -3295,9 +3709,11 @@ def _stage_parser_run(
 ) -> dict[str, object]:
     """Stage one complete parser output without changing the review target.
 
-    Stable identity and provenance hashes are parser inputs, not guessed fuzzy
-    matches.  A section may inherit a completed decision only when all three
-    of stable identity, native-text hash, and provenance hash match exactly.
+    Stable identity and provenance are parser inputs, not guessed fuzzy
+    matches. A section may inherit terminal work only when its native text and
+    every explicit provenance field match. The one-time v3-to-v4 bridge checks
+    those fields directly because the retired v3 provenance hash included its
+    parser version; new hashes are parser-independent.
     """
     bundle = run.get("trusted_bundle")
     if not isinstance(bundle, TrustedParseBundle):
@@ -3357,6 +3773,74 @@ def _stage_parser_run(
                 "native_word_anchors": record.get("native_word_anchors"),
                 "layout_flags": sorted(set(flags)),
             })
+    raw_blocks = run.get("trusted_blocks", [])
+    raw_quarantine = run.get("trusted_quarantine", [])
+    if (
+        not isinstance(raw_blocks, list)
+        or any(not isinstance(item, Mapping) for item in raw_blocks)
+        or not isinstance(raw_quarantine, list)
+        or any(not isinstance(item, Mapping) for item in raw_quarantine)
+    ):
+        raise ValueError("trusted structural and quarantine records must be lists of objects")
+    section_ids = {str(record["source_section_id"]) for record in normalized}
+    blocks_by_section: dict[str, list[dict[str, object]]] = {}
+    for raw in raw_blocks:
+        source_section_id = str(raw.get("source_section_id", ""))
+        anchors = raw.get("native_word_anchors")
+        text = raw.get("source_text")
+        if (
+            source_section_id not in section_ids
+            or raw.get("kind") not in {"heading", "body", "sidebar", "table"}
+            or not isinstance(raw.get("block_ordinal"), int)
+            or not isinstance(raw.get("physical_page"), int)
+            or not isinstance(text, str)
+            or hashlib.sha256(text.encode("utf-8")).hexdigest() != raw.get("text_hash")
+            or not isinstance(anchors, list)
+            or not anchors
+            or any(not _is_sha256(anchor) for anchor in anchors)
+            or raw.get("anchor_digest")
+            != _anchor_digest("section-block-native-word-anchors-v1", anchors)
+        ):
+            raise ValueError("trusted parser run contains an invalid structural block")
+        blocks_by_section.setdefault(source_section_id, []).append(dict(raw))
+    for source_section_id, block_rows in blocks_by_section.items():
+        block_rows.sort(key=lambda item: int(item["block_ordinal"]))
+        if [int(item["block_ordinal"]) for item in block_rows] != list(range(len(block_rows))):
+            raise ValueError("trusted structural block ordinals are not contiguous")
+        section = next(
+            item for item in normalized if item["source_section_id"] == source_section_id
+        )
+        block_anchors = [
+            str(anchor) for item in block_rows for anchor in item["native_word_anchors"]
+        ]
+        if block_anchors != section["native_word_anchors"]:
+            raise ValueError("trusted structural blocks do not match section anchor order")
+    quarantine_records: list[dict[str, object]] = []
+    for raw in raw_quarantine:
+        anchors = raw.get("native_word_anchors")
+        text = raw.get("source_text")
+        if (
+            not isinstance(raw.get("quarantine_id"), str)
+            or not str(raw["quarantine_id"])
+            or raw.get("reason") not in {
+                "repeated-furniture", "page-number", "contents-index", "credits-legal",
+                "unresolved-table", "unbound-layout", "heading-artifact",
+                "unresolved-continuation", "unresolved-layout",
+                "layout-order-conflict", "oversize-block",
+            }
+            or not isinstance(raw.get("physical_page"), int)
+            or not isinstance(text, str)
+            or hashlib.sha256(text.encode("utf-8")).hexdigest() != raw.get("text_hash")
+            or not isinstance(anchors, list)
+            or not anchors
+            or any(not _is_sha256(anchor) for anchor in anchors)
+            or len(set(anchors)) != len(anchors)
+            or raw.get("native_word_count") != len(anchors)
+            or raw.get("native_word_digest")
+            != _anchor_digest("quarantine-native-word-anchors-v1", anchors)
+        ):
+            raise ValueError("trusted parser run contains an invalid quarantine record")
+        quarantine_records.append(dict(raw))
     output_digest = _parser_output_digest(normalized)
     if output_digest != run["parser_output_digest"]:
         raise ValueError("parser_output_digest does not match canonical section records")
@@ -3397,7 +3881,12 @@ def _stage_parser_run(
             expected_digest = _anchor_digest("section-native-word-anchors-v1", anchors)
             if record["native_word_count"] != len(anchors) or record["native_word_digest"] != expected_digest:
                 raise ValueError("per-section native-word coverage digest does not match anchors")
-        if coverage_digest != _native_word_coverage_digest(normalized):
+        for item in quarantine_records:
+            anchors = item["native_word_anchors"]
+            if seen_anchors.intersection(anchors):
+                raise ValueError("quarantine native-word anchors overlap active sections")
+            seen_anchors.update(anchors)
+        if coverage_digest != _native_word_coverage_digest(normalized, quarantine_records):
             raise ValueError("native-word coverage digest does not match section coverage records")
         complete = 1
     conn = _connect(workspace)
@@ -3413,12 +3902,6 @@ def _stage_parser_run(
             "SELECT * FROM source_assets WHERE product_code=? AND source_fingerprint=?",
             (product, fingerprint),
         ).fetchone()
-        if (
-            existing_asset is not None
-            and supplied_asset_provenance is not None
-            and str(existing_asset["provenance_hash"]) != asset_provenance
-        ):
-            raise ValueError("source asset provenance conflicts with the recorded normalized source")
         trusted_inventory = bundle.inventory
         inventory_digest = _anchor_digest("asset-native-word-inventory-v1", trusted_inventory.anchors)
         ignored_digest = _ignored_anchor_digest(trusted_inventory.ignored_anchors)
@@ -3458,6 +3941,22 @@ def _stage_parser_run(
             )
         ):
             raise ValueError("source asset native inventory is immutable once bound")
+        if (
+            existing_asset is not None
+            and supplied_asset_provenance is not None
+            and str(existing_asset["provenance_hash"]) != asset_provenance
+        ):
+            # Older staging mixed parser-layout evidence into an asset-level
+            # provenance hash. The immutable native inventory above is the
+            # actual source identity, so normalize this derived field only
+            # after that complete inventory has matched exactly.
+            conn.execute(
+                "UPDATE source_assets SET provenance_hash=? WHERE asset_id=?",
+                (asset_provenance, asset_id),
+            )
+            existing_asset = conn.execute(
+                "SELECT * FROM source_assets WHERE asset_id=?", (asset_id,)
+            ).fetchone()
         source_inventory_digest: str | None = None
         if complete:
             if existing_asset is None or not _is_sha256(existing_asset["inventory_manifest_digest"]):
@@ -3481,15 +3980,24 @@ def _stage_parser_run(
             section_anchors = [
                 str(anchor) for record in normalized for anchor in record["native_word_anchors"]
             ]
+            quarantine_anchors = [
+                str(anchor)
+                for record in quarantine_records
+                for anchor in record["native_word_anchors"]
+            ]
+            assigned_anchors = section_anchors + quarantine_anchors
             if (
                 len(set(ignored_hashes)) != len(ignored_hashes)
-                or set(ignored_hashes).intersection(section_anchors)
+                or len(set(assigned_anchors)) != len(assigned_anchors)
+                or set(ignored_hashes).intersection(assigned_anchors)
                 or _ignored_anchor_digest(ignored) != existing_asset["ignored_anchor_digest"]
-                or len(section_anchors) + len(ignored_hashes) != existing_asset["native_word_anchor_count"]
-                or _anchor_digest("asset-native-word-inventory-v1", section_anchors + ignored_hashes)
+                or len(assigned_anchors) + len(ignored_hashes) != existing_asset["native_word_anchor_count"]
+                or _anchor_digest("asset-native-word-inventory-v1", assigned_anchors + ignored_hashes)
                 != existing_asset["native_word_anchor_digest"]
             ):
-                raise ValueError("parser-run coverage does not exactly match the bound source native inventory")
+                raise ValueError(
+                    "parser-run coverage does not exactly match the bound source native inventory"
+                )
             source_inventory_digest = str(existing_asset["inventory_manifest_digest"])
         run_id = "parser-run:" + _digest(product, fingerprint, str(run["parser_output_digest"]))
         # V3 keyed source sections by (product, content_fingerprint,
@@ -3555,7 +4063,16 @@ def _stage_parser_run(
                 )
             ):
                 raise ValueError("complete_manifest must explicitly account for every removed stable identity")
-        counts = {"added": 0, "changed": 0, "unchanged": 0, "ambiguous": 0, "removed": 0, "reused": 0}
+        counts = {
+            "added": 0,
+            "changed": 0,
+            "unchanged": 0,
+            "ambiguous": 0,
+            "removed": 0,
+            "reused": 0,
+            "screening_reused": 0,
+        }
+        exact_section_mapping: dict[str, str] = {}
         next_shard_ordinal = int(conn.execute(
             """SELECT COALESCE(MAX(shard_ordinal), -1) + 1 FROM review_shards
             WHERE product_code=? AND content_fingerprint=?""", (product, run_revision)
@@ -3595,11 +4112,15 @@ def _stage_parser_run(
                 old = prior[0]
                 if (
                     str(old["text_hash"]) == item["text_hash"]
-                    and str(old["provenance_hash"]) == item["provenance_hash"]
+                    and old["page_start"] == item["page_start"]
+                    and old["page_end"] == item["page_end"]
+                    and str(old["printed_page"] or "") == str(item["printed_page"] or "")
+                    and str(old["heading"]) == item["heading"]
                     and _canonical_json(sorted(json.loads(str(old["layout_flags"] or "[]"))))
                     == _canonical_json(sorted(item["layout_flags"]))
                 ):
                     counts["unchanged"] += 1
+                    exact_section_mapping[str(old["section_key"])] = section_key
                     if _clone_resolution(conn, old_section_key=str(old["section_key"]), new_section=inserted, now=now):
                         reused_from = str(old["section_key"])
                         counts["reused"] += 1
@@ -3616,6 +4137,56 @@ def _stage_parser_run(
                 "INSERT INTO parser_section_anchors(parser_run_id, section_key, anchor_hash) VALUES (?, ?, ?)",
                 [(run_id, section_key, str(anchor)) for anchor in item["native_word_anchors"]],
             )
+            conn.executemany(
+                """INSERT INTO parser_section_blocks
+                   (parser_run_id, section_key, block_ordinal, kind, physical_page,
+                    source_text, text_hash, table_json, anchor_digest)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        run_id, section_key, block["block_ordinal"], block["kind"],
+                        block["physical_page"], block["source_text"], block["text_hash"],
+                        block.get("table_json"), block["anchor_digest"],
+                    )
+                    for block in blocks_by_section.get(str(item["source_section_id"]), [])
+                ],
+            )
+            conn.executemany(
+                """INSERT INTO parser_section_block_anchors
+                   (parser_run_id, section_key, block_ordinal, anchor_ordinal, anchor_hash)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (run_id, section_key, block["block_ordinal"], anchor_ordinal, str(anchor))
+                    for block in blocks_by_section.get(str(item["source_section_id"]), [])
+                    for anchor_ordinal, anchor in enumerate(block["native_word_anchors"])
+                ],
+            )
+        for item in quarantine_records:
+            conn.execute(
+                """INSERT INTO parser_quarantine
+                   (parser_run_id, quarantine_id, product_code, reason, physical_page,
+                    source_text, text_hash, anchor_count, anchor_digest)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, item["quarantine_id"], product, item["reason"],
+                    item["physical_page"], item["source_text"], item["text_hash"],
+                    item["native_word_count"], item["native_word_digest"],
+                ),
+            )
+            conn.executemany(
+                """INSERT INTO parser_quarantine_anchors
+                   (parser_run_id, quarantine_id, anchor_hash) VALUES (?, ?, ?)""",
+                [
+                    (run_id, item["quarantine_id"], str(anchor))
+                    for anchor in item["native_word_anchors"]
+                ],
+            )
+        counts["screening_reused"] = _clone_screening_resolutions(
+            conn,
+            parser_run_id=run_id,
+            old_to_new=exact_section_mapping,
+            now=now,
+        )
         conn.executemany(
             "INSERT INTO parser_ignored_anchors(parser_run_id, anchor_hash, reason) VALUES (?, ?, ?)",
             [(run_id, str(item["anchor_hash"]), str(item["reason"])) for item in trusted_inventory.ignored_anchors],
@@ -3684,6 +4255,39 @@ def _validate_trusted_run_commitments(
             "SELECT anchor_hash FROM parser_section_anchors WHERE parser_run_id=? AND section_key=? ORDER BY anchor_hash",
             (target["parser_run_id"], row["section_key"]),
         )]
+        block_rows = conn.execute(
+            """SELECT * FROM parser_section_blocks
+               WHERE parser_run_id=? AND section_key=? ORDER BY block_ordinal""",
+            (target["parser_run_id"], row["section_key"]),
+        ).fetchall()
+        block_anchor_union: list[str] = []
+        for expected_ordinal, block in enumerate(block_rows):
+            if int(block["block_ordinal"]) != expected_ordinal or hashlib.sha256(
+                str(block["source_text"]).encode("utf-8")
+            ).hexdigest() != block["text_hash"]:
+                raise ValueError("trusted parser structural block is corrupted")
+            block_anchors = [str(item[0]) for item in conn.execute(
+                """SELECT anchor_hash FROM parser_section_block_anchors
+                   WHERE parser_run_id=? AND section_key=? AND block_ordinal=?
+                   ORDER BY anchor_ordinal""",
+                (target["parser_run_id"], row["section_key"], expected_ordinal),
+            )]
+            if (
+                not block_anchors
+                or _anchor_digest("section-block-native-word-anchors-v1", block_anchors)
+                != block["anchor_digest"]
+            ):
+                raise ValueError("trusted parser structural block anchors are corrupted")
+            if block["table_json"] is not None:
+                try:
+                    table = json.loads(str(block["table_json"]))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("trusted parser table structure is corrupted") from exc
+                if block["kind"] != "table" or not isinstance(table, list):
+                    raise ValueError("trusted parser table structure is invalid")
+            block_anchor_union.extend(block_anchors)
+        if block_rows and sorted(block_anchor_union) != sorted(section_anchors):
+            raise ValueError("trusted parser structural blocks do not cover their section")
         try:
             flags = json.loads(str(row["layout_flags"] or "[]"))
         except json.JSONDecodeError as exc:
@@ -3706,7 +4310,35 @@ def _validate_trusted_run_commitments(
         commitments.append(commitment)
         anchors.extend(section_anchors)
     parser_output_digest = _parser_output_digest(records)
-    coverage_digest = _native_word_coverage_digest(records)
+    quarantine_records: list[dict[str, object]] = []
+    for item in conn.execute(
+        """SELECT * FROM parser_quarantine WHERE parser_run_id=?
+           ORDER BY quarantine_id""",
+        (target["parser_run_id"],),
+    ):
+        quarantine_anchors = [str(row[0]) for row in conn.execute(
+            """SELECT anchor_hash FROM parser_quarantine_anchors
+               WHERE parser_run_id=? AND quarantine_id=? ORDER BY anchor_hash""",
+            (target["parser_run_id"], item["quarantine_id"]),
+        )]
+        if (
+            hashlib.sha256(str(item["source_text"]).encode("utf-8")).hexdigest()
+            != item["text_hash"]
+            or len(quarantine_anchors) != int(item["anchor_count"])
+            or _anchor_digest("quarantine-native-word-anchors-v1", quarantine_anchors)
+            != item["anchor_digest"]
+        ):
+            raise ValueError("trusted parser quarantine record is corrupted")
+        quarantine_records.append({
+            "quarantine_id": item["quarantine_id"],
+            "reason": item["reason"],
+            "physical_page": item["physical_page"],
+            "native_word_count": len(quarantine_anchors),
+            "native_word_digest": item["anchor_digest"],
+            "native_word_anchors": quarantine_anchors,
+        })
+        anchors.extend(quarantine_anchors)
+    coverage_digest = _native_word_coverage_digest(records, quarantine_records)
     if (
         parser_output_digest != target["parser_output_digest"]
         or parser_output_digest != target["manifest_digest"]
@@ -4169,6 +4801,7 @@ __all__ = [
     "read_draft_screening_record",
     "reclaim_interrupted_shard",
     "release_draft_screening_batch",
+    "reopen_draft_screening",
     "set_review_target",
     "stage_trusted_native_pdf",
     "stage_trusted_native_pdf_with_approved_stitches",

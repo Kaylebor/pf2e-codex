@@ -41,6 +41,7 @@ PAIZO_NATIVE_PARSER_V2 = "paizo-native-v2"
 # recurring two-cell regions.
 PAIZO_NATIVE_PARSER_V3 = "paizo-native-v3"
 PAIZO_NATIVE_LAYOUT_V1 = "paizo-native-v3+pp-doclayout-v3-v1"
+PAIZO_NATIVE_PARSER_V4 = "paizo-native-v4"
 PAIZO_NATIVE_PARSER_VERSION = PAIZO_NATIVE_PARSER_V1
 
 
@@ -250,6 +251,31 @@ class RulebookSection:
 
 
 @dataclass(frozen=True, repr=False)
+class TrustedBlock:
+    """One ordered native-text block inside a trusted section."""
+
+    kind: str
+    physical_page: int
+    ordinal: int
+    text: str = field(repr=False)
+    text_hash: str
+    coverage_anchors: tuple[str, ...] = field(repr=False)
+    table_cells: tuple[tuple[str, ...], ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True, repr=False)
+class TrustedQuarantine:
+    """Private native text excluded from semantic review, never from coverage."""
+
+    quarantine_id: str
+    reason: str
+    physical_page: int
+    text: str = field(repr=False)
+    text_hash: str
+    coverage_anchors: tuple[str, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, repr=False)
 class TrustedSection:
     """Immutable private section record; its repr never exposes source text."""
 
@@ -262,6 +288,7 @@ class TrustedSection:
     stable_section_identity: str
     layout_flags: tuple[str, ...]
     coverage_anchors: tuple[str, ...] = field(repr=False)
+    blocks: tuple[TrustedBlock, ...] = field(default=(), repr=False)
     # Public-safe provenance handle: product/component/physical page/ordinal
     # only. It contains neither title text nor local asset information.
     source_section_id: str = ""
@@ -285,17 +312,47 @@ class TrustedParseBundle:
     sealed_digest: str = field(repr=False)
     artifact_attestation_digest: str = field(repr=False, default="")
     layout_binding_digest: str | None = field(repr=False, default=None)
+    quarantine: tuple[TrustedQuarantine, ...] = field(default=(), repr=False)
 
     def __repr__(self) -> str:
         return (
             f"TrustedParseBundle(product={self.product_code}, parser={self.parser_version}, "
             f"sections={len(self.sections)}, anchors={len(self.inventory.anchors)}, "
-            f"ignored={len(self.inventory.ignored_anchors)})"
+            f"quarantine={len(self.quarantine)}, ignored={len(self.inventory.ignored_anchors)})"
         )
 
     def verify_seal(self) -> None:
         """Raise if this immutable bundle no longer matches its canonical seal."""
-        parser_digest = _trusted_parser_output_digest(self.sections)
+        if self.parser_version == PAIZO_NATIVE_PARSER_V4:
+            for section in self.sections:
+                block_anchors = tuple(
+                    anchor for block in section.blocks for anchor in block.coverage_anchors
+                )
+                if (
+                    not section.blocks
+                    or tuple(block.ordinal for block in section.blocks)
+                    != tuple(range(len(section.blocks)))
+                    or block_anchors != section.coverage_anchors
+                    or _clean_text(" ".join(block.text for block in section.blocks))
+                    != section.text
+                ):
+                    raise ValueError(
+                        "trusted v4 section does not match its ordered native blocks"
+                    )
+            assigned = Counter(
+                anchor
+                for anchors in (
+                    *(section.coverage_anchors for section in self.sections),
+                    *(item.coverage_anchors for item in self.quarantine),
+                )
+                for anchor in anchors
+            )
+            expected = set(self.inventory.anchors) - set(self.inventory.ignored_anchor_reasons)
+            if set(assigned) != expected or any(count != 1 for count in assigned.values()):
+                raise ValueError(
+                    "trusted parser bundle does not account for every native anchor exactly once"
+                )
+        parser_digest = _trusted_parser_output_digest(self.sections, self.quarantine)
         if parser_digest != self.parser_output_digest:
             raise ValueError("trusted parser bundle output digest does not match its sections")
         expected = _trusted_bundle_seal(
@@ -305,6 +362,7 @@ class TrustedParseBundle:
             artifact_attestation=self.artifact_attestation,
             artifact_attestation_digest=self.artifact_attestation_digest,
             inventory=self.inventory, sections=self.sections,
+            quarantine=self.quarantine,
             parser_output_digest=self.parser_output_digest,
             layout_binding_digest=self.layout_binding_digest,
         )
@@ -1410,6 +1468,614 @@ def _is_condensed_bold_body_candidate(line: _Line, body_size: float) -> bool:
     return condensed / len(line.fonts) >= 0.8
 
 
+_V4_BODY_LABELS = {
+    "abstract", "content", "text", "reference", "reference_content",
+}
+_V4_SIDEBAR_LABELS = {"aside_text", "footnote"}
+_V4_HEADING_LABELS = {"doc_title", "paragraph_title"}
+_V4_QUARANTINE_REASONS = {
+    "repeated-furniture", "page-number", "contents-index", "credits-legal",
+    "unresolved-table", "unbound-layout", "heading-artifact",
+    "unresolved-continuation", "unresolved-layout", "layout-order-conflict",
+    "oversize-block",
+}
+_V4_SECTION_TARGET_CHARS = 7_800
+
+
+@dataclass(frozen=True)
+class _V4ParseResult:
+    chunks: tuple[dict[str, Any], ...]
+    blocks_by_section_id: Mapping[str, tuple[TrustedBlock, ...]]
+    quarantine: tuple[TrustedQuarantine, ...]
+
+
+def _v4_page_quarantine_reason(page_number: int, lines: Sequence[_Line]) -> str | None:
+    """Classify bounded whole-page non-rule matter without exposing its text."""
+    normalized = [_normalize_name(line.text) for line in lines]
+    exact = set(normalized)
+    if exact & {"contents", "table of contents", "index", "subject index"}:
+        return "contents-index"
+    leader_rows = sum(
+        bool(re.search(r"(?:\.{2,}|\s)\d{1,4}\s*$", line.text))
+        for line in lines
+    )
+    if len(lines) >= 8 and leader_rows >= max(5, len(lines) // 3):
+        return "contents-index"
+    legal_markers = {
+        "credits", "open game license version 1 0a", "orc notice",
+        "orc license", "product identity", "designation of product identity",
+    }
+    if exact & legal_markers or any(
+        marker in value for marker in legal_markers for value in normalized
+    ):
+        return "credits-legal"
+    # Front-matter credit blocks often have no single canonical title, but a
+    # dense cluster of role labels is deterministic and book-independent.
+    credit_roles = ("authors", "designers", "developers", "editors", "art director")
+    if page_number <= 12 and sum(
+        any(role in value for role in credit_roles) for value in normalized
+    ) >= 3:
+        return "credits-legal"
+    return None
+
+
+def _v4_is_heading(line: _Line, body_size: float, region_label: str) -> bool:
+    text = line.text.strip()
+    if not text or _PAGE_NUMBER_RE.fullmatch(text):
+        return False
+    words = text.split()
+    sentence_like = (
+        len(text) > 80
+        or len(words) >= 16
+        or (len(words) >= 8 and text[-1:] in {".", "?", "!", ";", ":"})
+    )
+    if sentence_like:
+        return False
+    if region_label == "heading" or region_label in _V4_HEADING_LABELS:
+        return len(text) <= 160 and sum(char.isalnum() for char in text) >= 3
+    if line.layout_kind.startswith("table"):
+        return False
+    return _is_heading_v2(line, body_size)
+
+
+def _v4_table_rows(
+    page: Mapping[str, Any], raw_lines: Sequence[_Line]
+) -> list[list[_Line]] | None:
+    """Return a stable native table grid or ``None`` when geometry is ambiguous."""
+    width = float(page.get("width", 0) or 0)
+    height = float(page.get("height", 0) or 0)
+    rows = _rows_for_lines(raw_lines)
+    data_rows = [sorted(row, key=lambda item: item.x0) for row in rows if len(row) >= 2]
+    if len(data_rows) < 2 or not width:
+        return None
+    counts = Counter(len(row) for row in data_rows)
+    cell_count, support = counts.most_common(1)[0]
+    if support < 2 or cell_count > 8:
+        return None
+    aligned = [row for row in data_rows if len(row) == cell_count]
+    sizes = [line.size for row in aligned for line in row if line.size > 0]
+    tolerance = max(width * 0.035, (median(sizes) if sizes else 9.0) * 2.0)
+    signature = _row_grid_signature(aligned[0], tolerance)
+    if any(_row_grid_signature(row, tolerance) != signature for row in aligned[1:]):
+        return None
+    vertical_span = max(line.bottom for row in aligned for line in row) - min(
+        line.top for row in aligned for line in row
+    )
+    if height and vertical_span > height * 0.8:
+        return None
+    # One-cell rows are retained as spanning table headings or notes; any
+    # other inconsistent row shape makes the entire region unresolved.
+    if any(len(row) not in {1, cell_count} for row in rows):
+        return None
+    return [sorted(row, key=lambda item: item.x0) for row in rows]
+
+
+def _v4_native_fallback_order(line: _Line, regions: Sequence[Any]) -> float:
+    """Place a model-uncovered native line between nearby bound regions.
+
+    PP-DocLayout can omit dense stat-block text while still detecting the
+    headings immediately above and below it. Native geometry is authoritative,
+    so use those same-column regions as deterministic order brackets instead
+    of quarantining the uncovered words or inventing OCR text.
+    """
+    textual = [
+        region
+        for region in regions
+        if region.label
+        in _V4_BODY_LABELS | _V4_SIDEBAR_LABELS | _V4_HEADING_LABELS | {"table"}
+    ]
+    if not textual:
+        return float("inf")
+
+    def horizontal_distance(region: Any) -> float:
+        x0, _y0, x1, _y1 = (float(value) for value in region.box)
+        return max(x0 - line.x1, line.x0 - x1, 0.0)
+
+    nearest_distance = min(horizontal_distance(region) for region in textual)
+    nearby = [
+        region
+        for region in textual
+        if horizontal_distance(region) <= nearest_distance + max(line.size * 2.0, 12.0)
+    ]
+    overlapping = [
+        region
+        for region in nearby
+        if float(region.box[1]) <= (line.top + line.bottom) / 2 <= float(region.box[3])
+    ]
+    if overlapping:
+        chosen = min(
+            overlapping,
+            key=lambda region: (
+                horizontal_distance(region),
+                max(0.0, float(region.box[2]) - float(region.box[0]))
+                * max(0.0, float(region.box[3]) - float(region.box[1])),
+                int(region.order),
+            ),
+        )
+        return float(chosen.order)
+
+    above = [region for region in nearby if float(region.box[3]) <= line.top + 2.0]
+    below = [region for region in nearby if float(region.box[1]) >= line.bottom - 2.0]
+    previous = max(above, key=lambda region: (float(region.box[3]), int(region.order))) if above else None
+    following = min(below, key=lambda region: (float(region.box[1]), int(region.order))) if below else None
+    if previous is not None and following is not None:
+        before = float(previous.order)
+        after = float(following.order)
+        if before < after:
+            return (before + after) / 2.0
+        return before + 0.5
+    if previous is not None:
+        return float(previous.order) + 0.5
+    if following is not None:
+        return float(following.order) - 0.5
+    return float("inf")
+
+
+def _v4_quarantine(
+    product: ProductSpec,
+    reason: str,
+    page: int,
+    ordinal: int,
+    text: str,
+    anchors: Sequence[str],
+) -> TrustedQuarantine:
+    if reason not in _V4_QUARANTINE_REASONS or not anchors:
+        raise ValueError("invalid native-text quarantine record")
+    cleaned = _clean_text(text)
+    digest = hashlib.sha256("\n".join(anchors).encode()).hexdigest()[:20]
+    return TrustedQuarantine(
+        quarantine_id=(
+            f"{product.code.casefold()}:{product.component}:p{page}:q{ordinal}:{digest}"
+        ),
+        reason=reason,
+        physical_page=page,
+        text=cleaned,
+        text_hash=hashlib.sha256(cleaned.encode()).hexdigest(),
+        coverage_anchors=tuple(anchors),
+    )
+
+
+def _parse_rulebook_payload_v4(
+    payload: Mapping[str, Any],
+    *,
+    product: ProductSpec,
+    binding: Any,
+    fallback_filename: str,
+) -> _V4ParseResult:
+    """Reconstruct review sections from native words ordered by bound layout regions."""
+    if binding.product_code != product.code:
+        raise ValueError("native layout binding does not match the parser product")
+    inventory = native_word_inventory(payload, product.code, strict=True)
+    annotated = annotate_native_words(payload, inventory)
+    pages = {
+        int(page["number"]): page
+        for page in annotated.get("pages", [])
+        if isinstance(page, Mapping)
+    }
+    if tuple(sorted(pages)) != tuple(binding.selected_pages):
+        raise ValueError("v4 layout evidence must cover every native PDF page")
+
+    words_by_anchor: dict[str, Mapping[str, Any]] = {}
+    page_by_anchor: dict[str, int] = {}
+    for page_number, page in pages.items():
+        for word in page.get("words", []):
+            if not isinstance(word, Mapping):
+                continue
+            anchor = word.get("_native_anchor")
+            if isinstance(anchor, str) and anchor not in inventory.ignored_anchor_reasons:
+                words_by_anchor[anchor] = word
+                page_by_anchor[anchor] = page_number
+
+    regions_by_page: dict[int, list[Any]] = defaultdict(list)
+    for region in binding.regions:
+        regions_by_page[int(region.page)].append(region)
+    for regions in regions_by_page.values():
+        regions.sort(key=lambda item: (item.order, item.box, item.label))
+
+    furniture = _repeated_furniture(tuple(pages.values()), _lines_for_page_v2)
+    ordered: list[tuple[int, str, _Line, tuple[tuple[str, ...], ...]]] = []
+    quarantined: list[TrustedQuarantine] = []
+    quarantine_ordinals: Counter[tuple[int, str]] = Counter()
+    assigned: set[str] = set()
+    fallback_anchors: set[str] = set()
+
+    def quarantine(reason: str, page: int, text: str, anchors: Sequence[str]) -> None:
+        unique = tuple(anchor for anchor in anchors if anchor not in assigned)
+        if not unique:
+            return
+        key = (page, reason)
+        quarantined.append(
+            _v4_quarantine(product, reason, page, quarantine_ordinals[key], text, unique)
+        )
+        quarantine_ordinals[key] += 1
+        assigned.update(unique)
+
+    for page_number in sorted(pages):
+        page = pages[page_number]
+        all_lines = _lines_for_page_v2(page)
+        page_reason = _v4_page_quarantine_reason(page_number, all_lines)
+        page_anchors = tuple(
+            str(word["_native_anchor"])
+            for word in page.get("words", [])
+            if isinstance(word, Mapping)
+            and isinstance(word.get("_native_anchor"), str)
+            and word["_native_anchor"] not in inventory.ignored_anchor_reasons
+        )
+        if page_reason is not None:
+            quarantine(page_reason, page_number, " ".join(line.text for line in all_lines), page_anchors)
+            continue
+        height = float(page.get("height", 0) or 0)
+        page_regions = regions_by_page.get(page_number, [])
+        page_ordered: list[
+            tuple[float, float, float, str, _Line, tuple[tuple[str, ...], ...]]
+        ] = []
+        order_conflicts: set[int] = set()
+        for index, (earlier, later) in enumerate(
+            zip(page_regions, page_regions[1:], strict=False)
+        ):
+            earlier_width = max(1.0, float(earlier.box[2]) - float(earlier.box[0]))
+            later_width = max(1.0, float(later.box[2]) - float(later.box[0]))
+            overlap = max(
+                0.0,
+                min(float(earlier.box[2]), float(later.box[2]))
+                - max(float(earlier.box[0]), float(later.box[0])),
+            )
+            if (
+                overlap / min(earlier_width, later_width) >= 0.5
+                and float(later.box[1]) + 2.0 < float(earlier.box[1])
+            ):
+                order_conflicts.update((index, index + 1))
+        if order_conflicts:
+            conflict_anchors = tuple(
+                anchor
+                for region_index in sorted(order_conflicts)
+                for anchor in page_regions[region_index].native_word_anchors
+                if anchor in words_by_anchor and anchor not in assigned
+            )
+            quarantine(
+                "layout-order-conflict",
+                page_number,
+                " ".join(
+                    str(words_by_anchor[anchor].get("text", ""))
+                    for anchor in conflict_anchors
+                ),
+                conflict_anchors,
+            )
+        for region_index, region in enumerate(page_regions):
+            anchors = tuple(
+                anchor
+                for anchor in region.native_word_anchors
+                if anchor in words_by_anchor and anchor not in assigned
+            )
+            if not anchors:
+                continue
+            if region_index in order_conflicts:
+                continue
+            region_page = dict(page)
+            region_page["words"] = [words_by_anchor[anchor] for anchor in anchors]
+            raw_lines = _lines_for_page_v2(region_page)
+            if not raw_lines:
+                quarantine("unresolved-layout", page_number, "", anchors)
+                continue
+            if region.label == "table":
+                rows = _v4_table_rows(region_page, raw_lines)
+                if rows is None:
+                    quarantine(
+                        "unresolved-table", page_number,
+                        " ".join(line.text for line in raw_lines), anchors,
+                    )
+                    continue
+                for row in rows:
+                    line = _table_block(row, layout_kind="table-grid")
+                    row_cells = (tuple(item.text for item in row),)
+                    page_ordered.append(
+                        (
+                            float(region.order), line.top, line.x0,
+                            "table", line, row_cells,
+                        )
+                    )
+                    assigned.update(line.native_word_anchors)
+                continue
+            if region.label not in _V4_BODY_LABELS | _V4_SIDEBAR_LABELS | _V4_HEADING_LABELS:
+                quarantine(
+                    "unresolved-layout", page_number,
+                    " ".join(line.text for line in raw_lines), anchors,
+                )
+                continue
+            lines = _reading_order_v2(region_page, raw_lines)
+            for line in lines:
+                line_anchors = tuple(anchor for anchor in line.native_word_anchors if anchor not in assigned)
+                if not line_anchors:
+                    continue
+                normalized = _normalize_name(re.sub(r"\b\d+\b", "", line.text))
+                margin = bool(height and (line.top < height * 0.12 or line.bottom > height * 0.88))
+                if margin and _PAGE_NUMBER_RE.fullmatch(line.text.strip()):
+                    quarantine("page-number", page_number, line.text, line_anchors)
+                    continue
+                if margin and normalized in furniture:
+                    quarantine("repeated-furniture", page_number, line.text, line_anchors)
+                    continue
+                kind = "sidebar" if region.label in _V4_SIDEBAR_LABELS else "body"
+                if region.label in _V4_HEADING_LABELS:
+                    kind = "heading"
+                page_ordered.append(
+                    (
+                        float(region.order), line.top, line.x0,
+                        kind, replace(line, layout_kind=kind), (),
+                    )
+                )
+                assigned.update(line_anchors)
+
+        # Model-unbound native words remain authoritative. Reconstruct their
+        # lines from the PDF geometry and bracket them between nearby detected
+        # regions; never invent OCR text or silently discard a stat block.
+        remaining = [anchor for anchor in page_anchors if anchor not in assigned]
+        if remaining:
+            fallback_page = dict(page)
+            fallback_page["words"] = [words_by_anchor[anchor] for anchor in remaining]
+            for line in _reading_order_v2(fallback_page, _lines_for_page_v2(fallback_page)):
+                line_anchors = tuple(
+                    anchor for anchor in line.native_word_anchors if anchor not in assigned
+                )
+                if not line_anchors:
+                    continue
+                normalized = _normalize_name(re.sub(r"\b\d+\b", "", line.text))
+                margin = bool(
+                    height
+                    and (line.top < height * 0.12 or line.bottom > height * 0.88)
+                )
+                if margin and _PAGE_NUMBER_RE.fullmatch(line.text.strip()):
+                    quarantine("page-number", page_number, line.text, line_anchors)
+                    continue
+                if margin and normalized in furniture:
+                    quarantine("repeated-furniture", page_number, line.text, line_anchors)
+                    continue
+                page_ordered.append(
+                    (
+                        _v4_native_fallback_order(line, page_regions),
+                        line.top,
+                        line.x0,
+                        "native-fallback",
+                        replace(line, layout_kind="native-fallback"),
+                        (),
+                    )
+                )
+                assigned.update(line_anchors)
+                fallback_anchors.update(line_anchors)
+        ordered.extend(
+            (page_number, kind, line, cells)
+            for _order, _top, _x0, kind, line, cells in sorted(
+                page_ordered, key=lambda item: item[:3]
+            )
+        )
+
+    sections: list[dict[str, Any]] = []
+    blocks_by_section_id: dict[str, tuple[TrustedBlock, ...]] = {}
+    section_ordinals: Counter[tuple[int, str]] = Counter()
+    title: str | None = None
+    body_lines: list[str] = []
+    blocks: list[TrustedBlock] = []
+    anchors: list[str] = []
+    pages_in_section: list[int] = []
+    layout_flags: set[str] = set()
+
+    def quarantine_open(reason: str) -> None:
+        nonlocal title, body_lines, blocks, anchors, pages_in_section, layout_flags
+        if anchors:
+            key = (pages_in_section[0], reason)
+            quarantined.append(
+                _v4_quarantine(
+                    product, reason, pages_in_section[0], quarantine_ordinals[key],
+                    " ".join(block.text for block in blocks), anchors,
+                )
+            )
+            quarantine_ordinals[key] += 1
+        title = None
+        body_lines = []
+        blocks = []
+        anchors = []
+        pages_in_section = []
+        layout_flags = set()
+
+    def flush() -> None:
+        nonlocal title, body_lines, blocks, anchors, pages_in_section, layout_flags
+        if title is None or not body_lines:
+            quarantine_open("heading-artifact" if title else "unresolved-continuation")
+            return
+        if any(len(block.text) > _V4_SECTION_TARGET_CHARS for block in blocks):
+            quarantine_open("oversize-block")
+            return
+        heading_chain = tuple(
+            block.text for block in blocks if block.kind == "heading"
+        )
+        identity_heading = "\n".join(heading_chain) or title
+        groups: list[list[TrustedBlock]] = []
+        current: list[TrustedBlock] = []
+        current_chars = 0
+        for block in blocks:
+            next_chars = current_chars + len(block.text) + int(bool(current))
+            if (
+                current
+                and next_chars > _V4_SECTION_TARGET_CHARS
+                and any(item.kind != "heading" for item in current)
+            ):
+                groups.append(current)
+                current = []
+                current_chars = 0
+            current.append(block)
+            current_chars += len(block.text) + int(len(current) > 1)
+        if current:
+            groups.append(current)
+        split = len(groups) > 1
+        for group in groups:
+            group_blocks = tuple(
+                replace(block, ordinal=ordinal)
+                for ordinal, block in enumerate(group)
+            )
+            group_anchors = tuple(
+                anchor for block in group_blocks for anchor in block.coverage_anchors
+            )
+            page_values = tuple(
+                dict.fromkeys(block.physical_page for block in group_blocks)
+            )
+            page_start = page_values[0]
+            key = (page_start, _slug(title))
+            ordinal = section_ordinals[key]
+            section_ordinals[key] += 1
+            section_id = (
+                f"corpus:{product.code}:{product.component}:p{page_start}:"
+                f"{key[1]}:{ordinal}"
+            )
+            text = _clean_text(" ".join(block.text for block in group_blocks))
+            group_flags = {
+                *("structured-table" for block in group_blocks if block.kind == "table"),
+                *("structured-sidebar" for block in group_blocks if block.kind == "sidebar"),
+            }
+            if split:
+                group_flags.add("oversize-split")
+            if fallback_anchors.intersection(group_anchors):
+                group_flags.add("native-layout-fallback")
+            provenance = {
+                "export_schema_version": payload.get("schema_version"),
+                "title": product.title,
+                "physical_pages": list(page_values),
+                "printed_pages": [],
+                "content_fingerprint": inventory.content_fingerprint,
+                "native_word_anchors": list(group_anchors),
+                "heading_chain": list(heading_chain),
+                "stable_section_identity": _stable_section_identity(
+                    product, page_start, None, identity_heading, ordinal
+                ),
+            }
+            if group_flags:
+                provenance["layout_flags"] = sorted(group_flags)
+            section_hash = hashlib.sha256(text.encode()).hexdigest()
+            sections.append(
+                RulebookSection(
+                    id=section_id, name=title, text=text, product_code=product.code,
+                    book=product.title, component=product.component,
+                    rules_era=product.rules_era, license=product.license,
+                    remaster=product.remaster,
+                    source_filename=_safe_basename(fallback_filename),
+                    source_sha256="", pages=page_values, page_start=page_start,
+                    page_end=page_values[-1], printed_page=None,
+                    section_hash=section_hash, provenance=provenance,
+                    ordinal=ordinal, parser_version=PAIZO_NATIVE_PARSER_V4,
+                ).as_chunk()
+            )
+            blocks_by_section_id[section_id] = group_blocks
+        title = None
+        body_lines = []
+        blocks = []
+        anchors = []
+        pages_in_section = []
+        layout_flags = set()
+
+    page_sizes: dict[int, float] = {}
+    for page_number, page in pages.items():
+        sizes = [
+            float(word.get("size", 0)) for word in page.get("words", [])
+            if isinstance(word, Mapping) and float(word.get("size", 0)) > 0
+        ]
+        page_sizes[page_number] = median(sizes) if sizes else 9.0
+
+    for page_number, kind, line, table_cells in ordered:
+        heading = _v4_is_heading(line, page_sizes[page_number], kind)
+        if heading:
+            if (
+                title is not None
+                and not body_lines
+                and pages_in_section[-1] == page_number
+            ):
+                title = line.text
+                anchors.extend(line.native_word_anchors)
+                pages_in_section.append(page_number)
+                blocks.append(
+                    TrustedBlock(
+                        kind="heading", physical_page=page_number,
+                        ordinal=len(blocks), text=line.text,
+                        text_hash=hashlib.sha256(line.text.encode()).hexdigest(),
+                        coverage_anchors=line.native_word_anchors,
+                    )
+                )
+                continue
+            flush()
+            title = line.text
+            anchors = list(line.native_word_anchors)
+            pages_in_section = [page_number]
+            blocks = [
+                TrustedBlock(
+                    kind="heading", physical_page=page_number, ordinal=0,
+                    text=line.text, text_hash=hashlib.sha256(line.text.encode()).hexdigest(),
+                    coverage_anchors=line.native_word_anchors,
+                )
+            ]
+            continue
+        block_kind = "body" if kind == "native-fallback" else kind
+        if title is None:
+            # Keep collecting until a real heading is observed; the group is
+            # quarantined deterministically at the next boundary/end.
+            pages_in_section.append(page_number)
+            anchors.extend(line.native_word_anchors)
+            body_lines.append(line.text)
+            blocks.append(
+                TrustedBlock(
+                    kind=block_kind, physical_page=page_number, ordinal=len(blocks),
+                    text=line.text, text_hash=hashlib.sha256(line.text.encode()).hexdigest(),
+                    coverage_anchors=line.native_word_anchors, table_cells=table_cells,
+                )
+            )
+            continue
+        body_lines.append(line.text)
+        pages_in_section.append(page_number)
+        anchors.extend(line.native_word_anchors)
+        blocks.append(
+            TrustedBlock(
+                kind=block_kind, physical_page=page_number, ordinal=len(blocks),
+                text=line.text, text_hash=hashlib.sha256(line.text.encode()).hexdigest(),
+                coverage_anchors=line.native_word_anchors, table_cells=table_cells,
+            )
+        )
+        if kind == "table":
+            layout_flags.add("structured-table")
+        elif kind == "sidebar":
+            layout_flags.add("structured-sidebar")
+    flush()
+
+    expected = set(inventory.anchors) - set(inventory.ignored_anchor_reasons)
+    ownership = Counter(
+        anchor
+        for anchor_group in (
+            *(chunk["provenance"]["native_word_anchors"] for chunk in sections),
+            *(item.coverage_anchors for item in quarantined),
+        )
+        for anchor in anchor_group
+    )
+    if set(ownership) != expected or any(value != 1 for value in ownership.values()):
+        raise ValueError("v4 parser did not assign every native anchor exactly once")
+    return _V4ParseResult(tuple(sections), MappingProxyType(blocks_by_section_id), tuple(quarantined))
+
+
 def _slug(value: str) -> str:
     value = _normalize_name(value).replace(" ", "-")
     return value[:80] or "section"
@@ -1439,13 +2105,47 @@ def _trusted_section_canonical(section: TrustedSection) -> dict[str, object]:
         "stable_section_identity": section.stable_section_identity,
         "layout_flags": section.layout_flags,
         "anchors": section.coverage_anchors,
+        "blocks": [
+            {
+                "kind": block.kind,
+                "page": block.physical_page,
+                "ordinal": block.ordinal,
+                "text_hash": block.text_hash,
+                "anchors": block.coverage_anchors,
+                "table_shape": tuple(len(row) for row in block.table_cells),
+            }
+            for block in section.blocks
+        ],
     }
 
 
-def _trusted_parser_output_digest(sections: Sequence[TrustedSection]) -> str:
-    canonical = [_trusted_section_canonical(section) for section in sections]
+def _trusted_quarantine_canonical(item: TrustedQuarantine) -> dict[str, object]:
+    return {
+        "id": item.quarantine_id,
+        "reason": item.reason,
+        "page": item.physical_page,
+        "text_hash": item.text_hash,
+        "anchors": item.coverage_anchors,
+    }
+
+
+def _trusted_parser_output_digest(
+    sections: Sequence[TrustedSection],
+    quarantine: Sequence[TrustedQuarantine] = (),
+) -> str:
+    canonical: object
+    if quarantine:
+        canonical = {
+            "sections": [_trusted_section_canonical(section) for section in sections],
+            "quarantine": [_trusted_quarantine_canonical(item) for item in quarantine],
+        }
+    else:
+        canonical = [_trusted_section_canonical(section) for section in sections]
     return hashlib.sha256(
-        ("trusted-parser-output-v2\n" + json.dumps(canonical, sort_keys=True, separators=(",", ":"))).encode()
+        (
+            ("trusted-parser-output-v3\n" if quarantine else "trusted-parser-output-v2\n")
+            + json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        ).encode()
     ).hexdigest()
 
 
@@ -1460,6 +2160,7 @@ def _trusted_bundle_seal(
     inventory: NativeWordInventory,
     sections: Sequence[TrustedSection],
     parser_output_digest: str,
+    quarantine: Sequence[TrustedQuarantine] = (),
     layout_binding_digest: str | None = None,
 ) -> str:
     material = {
@@ -1473,6 +2174,7 @@ def _trusted_bundle_seal(
         "semantic_fingerprint": semantic_fingerprint,
         "ignored_policy": sorted((item.anchor_hash, item.reason) for item in inventory.ignored_anchors),
         "sections": [_trusted_section_canonical(section) for section in sections],
+        "quarantine": [_trusted_quarantine_canonical(item) for item in quarantine],
         "parser_output_digest": parser_output_digest,
     }
     return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -1771,6 +2473,7 @@ def parse_verified_native_export(
     artifact: VerifiedNativeExport,
     *,
     parser_version: str = PAIZO_NATIVE_PARSER_VERSION,
+    layout_binding: Any | None = None,
 ) -> TrustedParseBundle:
     """Parse one verified in-memory export into a private staging contract."""
     if (
@@ -1784,10 +2487,22 @@ def parse_verified_native_export(
     if product is None:
         raise ValueError("verified export references an unsupported PZO product")
     inventory = native_word_inventory(artifact.payload, product.code, strict=True)
-    sections = parse_rulebook_payload(
-        artifact.payload, product=product, parser_version=parser_version,
-        fallback_filename=artifact.source_basename,
-    )
+    v4_result: _V4ParseResult | None = None
+    if parser_version == PAIZO_NATIVE_PARSER_V4:
+        if layout_binding is None:
+            raise ValueError("paizo-native-v4 requires complete bound layout evidence")
+        v4_result = _parse_rulebook_payload_v4(
+            artifact.payload, product=product, binding=layout_binding,
+            fallback_filename=artifact.source_basename,
+        )
+        sections = list(v4_result.chunks)
+    else:
+        if layout_binding is not None:
+            raise ValueError("bound layout input is only accepted by paizo-native-v4")
+        sections = parse_rulebook_payload(
+            artifact.payload, product=product, parser_version=parser_version,
+            fallback_filename=artifact.source_basename,
+        )
     trusted_sections: list[TrustedSection] = []
     for section in sections:
         provenance = section.get("provenance")
@@ -1808,8 +2523,15 @@ def parse_verified_native_export(
         ordinal_text = str(section["id"]).rsplit(":", 1)[-1]
         if not ordinal_text.isdigit():
             raise ValueError("parser section lacks a structural ordinal")
+        heading_chain = provenance.get("heading_chain", [section["name"]])
+        if (
+            not isinstance(heading_chain, list)
+            or not heading_chain
+            or any(not isinstance(value, str) or not value for value in heading_chain)
+        ):
+            raise ValueError("parser section heading chain is invalid")
         heading_anchor = hashlib.sha256(
-            _normalize_name(str(section["name"])).encode("utf-8")
+            "\n".join(_normalize_name(value) for value in heading_chain).encode("utf-8")
         ).hexdigest()[:16]
         source_section_id = (
             f"{product.code.casefold()}:{product.component}:p{pages[0]}:"
@@ -1825,9 +2547,14 @@ def parse_verified_native_export(
                 printed_page=section.get("printed_page") if isinstance(section.get("printed_page"), str) else None,
                 stable_section_identity=stable, layout_flags=tuple(sorted(flags)),
                 coverage_anchors=tuple(anchors),
+                blocks=(
+                    v4_result.blocks_by_section_id.get(str(section["id"]), ())
+                    if v4_result is not None else ()
+                ),
             )
         )
-    parser_output_digest = _trusted_parser_output_digest(trusted_sections)
+    quarantine = v4_result.quarantine if v4_result is not None else ()
+    parser_output_digest = _trusted_parser_output_digest(trusted_sections, quarantine)
     attestation = MappingProxyType({
         "product_verified": True,
         "page_count": artifact.page_count,
@@ -1841,6 +2568,10 @@ def parse_verified_native_export(
         semantic_fingerprint=inventory.content_fingerprint, artifact_attestation=attestation,
         artifact_attestation_digest=artifact.attestation_digest, inventory=inventory,
         sections=trusted_sections, parser_output_digest=parser_output_digest,
+        quarantine=quarantine,
+        layout_binding_digest=(
+            str(layout_binding.binding_digest) if layout_binding is not None else None
+        ),
     )
     return TrustedParseBundle(
         product_code=product.code,
@@ -1853,6 +2584,10 @@ def parse_verified_native_export(
         sections=tuple(trusted_sections),
         parser_output_digest=parser_output_digest,
         sealed_digest=sealed_digest,
+        layout_binding_digest=(
+            str(layout_binding.binding_digest) if layout_binding is not None else None
+        ),
+        quarantine=quarantine,
     )
 
 
@@ -1876,11 +2611,12 @@ def load_and_parse_verified_pdf(
         source_pdf, product_code=product_code, expected_title_markers=title_markers,
         catalog_title_markers=catalog_title_markers,
     )
-    bundle = parse_verified_native_export(artifact, parser_version=parser_version)
     if layout_artifact is None:
-        return bundle
-    if parser_version != PAIZO_NATIVE_PARSER_V3:
-        raise ValueError("layout evidence currently requires paizo-native-v3")
+        if parser_version == PAIZO_NATIVE_PARSER_V4:
+            raise ValueError("paizo-native-v4 requires complete layout evidence")
+        return parse_verified_native_export(artifact, parser_version=parser_version)
+    if parser_version not in {PAIZO_NATIVE_PARSER_V3, PAIZO_NATIVE_PARSER_V4}:
+        raise ValueError("layout evidence requires the current licensed-review parser")
     from .pdf_layout import bind_layout_to_native_export
 
     binding = bind_layout_to_native_export(artifact, layout_artifact)
@@ -1895,6 +2631,11 @@ def load_and_parse_verified_pdf(
         raise ValueError(
             "trusted layout evidence must cover every exported native PDF page"
         )
+    if parser_version == PAIZO_NATIVE_PARSER_V4:
+        return parse_verified_native_export(
+            artifact, parser_version=parser_version, layout_binding=binding
+        )
+    bundle = parse_verified_native_export(artifact, parser_version=parser_version)
     return apply_layout_evidence(bundle, binding)
 
 
@@ -2042,6 +2783,12 @@ def repair_trusted_bundle(
         group = [sections[position] for position in indexes]
         pages = tuple(sorted({page for section in group for page in section.physical_pages}))
         anchors = tuple(anchor for section in group for anchor in section.coverage_anchors)
+        merged_blocks = tuple(
+            replace(block, ordinal=ordinal)
+            for ordinal, block in enumerate(
+                block for section in group for block in section.blocks
+            )
+        )
         if len(set(anchors)) != len(anchors):
             raise ValueError("trusted stitch would duplicate native anchors")
         text = "\n\n".join(section.text.rstrip() for section in group).strip()
@@ -2065,6 +2812,7 @@ def repair_trusted_bundle(
                     *(flag for section in group for flag in section.layout_flags),
                 })),
                 coverage_anchors=anchors,
+                blocks=merged_blocks,
             )
         )
         index += len(indexes)
@@ -2073,7 +2821,7 @@ def repair_trusted_bundle(
     repaired_anchors = [anchor for section in repaired for anchor in section.coverage_anchors]
     if sorted(original_anchors) != sorted(repaired_anchors):
         raise ValueError("trusted stitch changed native anchor coverage")
-    parser_output_digest = _trusted_parser_output_digest(repaired)
+    parser_output_digest = _trusted_parser_output_digest(repaired, bundle.quarantine)
     sealed_digest = _trusted_bundle_seal(
         product_code=bundle.product_code,
         parser_version=bundle.parser_version,
@@ -2084,6 +2832,7 @@ def repair_trusted_bundle(
         inventory=bundle.inventory,
         sections=repaired,
         parser_output_digest=parser_output_digest,
+        quarantine=bundle.quarantine,
         layout_binding_digest=bundle.layout_binding_digest,
     )
     result = TrustedParseBundle(
@@ -2098,6 +2847,7 @@ def repair_trusted_bundle(
         parser_output_digest=parser_output_digest,
         sealed_digest=sealed_digest,
         layout_binding_digest=bundle.layout_binding_digest,
+        quarantine=bundle.quarantine,
     )
     result.verify_seal()
     return result
@@ -2150,6 +2900,7 @@ __all__ = [
     "PAIZO_NATIVE_PARSER_V1",
     "PAIZO_NATIVE_PARSER_V2",
     "PAIZO_NATIVE_PARSER_V3",
+    "PAIZO_NATIVE_PARSER_V4",
     "PAIZO_NATIVE_LAYOUT_V1",
     "PAIZO_NATIVE_PARSER_VERSION",
     "PRODUCT_CATALOG",
@@ -2159,6 +2910,8 @@ __all__ = [
     "ProductSpec",
     "RulebookSection",
     "TrustedSection",
+    "TrustedBlock",
+    "TrustedQuarantine",
     "TrustedParseBundle",
     "SelectedRevision",
     "discover",

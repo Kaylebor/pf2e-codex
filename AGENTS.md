@@ -212,11 +212,30 @@ terminal conflicts fail, and a noncanonical exact-text duplicate is stored as
 `REJECT` with its canonical section reference. The public builder must continue
 to ignore all screening tables.
 
-The frozen `paizo-native-v1` and exploratory `paizo-native-v2` profiles must
-not change. Opt-in `paizo-native-v3` preserves v2 reading order, but uses a
-page-local x-band model to keep recurring condensed body-sized two-cell labels
-out of heading boundaries. It marks the containing section `table-cell`, which
-is a layout-review gate for public candidates.
+The frozen `paizo-native-v1`, `paizo-native-v2`, and `paizo-native-v3` profiles
+must not change. The licensed-review runner defaults to `paizo-native-v4`.
+V4 binds GPU-produced PP-DocLayout regions to the authoritative native words,
+then emits ordered structural blocks, active sections, and bounded quarantine
+records. Every native anchor must occur exactly once across active blocks,
+quarantine, or constrained ignores, and each active section's text must equal
+the normalized projection of its ordered blocks. Ambiguous order, indivisible
+oversize blocks, unresolved tables, and unsupported detected regions fail
+closed into quarantine rather than disappearing or being guessed into public
+text.
+When the model omits a dense text region entirely (notably Monster Core stat
+blocks), V4 reconstructs those authoritative native words with the frozen
+native geometry and brackets them between nearby detected regions. Such
+sections carry `native-layout-fallback`, which remains visible to classification
+and independent review. It is not itself a forced mixed-extraction decision:
+the fallback is exact native text, and forcing every partly recovered section
+to Terra would create a large, unjustified review cost.
+
+V4 workspace preparation is a one-way schema upgrade, not a compatibility
+layer. It builds from a read-only SQLite backup in a sibling file, carries
+forward only exact unchanged terminal work, applies content-free structural
+and aggregate rule-probe gates, and atomically replaces the live workspace only
+after validation. Screening is append-only: rejection remains auditable and a
+maintainer may explicitly reopen it without deleting its prior decision.
 
 When a local-full seed has a complete PDF for a product, suppress the bundled
 licensed-core rows for that product; keep bundled rows for missing products.
@@ -339,6 +358,7 @@ pf2e_codex/
 ├── pdf_export.py   # Native PDF words/geometry → versioned ignored JSON
 ├── pdf_layout.py   # GPU-first ONNX regions/order bound to opaque native anchors
 ├── corpus.py       # PZO discovery/revision selection + Paizo rulebook parsing
+├── corpus_quality.py # Content-free parser audits and acceptance gates
 ├── licensed_corpus.py # Ignored review workspace + deterministic public builder
 ├── licensed_core.py # Validate/load the bundled reviewed mechanics projection
 ├── licensed_policy.py # Tracked mechanics-selection policy and digest
