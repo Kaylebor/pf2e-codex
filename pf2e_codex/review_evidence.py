@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .licensed_corpus import _semantic_scope_sql
+
 _AON_HOSTS = {"2e.aonprd.com", "aonprd.com", "www.aonprd.com"}
 _WORD_RE = re.compile(r"[a-z0-9]{2,}")
 
@@ -51,13 +53,14 @@ def _authorized(context: dict[str, Any], section_id: str) -> None:
 
 def _section_row(conn: sqlite3.Connection, section_id: str) -> sqlite3.Row:
     row = conn.execute(
-        """SELECT s.section_key AS id, s.source_section_id, s.heading, s.source_text,
+        f"""SELECT s.section_key AS id, s.source_section_id, s.heading, s.source_text,
                   s.page_start, s.page_end, s.printed_page, s.layout_flags,
                   s.product_code, r.era AS rules_era, r.license
            FROM source_sections AS s
            JOIN source_revisions AS r USING(product_code, content_fingerprint)
            JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
-           WHERE s.section_key=? AND p.state='active' AND p.review_enabled=1""",
+           WHERE s.section_key=? AND p.state='active' AND p.review_enabled=1
+             AND {_semantic_scope_sql('p.product_code')}""",
         (section_id,),
     ).fetchone()
     if row is None:
@@ -90,12 +93,13 @@ def neighbors(context: dict[str, Any], section_id: str) -> dict[str, Any]:
     with _connect(str(context["workspace"])) as conn:
         target = _section_row(conn, section_id)
         rows = conn.execute(
-            """SELECT s.section_key AS id, s.heading, s.source_text, s.page_start,
+            f"""SELECT s.section_key AS id, s.heading, s.source_text, s.page_start,
                       s.page_end, s.printed_page, s.layout_flags
                FROM source_sections AS s
                JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
                WHERE p.parser_run_id=(SELECT parser_run_id FROM source_sections WHERE section_key=?)
                  AND p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}
                ORDER BY COALESCE(s.page_start, 2147483647), s.source_section_id, s.section_key""",
             (section_id,),
         ).fetchall()
@@ -182,6 +186,7 @@ def foundry(context: dict[str, Any], section_id: str, *, limit: int = 5) -> dict
 def stitches(context: dict[str, Any], section_id: str) -> dict[str, Any]:
     _authorized(context, section_id)
     with _connect(str(context["workspace"])) as conn:
+        _section_row(conn, section_id)
         rows = conn.execute(
             """SELECT candidate_id, section_keys, evidence_json
                FROM stitch_candidates

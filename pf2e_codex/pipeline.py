@@ -48,6 +48,8 @@ def _insert_licensed_metadata(
     conn: Any,
     chunks: list[dict[str, Any]],
     notices: tuple[dict[str, str], ...] = (),
+    required_foundry_rows: tuple[dict[str, str], ...] = (),
+    covered_products: tuple[str, ...] = (),
 ) -> None:
     """Copy the audited static-corpus manifest and notices into a model DB."""
     revisions: dict[tuple[str, str], dict[str, Any]] = {}
@@ -132,6 +134,39 @@ def _insert_licensed_metadata(
                 provenance.get("printing_revision"), notice_key,
             ),
         )
+        sources = provenance.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError(f"licensed-core chunk lacks multi-source provenance: {chunk.get('id')}")
+        for ordinal, source in enumerate(sources):
+            if not isinstance(source, dict):
+                raise ValueError("licensed-core source provenance is malformed")
+            conn.execute(
+                """INSERT OR REPLACE INTO licensed_section_sources
+                   (public_id, source_ordinal, product_code, content_fingerprint,
+                    source_section_id, source_section_hash, page_start, page_end,
+                    printed_page, parser_version, printing_revision, notice_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chunk["id"], ordinal, source["product_code"],
+                    source["content_fingerprint"], source["source_section_id"],
+                    source["source_section_hash"], source["page_start"], source["page_end"],
+                    source.get("printed_page"), source["parser_version"],
+                    source["printing_revision"], source["notice_key"],
+                ),
+            )
+            source_key = (str(source["product_code"]), str(source["content_fingerprint"]))
+            source_revision = revisions.setdefault(
+                source_key,
+                {
+                    "license": license_name,
+                    "era": str(provenance.get("era") or "unknown"),
+                    "parser_version": str(source["parser_version"]),
+                    "source_schema_version": source.get("source_schema_version"),
+                    "printing_revision": source["printing_revision"],
+                    "policy_versions": set(),
+                },
+            )
+            source_revision["policy_versions"].add(str(provenance.get("policy_version") or ""))
     for (product, fingerprint), revision in sorted(revisions.items()):
         conn.execute(
             """INSERT OR REPLACE INTO licensed_revisions
@@ -145,6 +180,42 @@ def _insert_licensed_metadata(
                 json.dumps(sorted(revision["policy_versions"])),
             ),
         )
+    from .licensed_coverage import normalized_hash
+
+    for requirement in required_foundry_rows:
+        foundry = conn.execute(
+            """SELECT source_hash, text, publication_title, license, remaster
+                 FROM chunks WHERE id=? AND origin='foundry'""",
+            (requirement["foundry_id"],),
+        ).fetchone()
+        expected_era = "remaster" if foundry and foundry[4] == 1 else "legacy" if foundry and foundry[4] == 0 else "unknown"
+        if (
+            foundry is None
+            or str(foundry[2] or "") != requirement["publication_title"]
+            or str(foundry[3] or "") != requirement["license"]
+            or expected_era != requirement["era"]
+            or (
+                str(foundry[0] or "") != requirement["source_hash"]
+                and normalized_hash(foundry[1]) != requirement["normalized_hash"]
+            )
+        ):
+            raise ValueError(
+                f"required Foundry row is missing or materially changed: {requirement['foundry_id']}"
+            )
+        conn.execute(
+            """INSERT OR REPLACE INTO required_foundry_rows
+               (foundry_id, source_hash, normalized_hash, publication_title, license, era)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                requirement["foundry_id"], requirement["source_hash"],
+                requirement["normalized_hash"], requirement["publication_title"],
+                requirement["license"], requirement["era"],
+            ),
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('licensed_core_covered_products', ?)",
+        (json.dumps(list(covered_products), separators=(",", ":")),),
+    )
 
 
 def _corpus_scope_value(settings: Settings) -> str:
@@ -590,7 +661,11 @@ def embed_and_index(
         bundled_metadata = load_licensed_core(
             exclude_products=_corpus_product_codes(chunks),
         )
-        _insert_licensed_metadata(conn, chunks, bundled_metadata.notices)
+        _insert_licensed_metadata(
+            conn, chunks, bundled_metadata.notices,
+            bundled_metadata.required_foundry_rows,
+            bundled_metadata.covered_products,
+        )
         # Mark duplicate IDs introduced by this inserted snapshot. Incremental
         # updates use INSERT OR IGNORE so prior ambiguity tombstones persist.
         ensure_ambiguous_ref_targets(conn)
@@ -642,6 +717,10 @@ def embed_and_index(
             bundled = load_licensed_core(
                 exclude_products=_corpus_product_codes(chunks),
             )
+            licensed_metadata.append((
+                "licensed_core_covered_products",
+                json.dumps(list(bundled.covered_products), separators=(",", ":")),
+            ))
             indexed_ids = {
                 row[0]
                 for row in conn.execute(
@@ -826,14 +905,18 @@ def sync_corpus_index(
             _insert_chunk(conn, chunk, embedding, settings)
 
         conn.execute("DELETE FROM licensed_sections")
+        conn.execute("DELETE FROM licensed_section_sources")
+        conn.execute("DELETE FROM required_foundry_rows")
         conn.execute("DELETE FROM licensed_revisions")
         conn.execute("DELETE FROM license_notices")
         _insert_licensed_metadata(
             conn,
             list(licensed_bundle.chunks),
             licensed_bundle.notices,
+            licensed_bundle.required_foundry_rows,
+            licensed_bundle.covered_products,
         )
-        if licensed_bundle.chunks:
+        if licensed_bundle.covered_products:
             from .licensed_core import (
                 LICENSED_CORE_SCHEMA_VERSION,
                 licensed_core_digest,
@@ -844,6 +927,13 @@ def sync_corpus_index(
                 [
                     ("licensed_core_schema_version", str(LICENSED_CORE_SCHEMA_VERSION)),
                     ("licensed_core_scope", "licensed-core-reviewed"),
+                    (
+                        "licensed_core_covered_products",
+                        json.dumps(
+                            list(licensed_bundle.covered_products),
+                            separators=(",", ":"),
+                        ),
+                    ),
                     ("licensed_core_digest", licensed_core_digest(licensed_bundle)),
                 ],
             )
@@ -851,7 +941,7 @@ def sync_corpus_index(
             conn.execute(
                 """DELETE FROM _meta WHERE key IN (
                     'licensed_core_schema_version', 'licensed_core_scope',
-                    'licensed_core_digest'
+                    'licensed_core_digest', 'licensed_core_covered_products'
                 )"""
             )
         conn.execute(

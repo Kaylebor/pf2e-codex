@@ -212,8 +212,9 @@ terminal conflicts fail, and a noncanonical exact-text duplicate is stored as
 `REJECT` with its canonical section reference. The public builder must continue
 to ignore all screening tables.
 
-The frozen `paizo-native-v1`, `paizo-native-v2`, and `paizo-native-v3` profiles
-must not change. The licensed-review runner defaults to `paizo-native-v4`.
+The frozen `paizo-native-v1`, `paizo-native-v2`, `paizo-native-v3`, and
+`paizo-native-v4` profiles must not change. The licensed-review runner defaults
+to `paizo-native-v5`.
 V4 binds GPU-produced PP-DocLayout regions to the authoritative native words,
 then emits ordered structural blocks, active sections, and bounded quarantine
 records. Every native anchor must occur exactly once across active blocks,
@@ -230,12 +231,39 @@ and independent review. It is not itself a forced mixed-extraction decision:
 the fallback is exact native text, and forcing every partly recovered section
 to Terra would create a large, unjustified review cost.
 
-V4 workspace preparation is a one-way schema upgrade, not a compatibility
+V5 retains V4's text and anchor authority but deterministically recovers
+rule-bearing quarantine when geometry provides one stable interpretation.
+Stable tables retain a grid; ambiguous tables, unsupported regions, order
+conflicts, continuations, heading artifacts, and complete-boundary oversize
+splits remain exact native text with explicit review flags. Only page numbers,
+repeated furniture, contents/index, and credits/legal matter may remain in
+nonblocking quarantine. A V5 identity collision changes only the colliding
+opaque identities; every other V4 identity remains reusable.
+
+V5 workspace preparation is a one-way schema upgrade, not a compatibility
 layer. It builds from a read-only SQLite backup in a sibling file, carries
 forward only exact unchanged terminal work, applies content-free structural
 and aggregate rule-probe gates, and atomically replaces the live workspace only
 after validation. Screening is append-only: rejection remains auditable and a
 maintainer may explicitly reopen it without deleting its prior decision.
+V5's historical comparison counts a V4 active defect plus the corresponding V4
+rule-bearing quarantine as one conserved repair budget. Do not reuse the older
+V3-to-V4 percentage-reduction comparator: activating exact recovered anchors
+would make its active-only conflict and fragment metrics report improvement as
+a regression. The V5 gate instead requires identical anchor inventories, zero
+rule-bearing quarantine, lower quarantine ratios, and bounded per-product
+section/conflict/heading/fragment movement.
+
+Before screening, versioned private-text normalization groups exact duplicate
+heading/body pairs only within one license and rules era. The canonical
+occurrence is chosen by catalog order, page, stable identity, and section key;
+all shadow occurrences remain auditable provenance and reopen through the
+canonical group. A validated vector-free clean Foundry snapshot supplies at
+most three deterministic exact/lexical candidates to Spark. Only supplied,
+same-era, same-license rows may confirm complete coverage; stale or malformed
+proofs fail open into ordinary screening. The public builder repeats duplicate
+normalization over approved public text and emits one rule with all source
+occurrences.
 
 When a local-full seed has a complete PDF for a product, suppress the bundled
 licensed-core rows for that product; keep bundled rows for missing products.
@@ -251,6 +279,20 @@ schema-constrained noninteractive `codex exec` in an isolated read-only sandbox
 with user configuration ignored. The supervisor validates the exact submitted
 ID set before any mutation, retains content-free attempt/session audit rows,
 and retries transport/schema failures no more than three times.
+The supervisor classifies a Codex model usage-limit response as a sanitized,
+non-retryable `model-usage-limit` transport failure. Never burn the remaining
+attempt budget on an unchanged quota block or silently substitute a more
+expensive model.
+
+Parser activation and semantic scheduling are separate. Every trusted active
+parser run remains available for structural validation and deterministic
+duplicate/Foundry preparation. `review_product_scope` is the persistent
+semantic scheduling and projection boundary: claims, AON, pilots, completion,
+and base construction use only enabled products. Holding a product must never
+delete its source rows, decisions, candidates, reviews, or deterministic
+evidence. `prepare-review` performs only model-free preparation;
+`preview --queue screen` uses the production serializer and packer while
+remaining read-only and must never instantiate a Codex executor.
 
 Worker evidence goes only through `review_evidence.py`. Its claim context fixes
 the allowed section IDs, pre-authorized neighbors, review workspace, and one
@@ -273,7 +315,7 @@ Exact unchanged stitch identity is the product plus ordered stable section-key
 set, not mutable proposal evidence such as the section offset. Carry both model
 votes and any explicit maintainer resolution; otherwise repaired runs repeatedly
 reopen already resolved interleavings and waste worker quota.
-Use `run --queue QUEUE --pilot` for the mandatory at-most-one-batch-per-product
+Use `run --queue QUEUE --pilot` for the mandatory at-most-one-batch-per-enabled-product
 live pilots; a screening pilot must refuse to run while active layout work
 remains. Use `run --queue layout --sources PATH` to drain layout review and
 trusted repairs to a fixed point without entering semantic screening. Screening
@@ -281,7 +323,12 @@ rejections remain as private source-scoped decisions and EXCLUDE candidates;
 never delete their source rows merely because the public projection omits them.
 
 The base is not an embedding database. `build-base` produces an ignored,
-model-independent audited sibling with public text and provenance only.
+model-independent audited sibling using public schema v3: canonical
+`licensed_rules`, normalized `licensed_rule_sources`, and
+`required_foundry_rows` for rules suppressed by confirmed Foundry coverage.
+The base also commits to its ordered covered-product list and scope digest. The
+build revalidates those rows against the selected clean snapshot and must
+produce byte-identical repeated output.
 `promote-base` is a separate explicit maintainer action. Never put Foundry rows,
 vectors, FTS, model names, worker prompts, private paths, or raw PDF hashes in
 the base, and never use it as a mutable template for final model databases.

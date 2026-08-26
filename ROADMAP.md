@@ -30,6 +30,10 @@ Ordered by impact. Check items off as completed.
     anchor coverage plus exact block-to-section text projection, and isolates
     ambiguous order, unresolved layout/table material, and indivisible
     oversize blocks instead of guessing or dropping them.
+  - Implemented: one-way `paizo-native-v5` repair. Rule-bearing V4 quarantine
+    is recovered deterministically as exact native text with explicit table,
+    order, continuation, heading, unsupported-layout, and oversize flags;
+    intentional furniture/index/legal quarantine remains accounted for.
   - Implemented: content-free parser qualification and atomic one-way workspace
     preparation. Five-book candidates must pass coverage, privacy, layout,
     quarantine-volume, structural, aggregate general-rule probe, and historical
@@ -49,13 +53,23 @@ Ordered by impact. Check items off as completed.
   - Implemented: append-only screening decisions and explicit maintainer reopen.
     Rejections and their bounded reasons remain available for audit and later
     reconsideration; reopen adds history rather than deleting prior work.
+  - Implemented: versioned exact PDF duplicate groups and deterministic clean
+    Foundry coverage candidates. Canonical/shadow provenance is normalized,
+    Spark may confirm only supplied same-era/same-license rows, stale proofs
+    reopen fail-open, and no private normalized text is persisted.
   - Implemented: deterministic `licensed-corpus-runner` and claimed-ID-only
     evidence executable. The supervisor owns fresh five-PDF staging, bounded
     queue leases, 32-record/64-KiB packing, exact output schemas and ID sets,
     retries, Spark/Luna/Terra/Sol routing, disjoint producer/reviewer sessions,
     session rotation, AON title/URL caching, and content-free audit metadata.
-    A bounded pilot mode runs at most one selected-queue batch per catalog
+    A bounded pilot mode runs at most one selected-queue batch per enabled
     product and refuses to screen until the active layout queue is terminal.
+  - Implemented: persistent semantic product scope independent from parser
+    activation. All five trusted V5 runs remain auditable while queue claims,
+    pilots, completion, and schema-v3 public projection can target the four
+    Remaster products and hold legacy without deleting work. `prepare-review`
+    refreshes deterministic data without workers, and read-only `preview`
+    serializes and sizes the exact future Spark batches without claims.
   - Implemented: evidence-driven adjacent layout repair. Only consecutive full
     groups of two or three may merge; Luna selection requires independent Terra
     confirmation, the PDF is re-read, native anchors are revalidated exactly,
@@ -75,6 +89,10 @@ Ordered by impact. Check items off as completed.
     privacy, manifest/hash, provenance, notice, SQLite, and deterministic
     repeat-build gates. Promotion to the tracked projection is a separate
     explicit command and never triggers embedding builds or publication.
+  - Implemented: public base schema v3 with an explicit covered-product scope,
+    one canonical public rule, complete
+    multi-book/reprinting provenance, required Foundry row contracts, final
+    approved-text deduplication, and byte-identical repeat-build validation.
   - In progress: parallel review of the five cataloged books, exact bundled
     project-owned OGL/ORC notices, final tracked projection, qualified
     licensing/trademark review, retrieval comparison, and the first six-model

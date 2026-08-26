@@ -10,18 +10,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from pf2e_codex.licensed_coverage import build_foundry_evidence_database  # noqa: E402
 from pf2e_codex.pdf_layout import DEFAULT_LAYOUT_MODEL_DIR  # noqa: E402
 from pf2e_codex.review_runner import (  # noqa: E402
     build_base,
     compare_workspace_quality,
     maintainer_item_evidence,
+    prepare_review_data,
     prepare_workspace,
+    preview_screen_batches,
     promote_base,
     quality_workspace,
     reopen_screening,
     resolve_maintainer_item,
     run_queues,
     runner_status,
+    set_review_product_scope,
     verify_workspace,
 )
 
@@ -53,8 +57,42 @@ def main() -> None:
         default="auto",
     )
 
+    foundry = commands.add_parser(
+        "prepare-foundry", help="build a vector-free strictly filtered Foundry evidence database"
+    )
+    foundry.add_argument("archive", type=Path)
+    foundry.add_argument("output", type=Path)
+    foundry.add_argument("--release", required=True)
+
     status = commands.add_parser("status", help="show content-free queue and session counts")
     status.add_argument("workspace", type=Path)
+
+    scope = commands.add_parser(
+        "set-scope", help="persist the products enabled for semantic review"
+    )
+    scope.add_argument("workspace", type=Path)
+    scope.add_argument(
+        "--include", action="append", required=True, metavar="PZO_CODE",
+        help="enable one active product; repeat for every enabled product",
+    )
+    scope.add_argument(
+        "--held-reason", choices=("legacy-study", "maintainer-hold"),
+        default="maintainer-hold",
+    )
+
+    review_data = commands.add_parser(
+        "prepare-review",
+        help="prepare deterministic duplicates and Foundry evidence without workers",
+    )
+    review_data.add_argument("workspace", type=Path)
+    review_data.add_argument("--foundry-database", type=Path, required=True)
+
+    preview = commands.add_parser(
+        "preview", help="read-only preview of exact worker batch envelopes"
+    )
+    preview.add_argument("workspace", type=Path)
+    preview.add_argument("--queue", choices=("screen",), default="screen")
+    preview.add_argument("--foundry-database", type=Path, required=True)
 
     run = commands.add_parser("run", help="drain all queues or one selected queue")
     run.add_argument("workspace", type=Path)
@@ -70,6 +108,7 @@ def main() -> None:
     verify = commands.add_parser("verify", help="validate parser, workflow, privacy, and readiness")
     verify.add_argument("workspace", type=Path)
     verify.add_argument("--complete", action="store_true")
+    verify.add_argument("--foundry-database", type=Path)
 
     quality = commands.add_parser("quality", help="report content-free parser quality metrics")
     quality.add_argument("workspace", type=Path)
@@ -121,6 +160,7 @@ def main() -> None:
     build.add_argument("workspace", type=Path)
     build.add_argument("output", type=Path)
     build.add_argument("notices", type=Path)
+    build.add_argument("--foundry-database", type=Path, required=True)
 
     promote = commands.add_parser("promote-base", help="explicitly replace the tracked projection")
     promote.add_argument("staged", type=Path)
@@ -133,8 +173,20 @@ def main() -> None:
             shard_size=args.shard_size, layout_model_dir=args.layout_model,
             layout_provider=args.layout_provider,
         )
+    elif args.command == "prepare-foundry":
+        result = build_foundry_evidence_database(
+            args.archive, args.output, release=args.release
+        )
     elif args.command == "status":
         result = runner_status(args.workspace)
+    elif args.command == "set-scope":
+        result = set_review_product_scope(
+            args.workspace, args.include, held_reason=args.held_reason
+        )
+    elif args.command == "prepare-review":
+        result = prepare_review_data(args.workspace, args.foundry_database)
+    elif args.command == "preview":
+        result = preview_screen_batches(args.workspace, args.foundry_database)
     elif args.command == "run":
         result = run_queues(
             args.workspace, queue=args.queue, concurrency=args.concurrency,
@@ -142,7 +194,10 @@ def main() -> None:
             pilot=args.pilot,
         )
     elif args.command == "verify":
-        result = verify_workspace(args.workspace, require_complete=args.complete)
+        result = verify_workspace(
+            args.workspace, require_complete=args.complete,
+            foundry_database=args.foundry_database,
+        )
     elif args.command == "quality":
         selection = _run_selection(args.run)
         result = quality_workspace(
@@ -174,7 +229,9 @@ def main() -> None:
             maintainer=args.maintainer,
         )
     elif args.command == "build-base":
-        result = build_base(args.workspace, args.output, args.notices)
+        result = build_base(
+            args.workspace, args.output, args.notices, args.foundry_database
+        )
     else:
         result = promote_base(args.staged, args.tracked)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

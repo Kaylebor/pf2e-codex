@@ -26,9 +26,13 @@ from pf2e_codex.licensed_core import load_licensed_core
 from pf2e_codex.licensed_corpus import (
     REVIEW_SCHEMA_VERSION,
     activate_parser_run,
+    claim_draft_screening_batch,
     initialize_trusted_workspace,
+    prepare_deterministic_review,
+    set_review_product_scope,
     stage_trusted_native_pdf,
     stage_trusted_native_pdf_with_approved_stitches,
+    submit_draft_screening_decision,
 )
 from pf2e_codex.pdf_export import NativeWordInventory
 from pf2e_codex.pdf_layout import BoundLayoutRegion, BoundNativeLayout
@@ -38,15 +42,20 @@ from pf2e_codex.review_runner import (
     MAX_BATCH_RECORDS,
     CodexExecutor,
     CodexResult,
+    _CodexProcessError,
     _prior_stitch_candidate,
+    _reconcile_stitch_maintenance,
     _reuse_stitch_judgment,
     _stitch_records,
     build_base,
     generate_stitch_candidates,
     maintainer_item_evidence,
     pack_batches,
+    prepare_review_data,
     prepare_workspace,
+    preview_screen_batches,
     refresh_aon_cache,
+    reopen_screening,
     resolve_maintainer_item,
     run_codex_batch,
     run_queues,
@@ -67,7 +76,9 @@ class FakeCodex:
         del kwargs
         self.thread_inputs.append(thread_id)
         payload = self.payloads.pop(0) if self.payloads else {
-            "results": [{"id": "section-1", "decision": "add", "reason": None}]
+            "results": [
+                {"id": "section-1", "decision": "add", "reason": None, "foundry_ids": []}
+            ]
         }
         return CodexResult(payload, "thread-test", {"input_tokens": 10}, "f" * 64)
 
@@ -75,6 +86,44 @@ class FakeCodex:
 def _workspace(tmp_path: Path) -> Path:
     path = tmp_path / "review.sqlite3"
     initialize_trusted_workspace(path)
+    return path
+
+
+def _foundry_database(tmp_path: Path) -> Path:
+    path = tmp_path / "foundry.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE chunks (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, text TEXT NOT NULL,
+            source_hash TEXT NOT NULL, publication_title TEXT NOT NULL,
+            license TEXT NOT NULL, remaster INTEGER, type TEXT NOT NULL,
+            origin TEXT NOT NULL
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO _meta VALUES (?, ?)",
+        [
+            ("distribution_scope", "redistributable"),
+            ("foundry_scope", "core-publications-v1"),
+            ("pf2e_release", "pf2e-test"),
+        ],
+    )
+    for product_code in EXPECTED_PRODUCTS:
+        product = PRODUCT_CATALOG[product_code]
+        text = f"A distinct public Foundry rule for {product_code}."
+        conn.execute(
+            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'foundry')",
+            (
+                f"rules:{product_code.casefold()}", f"Foundry {product_code}", text,
+                hashlib.sha256(text.encode()).hexdigest(), product.title, product.license,
+                1 if product.remaster else 0, "rule",
+            ),
+        )
+    conn.commit()
+    conn.close()
     return path
 
 
@@ -148,7 +197,11 @@ def test_schema_failure_retries_without_accepted_partial_state(tmp_path: Path):
     fake = FakeCodex(
         [
             {"results": []},
-            {"results": [{"id": "section-1", "decision": "add", "reason": None}]},
+            {
+                "results": [
+                    {"id": "section-1", "decision": "add", "reason": None, "foundry_ids": []}
+                ]
+            },
         ]
     )
     results = run_codex_batch(
@@ -177,7 +230,11 @@ def test_session_rotates_after_four_completed_batches(tmp_path: Path):
     for index in range(5):
         section_id = f"section-{index}"
         fake.payloads.append(
-            {"results": [{"id": section_id, "decision": "add", "reason": None}]}
+            {
+                "results": [
+                    {"id": section_id, "decision": "add", "reason": None, "foundry_ids": []}
+                ]
+            }
         )
         run_codex_batch(
             workspace,
@@ -228,6 +285,62 @@ def test_codex_process_is_read_only_config_ignored_and_schema_constrained(
     assert commands[1][3:5] == ["exec", "resume"]
 
 
+def test_codex_usage_limit_is_sanitized_and_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = _workspace(tmp_path)
+
+    class QuotaExecutor:
+        version = "codex-cli test"
+        calls = 0
+
+        def execute(self, **_kwargs: object) -> CodexResult:
+            self.calls += 1
+            raise _CodexProcessError("model-usage-limit", retryable=False)
+
+    executor = QuotaExecutor()
+    with pytest.raises(RuntimeError, match="blocked by model-usage-limit"):
+        run_codex_batch(
+            workspace,
+            queue="screen",
+            slot=0,
+            records=[{"id": "section-1", "heading": "Rules", "text": "Private"}],
+            foundry_db=None,
+            executor=executor,
+        )
+
+    assert executor.calls == 1
+    conn = sqlite3.connect(workspace)
+    attempt = conn.execute(
+        "SELECT status, error_kind FROM runner_attempts"
+    ).fetchone()
+    conn.close()
+    assert attempt == ("transport-failure", "model-usage-limit")
+
+
+def test_codex_executor_classifies_usage_limit_without_exposing_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "pf2e_codex.review_runner.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="You've hit your usage limit for gpt-5.3-codex-spark",
+            stderr="private diagnostic must not escape",
+        ),
+    )
+    executor = CodexExecutor()
+
+    with pytest.raises(_CodexProcessError) as failure:
+        executor.execute(
+            model="gpt-5.3-codex-spark", prompt="bounded",
+            schema={"type": "object"}, workdir=tmp_path, thread_id=None,
+        )
+
+    assert str(failure.value) == "model-usage-limit"
+    assert failure.value.retryable is False
+
+
 class FakeResponse:
     def __init__(self, body: bytes, url: str = "https://2e.aonprd.com/Search.aspx?q=Fireball"):
         self.body = body
@@ -252,7 +365,11 @@ def _aon_workspace(tmp_path: Path) -> Path:
     conn.executescript(
         """
         CREATE TABLE parser_runs (
-            parser_run_id TEXT PRIMARY KEY, state TEXT, review_enabled INTEGER
+            parser_run_id TEXT PRIMARY KEY, product_code TEXT,
+            state TEXT, review_enabled INTEGER
+        );
+        CREATE TABLE review_product_scope (
+            product_code TEXT PRIMARY KEY, enabled INTEGER, reason TEXT, updated_at INTEGER
         );
         CREATE TABLE source_sections (
             section_key TEXT PRIMARY KEY, parser_run_id TEXT, heading TEXT
@@ -273,7 +390,8 @@ def _aon_workspace(tmp_path: Path) -> Path:
             query_digest TEXT PRIMARY KEY, normalized_query TEXT, status TEXT,
             results_json TEXT, checked_at INTEGER
         );
-        INSERT INTO parser_runs VALUES ('run','active',1);
+        INSERT INTO parser_runs VALUES ('run','PZO12001','active',1);
+        INSERT INTO review_product_scope VALUES ('PZO12001',1,'enabled',1);
         INSERT INTO source_sections VALUES ('section','run','Fireball');
         INSERT INTO draft_screening_events VALUES
             (1,'run','section','DECISION','DEFER','DEFER',NULL,NULL,'scope',
@@ -386,7 +504,7 @@ def _trusted_product_bundle(
                     text_hash=hashlib.sha256(section_texts[index].encode()).hexdigest(),
                     coverage_anchors=(anchors[index],),
                 ),
-            ) if parser_version == "paizo-native-v4" else (),
+            ) if parser_version in {"paizo-native-v4", "paizo-native-v5"} else (),
         )
         for index in range(section_count)
     )
@@ -408,7 +526,7 @@ def _trusted_product_bundle(
     parser_digest = _trusted_parser_output_digest(sections)
     layout_binding_digest = (
         hashlib.sha256(f"layout-{product_code}".encode()).hexdigest()
-        if parser_version == "paizo-native-v4"
+        if parser_version in {"paizo-native-v4", "paizo-native-v5"}
         else None
     )
     seal = _trusted_bundle_seal(
@@ -436,6 +554,30 @@ def _trusted_product_bundle(
         artifact_attestation_digest=attestation_digest,
         layout_binding_digest=layout_binding_digest,
     )
+
+
+def _stage_expected_products(
+    workspace: Path,
+    tmp_path: Path,
+    *,
+    mixed_product: str | None = None,
+) -> None:
+    for product_code in EXPECTED_PRODUCTS:
+        bundle = _trusted_product_bundle(
+            product_code, mixed=product_code == mixed_product
+        )
+        with patch(
+            "pf2e_codex.licensed_corpus.load_and_parse_verified_pdf",
+            return_value=bundle,
+        ):
+            staged = stage_trusted_native_pdf(
+                workspace,
+                tmp_path / f"{product_code}E.pdf",
+                product_code=product_code,
+                parser_version="paizo-native-v3",
+                shard_size=2,
+            )
+        activate_parser_run(workspace, str(staged["parser_run_id"]))
 
 
 def _layout_binding_for(bundle: TrustedParseBundle) -> BoundNativeLayout:
@@ -636,7 +778,10 @@ class WorkflowCodex(FakeCodex):
         records = json.loads(prompt.split("Records:\n", 1)[1])
         results = []
         if "bounded screen worker" in prompt:
-            results = [{"id": record["id"], "decision": "add", "reason": None} for record in records]
+            results = [
+                {"id": record["id"], "decision": "add", "reason": None, "foundry_ids": []}
+                for record in records
+            ]
         elif "bounded classify worker" in prompt:
             results = [
                 {
@@ -681,7 +826,10 @@ class ComplexWorkflowCodex(WorkflowCodex):
             self.thread_inputs.append(thread_id)
             payload = {
                 "results": [
-                    {"id": record["id"], "decision": "defer", "reason": "complex-rule"}
+                    {
+                        "id": record["id"], "decision": "defer",
+                        "reason": "complex-rule", "foundry_ids": [],
+                    }
                     for record in records
                 ]
             }
@@ -692,8 +840,75 @@ class ComplexWorkflowCodex(WorkflowCodex):
         return super().execute(prompt=prompt, thread_id=thread_id, **kwargs)
 
 
+def test_persistent_scope_holds_legacy_without_discarding_parser_work(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    _stage_expected_products(workspace, tmp_path)
+    remaster_products = [
+        product for product in EXPECTED_PRODUCTS if product != "PZO2101"
+    ]
+
+    scope = set_review_product_scope(
+        workspace, remaster_products, held_reason="legacy-study"
+    )
+
+    assert scope["enabled_products"] == sorted(remaster_products)
+    assert scope["held_products"] == ["PZO2101"]
+    with sqlite3.connect(workspace) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM parser_runs WHERE state='active' AND review_enabled=1"
+        ).fetchone()[0] == 5
+    assert claim_draft_screening_batch(
+        workspace, "held-worker", product_code="PZO2101"
+    ) is None
+    active_claim = claim_draft_screening_batch(
+        workspace, "active-worker", product_code="PZO12001"
+    )
+    assert active_claim is not None
+    with pytest.raises(ValueError, match="claims are live"):
+        set_review_product_scope(workspace, remaster_products)
+
+
+def test_prepare_and_preview_are_spark_free_idempotent_and_read_only(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
+    _stage_expected_products(workspace, tmp_path)
+    remaster_products = [
+        product for product in EXPECTED_PRODUCTS if product != "PZO2101"
+    ]
+    set_review_product_scope(
+        workspace, remaster_products, held_reason="legacy-study"
+    )
+
+    first = prepare_review_data(workspace, foundry)
+    second = prepare_review_data(workspace, foundry)
+    assert first["preparation_digest"] == second["preparation_digest"]
+    assert {item["product_code"]: item["scope_state"] for item in second["products"]} == {
+        **dict.fromkeys(remaster_products, "enabled"),
+        "PZO2101": "held",
+    }
+    with sqlite3.connect(workspace) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = workspace.read_bytes()
+
+    preview = preview_screen_batches(workspace, foundry)
+
+    assert workspace.read_bytes() == before
+    assert preview["ready"] is True
+    assert preview["model"] == "gpt-5.3-codex-spark"
+    assert preview["scope"]["held_products"] == ["PZO2101"]
+    assert {item["product_code"] for item in preview["products"]} == set(remaster_products)
+    assert preview["eligible_records"] == 4
+    assert preview["batches"] == 4
+    assert all(int(item["max_batch_bytes"]) <= MAX_BATCH_BYTES for item in preview["products"])
+    with sqlite3.connect(workspace) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runner_sessions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM runner_attempts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM draft_screening_claims").fetchone()[0] == 0
+
+
 def test_synthetic_five_product_workflow_builds_deterministic_base(tmp_path: Path):
     workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
     for product_code in EXPECTED_PRODUCTS:
         bundle = _trusted_product_bundle(product_code, mixed=product_code == "PZO12002")
         with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
@@ -706,9 +921,13 @@ def test_synthetic_five_product_workflow_builds_deterministic_base(tmp_path: Pat
             )
         activate_parser_run(workspace, str(staged["parser_run_id"]))
 
-    result = run_queues(workspace, concurrency=1, executor=WorkflowCodex())
+    result = run_queues(
+        workspace, concurrency=1, foundry_database=foundry, executor=WorkflowCodex()
+    )
     assert result["status"]["needs_maintainer"] == 0
-    verification = verify_workspace(workspace, require_complete=True)
+    verification = verify_workspace(
+        workspace, require_complete=True, foundry_database=foundry
+    )
     assert verification["ok"] is True, verification
 
     notices = tmp_path / "notices.json"
@@ -722,11 +941,50 @@ def test_synthetic_five_product_workflow_builds_deterministic_base(tmp_path: Pat
         encoding="utf-8",
     )
     output = tmp_path / "licensed_core.sqlite3"
-    built = build_base(workspace, output, notices)
+    built = build_base(workspace, output, notices, foundry)
     bundle = load_licensed_core(output)
     assert built["sections"] == 5
     assert len(bundle.chunks) == 5
     assert {row["era"] for row in bundle.source_revisions} == {"legacy", "remaster"}
+
+
+def test_scoped_remaster_workflow_builds_explicit_four_product_base(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
+    _stage_expected_products(workspace, tmp_path, mixed_product="PZO12002")
+    remaster_products = [
+        product for product in EXPECTED_PRODUCTS if product != "PZO2101"
+    ]
+    set_review_product_scope(
+        workspace, remaster_products, held_reason="legacy-study"
+    )
+
+    run_queues(
+        workspace, concurrency=1, foundry_database=foundry,
+        executor=WorkflowCodex(),
+    )
+    verification = verify_workspace(
+        workspace, require_complete=True, foundry_database=foundry
+    )
+    assert verification["ok"] is True, verification
+    assert verification["semantic_scope"]["held_products"] == ["PZO2101"]
+    notices = tmp_path / "scoped-notices.json"
+    notices.write_text(
+        json.dumps(
+            {
+                "ORC": {"license": "ORC", "text": "Synthetic complete ORC notice."},
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "licensed_core_scoped.sqlite3"
+    build_base(workspace, output, notices, foundry)
+    bundle = load_licensed_core(output)
+
+    assert bundle.covered_products == tuple(sorted(remaster_products))
+    assert len(bundle.chunks) == 4
+    assert {row["product_code"] for row in bundle.source_revisions} == set(remaster_products)
+    assert {row["era"] for row in bundle.source_revisions} == {"remaster"}
 
 
 def test_layout_queue_stops_before_screening(tmp_path: Path):
@@ -752,6 +1010,7 @@ def test_layout_queue_stops_before_screening(tmp_path: Path):
 
 def test_complex_screen_gets_luna_then_terra_and_defaults_to_add(tmp_path: Path):
     workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
     for product_code in EXPECTED_PRODUCTS:
         bundle = _trusted_product_bundle(product_code)
         with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
@@ -761,7 +1020,10 @@ def test_complex_screen_gets_luna_then_terra_and_defaults_to_add(tmp_path: Path)
             )
         activate_parser_run(workspace, str(staged["parser_run_id"]))
 
-    result = run_queues(workspace, concurrency=1, executor=ComplexWorkflowCodex())
+    result = run_queues(
+        workspace, concurrency=1, foundry_database=foundry,
+        executor=ComplexWorkflowCodex(),
+    )
     products = result["status"]["screening"]["products"]
     assert sum(product["accepted"] for product in products) == 5
     assert sum(product["deferred"] for product in products) == 0
@@ -777,6 +1039,7 @@ def test_complex_screen_gets_luna_then_terra_and_defaults_to_add(tmp_path: Path)
 
 def test_screening_pilot_processes_one_batch_per_product_without_draining(tmp_path: Path):
     workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
     for product_code in EXPECTED_PRODUCTS:
         bundle = _trusted_product_bundle(product_code, section_count=2)
         with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
@@ -787,7 +1050,8 @@ def test_screening_pilot_processes_one_batch_per_product_without_draining(tmp_pa
         activate_parser_run(workspace, str(staged["parser_run_id"]))
 
     result = run_queues(
-        workspace, queue="screen", concurrency=2, executor=WorkflowCodex(), pilot=True,
+        workspace, queue="screen", concurrency=2, foundry_database=foundry,
+        executor=WorkflowCodex(), pilot=True,
     )
 
     assert result["completed_products"] == sorted(EXPECTED_PRODUCTS)
@@ -795,10 +1059,96 @@ def test_screening_pilot_processes_one_batch_per_product_without_draining(tmp_pa
     products = result["status"]["screening"]["products"]
     assert sum(product["accepted"] + product["rejected"] for product in products) == 5
     assert sum(product["unprocessed"] for product in products) == 5
+    incomplete = verify_workspace(
+        workspace, require_complete=True, foundry_database=foundry
+    )
+    assert incomplete["ok"] is False
+    assert incomplete["unresolved"] == 10
+
+
+def test_exact_pdf_duplicates_screen_only_canonical_and_reopen_as_one_group(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
+    bundle = _trusted_product_bundle("PZO12001", section_count=2, same_heading=True)
+    with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
+        staged = stage_trusted_native_pdf(
+            workspace, tmp_path / "PZO12001E.pdf", product_code="PZO12001",
+            parser_version="paizo-native-v3", shard_size=2,
+        )
+    activate_parser_run(workspace, str(staged["parser_run_id"]))
+
+    prepared = prepare_deterministic_review(workspace, foundry)
+    assert prepared["canonical_sections"] == 1
+    assert prepared["shadow_duplicates"] == 1
+    with sqlite3.connect(workspace) as conn:
+        canonical, shadow = conn.execute(
+            """SELECT groups.canonical_section_key, member.section_key
+                 FROM duplicate_groups AS groups
+                 JOIN duplicate_group_members AS member USING(group_id)
+                WHERE member.source_ordinal=1"""
+        ).fetchone()
+        assert conn.execute(
+            "SELECT decision FROM draft_screening_current WHERE section_key=?", (shadow,)
+        ).fetchone()[0] == "REJECT"
+
+    reopened = reopen_screening(
+        workspace, shadow, reason="maintainer-review", maintainer="maintainer"
+    )
+    assert reopened["requested_section_key"] == shadow
+    assert reopened["section_key"] == canonical
+    with sqlite3.connect(workspace) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM draft_screening_current WHERE section_key=?", (canonical,)
+        ).fetchone() is None
+
+
+def test_changed_foundry_snapshot_reopens_coverage_rejection(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
+    bundle = _trusted_product_bundle("PZO12001")
+    source = bundle.sections[0]
+    with sqlite3.connect(foundry) as conn:
+        conn.execute(
+            """UPDATE chunks SET name=?, text=?, source_hash=?
+                WHERE id='rules:pzo12001'""",
+            (source.heading, source.text, hashlib.sha256(source.text.encode()).hexdigest()),
+        )
+    with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
+        staged = stage_trusted_native_pdf(
+            workspace, tmp_path / "PZO12001E.pdf", product_code="PZO12001",
+            parser_version="paizo-native-v3", shard_size=1,
+        )
+    activate_parser_run(workspace, str(staged["parser_run_id"]))
+    prepared = prepare_deterministic_review(workspace, foundry)
+    assert prepared["coverage_candidates"] == 1
+    claim = claim_draft_screening_batch(workspace, "screen:0")
+    assert claim is not None
+    submit_draft_screening_decision(
+        workspace, int(claim["shard_id"]), "screen:0", 0, "reject",
+        reject_reason="duplicate", foundry_ids=["rules:pzo12001"],
+    )
+
+    changed = "A materially changed public rule with a different numeric value of 4d8."
+    with sqlite3.connect(foundry) as conn:
+        conn.execute(
+            """UPDATE chunks SET text=?, source_hash=? WHERE id='rules:pzo12001'""",
+            (changed, hashlib.sha256(changed.encode()).hexdigest()),
+        )
+    refreshed = prepare_deterministic_review(workspace, foundry)
+    assert refreshed["stale_coverage_reopened"] == 1
+    with sqlite3.connect(workspace) as conn:
+        section_key = conn.execute(
+            "SELECT section_key FROM source_sections WHERE parser_run_id=?",
+            (staged["parser_run_id"],),
+        ).fetchone()[0]
+        assert conn.execute(
+            "SELECT 1 FROM draft_screening_current WHERE section_key=?", (section_key,)
+        ).fetchone() is None
 
 
 def test_replacement_run_carries_only_exact_terminal_screening_work(tmp_path: Path):
     workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
     original = _trusted_product_bundle("PZO12001", section_count=2)
     with patch(
         "pf2e_codex.licensed_corpus.load_and_parse_verified_pdf",
@@ -812,7 +1162,10 @@ def test_replacement_run_carries_only_exact_terminal_screening_work(tmp_path: Pa
             shard_size=2,
         )
     activate_parser_run(workspace, str(staged["parser_run_id"]))
-    run_queues(workspace, queue="screen", concurrency=1, executor=WorkflowCodex())
+    run_queues(
+        workspace, queue="screen", concurrency=1, foundry_database=foundry,
+        executor=WorkflowCodex(),
+    )
 
     replacement = _trusted_product_bundle(
         "PZO12001",
@@ -849,6 +1202,7 @@ def test_replacement_run_carries_only_exact_terminal_screening_work(tmp_path: Pa
 def test_stitch_pilot_targets_at_most_one_batch_per_product(tmp_path: Path):
     workspace = _workspace(tmp_path)
     products: list[str] = []
+    enabled = [product for product in EXPECTED_PRODUCTS if product != "PZO2101"]
 
     def process(
         _workspace: Path,
@@ -864,15 +1218,21 @@ def test_stitch_pilot_targets_at_most_one_batch_per_product(tmp_path: Path):
         products.append(product_code)
         return True
 
-    with patch("pf2e_codex.review_runner._process_stitches", side_effect=process):
+    with (
+        patch("pf2e_codex.review_runner._process_stitches", side_effect=process),
+        patch(
+            "pf2e_codex.review_runner.review_product_scope",
+            return_value={"enabled_products": enabled},
+        ),
+    ):
         result = run_queues(
             workspace, queue="stitch-select", concurrency=2,
             executor=WorkflowCodex(), pilot=True,
         )
 
-    assert sorted(products) == sorted(EXPECTED_PRODUCTS)
-    assert result["completed_products"] == sorted(EXPECTED_PRODUCTS)
-    assert result["completed_batches"] == 5
+    assert sorted(products) == sorted(enabled)
+    assert result["completed_products"] == sorted(enabled)
+    assert result["completed_batches"] == 4
 
 
 def test_stitch_disagreement_immediately_becomes_maintainer_work(tmp_path: Path):
@@ -967,8 +1327,77 @@ def test_stitch_disagreement_immediately_becomes_maintainer_work(tmp_path: Path)
         resolve_maintainer_item(workspace, item["maintenance_id"], "merge")
 
 
+def test_held_product_maintainer_item_is_preserved_but_not_actionable(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    staged_runs: dict[str, dict[str, object]] = {}
+    for product_code in ("PZO2101", "PZO12001"):
+        bundle = _trusted_product_bundle(product_code, section_count=2)
+        with patch(
+            "pf2e_codex.licensed_corpus.load_and_parse_verified_pdf",
+            return_value=bundle,
+        ):
+            staged = stage_trusted_native_pdf(
+                workspace,
+                tmp_path / f"{product_code}E.pdf",
+                product_code=product_code,
+                parser_version="paizo-native-v3",
+                shard_size=1,
+            )
+        activate_parser_run(workspace, str(staged["parser_run_id"]))
+        staged_runs[product_code] = staged
+
+    legacy = staged_runs["PZO2101"]
+    with sqlite3.connect(workspace) as conn:
+        section_keys = [
+            row[0]
+            for row in conn.execute(
+                "SELECT section_key FROM source_sections WHERE parser_run_id=?",
+                (legacy["parser_run_id"],),
+            )
+        ]
+        conn.execute(
+            "INSERT INTO stitch_candidates VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "stitch:held",
+                legacy["parser_run_id"],
+                "PZO2101",
+                json.dumps(section_keys),
+                "{}",
+                1,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO stitch_votes VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("stitch:held", "selector", "luna", "merge", "fragment", 2),
+                ("stitch:held", "confirmer", "terra", "no-merge", "separate", 3),
+            ],
+        )
+
+    assert _reconcile_stitch_maintenance(workspace) == 1
+    with sqlite3.connect(workspace) as conn:
+        maintenance_id = str(conn.execute(
+            "SELECT item_id FROM runner_maintenance WHERE subject_id='stitch:held'"
+        ).fetchone()[0])
+
+    set_review_product_scope(workspace, ["PZO12001"])
+
+    assert _reconcile_stitch_maintenance(workspace) == 0
+    assert runner_status(workspace)["needs_maintainer"] == 0
+    with pytest.raises(ValueError, match="outside the semantic product scope"):
+        maintainer_item_evidence(workspace, maintenance_id)
+    with pytest.raises(ValueError, match="outside the semantic product scope"):
+        resolve_maintainer_item(workspace, maintenance_id, "no-merge")
+    with sqlite3.connect(workspace) as conn:
+        assert conn.execute(
+            "SELECT resolved_at FROM runner_maintenance WHERE item_id=?",
+            (maintenance_id,),
+        ).fetchone()[0] is None
+
+
 def test_maintainer_merge_resolution_counts_as_explicit_approval(tmp_path: Path):
     workspace = _workspace(tmp_path)
+    foundry = _foundry_database(tmp_path)
     bundle = _trusted_product_bundle("PZO2101", section_count=2)
     with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
         staged = stage_trusted_native_pdf(
@@ -1018,7 +1447,10 @@ def test_maintainer_merge_resolution_counts_as_explicit_approval(tmp_path: Path)
             (repaired["parser_run_id"],),
         ).fetchone()[0] == 1
     with pytest.raises(ValueError, match="confirmed stitches require --sources"):
-        run_queues(workspace, concurrency=1, executor=WorkflowCodex())
+        run_queues(
+            workspace, concurrency=1, foundry_database=foundry,
+            executor=WorkflowCodex(),
+        )
 
 
 def _source_directory(tmp_path: Path) -> Path:
@@ -1034,7 +1466,7 @@ def test_prepare_creates_workspace_only_after_all_five_validate(tmp_path: Path):
     target = tmp_path / "review.sqlite3"
 
     def bundle_for(_path: Path, *, product_code: str, **_kwargs: object) -> TrustedParseBundle:
-        return _trusted_product_bundle(product_code, parser_version="paizo-native-v4")
+        return _trusted_product_bundle(product_code, parser_version="paizo-native-v5")
 
     with (
         patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", side_effect=bundle_for),
@@ -1065,7 +1497,7 @@ def test_prepare_reuses_one_layout_session_for_all_five_products(tmp_path: Path)
         **_kwargs: object,
     ) -> TrustedParseBundle:
         del layout_artifact
-        return _trusted_product_bundle(product_code, parser_version="paizo-native-v4")
+        return _trusted_product_bundle(product_code, parser_version="paizo-native-v5")
 
     def export_layout(_source: Path, output: Path, *, analyzer: object, **_kwargs: object) -> None:
         exported_analyzers.append(analyzer)
@@ -1103,7 +1535,7 @@ def test_prepare_failure_preserves_valid_existing_workspace(tmp_path: Path):
     def fail_last(_path: Path, *, product_code: str, **_kwargs: object) -> TrustedParseBundle:
         if product_code == "PZO12004":
             raise ValueError("synthetic parser failure")
-        return _trusted_product_bundle(product_code, parser_version="paizo-native-v4")
+        return _trusted_product_bundle(product_code, parser_version="paizo-native-v5")
 
     with (
         patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", side_effect=fail_last),

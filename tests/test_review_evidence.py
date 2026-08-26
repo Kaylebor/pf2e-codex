@@ -20,7 +20,11 @@ def _review_db(tmp_path: Path) -> Path:
             product_code TEXT, content_fingerprint TEXT, license TEXT, era TEXT
         );
         CREATE TABLE parser_runs (
-            parser_run_id TEXT PRIMARY KEY, state TEXT, review_enabled INTEGER
+            parser_run_id TEXT PRIMARY KEY, product_code TEXT,
+            state TEXT, review_enabled INTEGER
+        );
+        CREATE TABLE review_product_scope (
+            product_code TEXT PRIMARY KEY, enabled INTEGER, reason TEXT, updated_at INTEGER
         );
         CREATE TABLE source_sections (
             section_key TEXT PRIMARY KEY, parser_run_id TEXT, product_code TEXT,
@@ -38,7 +42,8 @@ def _review_db(tmp_path: Path) -> Path:
         """
     )
     conn.execute("INSERT INTO source_revisions VALUES ('PZO12001','f','ORC','remaster')")
-    conn.execute("INSERT INTO parser_runs VALUES ('run','active',1)")
+    conn.execute("INSERT INTO parser_runs VALUES ('run','PZO12001','active',1)")
+    conn.execute("INSERT INTO review_product_scope VALUES ('PZO12001',1,'enabled',1)")
     for index in range(3):
         conn.execute(
             "INSERT INTO source_sections VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -94,6 +99,17 @@ def test_evidence_section_exposes_rules_era_but_not_local_paths(tmp_path: Path):
     encoded = json.dumps(value).casefold()
     assert str(tmp_path).casefold() not in encoded
     assert "workspace" not in value
+
+
+def test_evidence_rejects_claimed_id_after_product_is_held(tmp_path: Path):
+    context = _context(tmp_path)
+    conn = sqlite3.connect(str(context["workspace"]))
+    conn.execute("UPDATE review_product_scope SET enabled=0, reason='legacy-study'")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ValueError, match="unknown active section"):
+        section(context, "section-1")
 
 
 def test_evidence_rejects_unclaimed_ids(tmp_path: Path):

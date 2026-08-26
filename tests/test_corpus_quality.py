@@ -12,6 +12,7 @@ from pf2e_codex.corpus_quality import (
     QualityReport,
     audit_workspace,
     compare_quality,
+    compare_repair_quality,
     validate_quality,
 )
 
@@ -279,6 +280,23 @@ def test_absent_quarantine_table_is_a_valid_v3_baseline(tmp_path: Path):
     assert all(item.quarantine_by_reason == {} for item in report.products)
 
 
+def test_v5_exact_native_ambiguous_table_is_active_review_not_unresolved(tmp_path: Path):
+    workspace = tmp_path / "review-table.sqlite3"
+    _create_workspace(workspace, with_quarantine=False)
+    conn = sqlite3.connect(workspace)
+    conn.execute(
+        "UPDATE source_sections SET layout_flags=? WHERE section_key=?",
+        ('["table-ambiguous"]', "section-player-fireball"),
+    )
+    conn.commit()
+    conn.close()
+
+    report = audit_workspace(workspace)
+    player = next(item for item in report.products if item.product_code == "PZO12001")
+
+    assert player.unresolved_table_count == 0
+
+
 def test_digest_is_stable_when_rows_are_inserted_in_a_different_order(tmp_path: Path):
     first = tmp_path / "first.sqlite3"
     second = tmp_path / "second.sqlite3"
@@ -316,6 +334,72 @@ def test_compare_quality_applies_overall_and_per_product_gates():
     comparison = compare_quality(baseline, candidate)
     assert comparison.passed
     assert comparison.as_dict()["gates"]["layout_order_conflicts_overall"]["actual_reduction"] == 0.9
+
+
+def test_compare_repair_quality_counts_v4_quarantine_as_recovered_structure():
+    baseline_row = replace(
+        _clean_quality(conflicts=2, short=2, sentence=1),
+        quarantine_count=4,
+        quarantined_anchor_count=8,
+        quarantine_anchor_ratio=0.2,
+        quarantine_by_reason={
+            "layout-order-conflict": 2,
+            "heading-artifact": 1,
+            "unresolved-table": 1,
+        },
+    )
+    candidate_row = replace(
+        baseline_row,
+        parser_run_id="candidate",
+        section_count=14,
+        quarantine_count=0,
+        quarantined_anchor_count=0,
+        quarantine_anchor_ratio=0.0,
+        quarantine_by_reason={},
+        layout_order_conflict_count=4,
+        sentence_like_heading_count=2,
+        short_under_40_count=6,
+        short_under_80_count=6,
+    )
+    baseline = QualityReport(
+        "corpus-quality-v1", {"PZO12001": "run"}, (baseline_row,), "base"
+    )
+    candidate = QualityReport(
+        "corpus-quality-v1", {"PZO12001": "candidate"},
+        (candidate_row,), "candidate",
+    )
+
+    comparison = compare_repair_quality(baseline, candidate)
+
+    assert comparison.passed
+    assert comparison.gates["layout_conflicts"]["PZO12001"]["baseline"] == 4
+
+
+def test_compare_repair_quality_rejects_remaining_rule_bearing_quarantine():
+    baseline_row = replace(
+        _clean_quality(),
+        quarantine_count=1,
+        quarantined_anchor_count=1,
+        quarantine_anchor_ratio=0.1,
+        quarantine_by_reason={"unresolved-layout": 1},
+    )
+    candidate_row = replace(
+        baseline_row,
+        parser_run_id="candidate",
+        quarantine_anchor_ratio=0.1,
+    )
+    baseline = QualityReport(
+        "corpus-quality-v1", {"PZO12001": "run"}, (baseline_row,), "base"
+    )
+    candidate = QualityReport(
+        "corpus-quality-v1", {"PZO12001": "candidate"},
+        (candidate_row,), "candidate",
+    )
+
+    comparison = compare_repair_quality(baseline, candidate)
+
+    assert not comparison.passed
+    assert not comparison.gates["rule_bearing_quarantine"]["PZO12001"]["passed"]
 
 
 def test_compare_quality_rejects_per_product_regression_and_zero_baseline_increase():

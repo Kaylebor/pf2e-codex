@@ -509,6 +509,44 @@ def test_trusted_layout_requires_every_native_pdf_page(tmp_path, monkeypatch):
         )
 
 
+def test_v5_disambiguates_only_colliding_flattened_heading_chains():
+    shared = "a" * 64
+    untouched = "b" * 64
+    sections = [
+        {
+            "name": "C",
+            "provenance": {
+                "stable_section_identity": shared,
+                "heading_chain": ["A B", "C"],
+                "native_word_anchors": ["anchor-1"],
+            },
+        },
+        {
+            "name": "B C",
+            "provenance": {
+                "stable_section_identity": shared,
+                "heading_chain": ["A", "B C"],
+                "native_word_anchors": ["anchor-2"],
+            },
+        },
+        {
+            "name": "Unrelated",
+            "provenance": {
+                "stable_section_identity": untouched,
+                "heading_chain": ["Unrelated"],
+                "native_word_anchors": ["anchor-3"],
+            },
+        },
+    ]
+
+    corpus._disambiguate_v5_stable_identities(sections)
+
+    identities = [section["provenance"]["stable_section_identity"] for section in sections]
+    assert len(set(identities)) == 3
+    assert identities[0] != shared and identities[1] != shared
+    assert identities[2] == untouched
+
+
 def test_v4_uses_layout_order_and_integrates_unbound_native_words():
     page = _page(1, [
         ("Left Rules", 30, 50, "Heading-Bold", 16),
@@ -619,6 +657,59 @@ def test_v4_reconstructs_stable_native_table_and_quarantines_ambiguous_table():
     assert {item.reason for item in bundle.quarantine} == {"unresolved-table"}
     bundle.verify_seal()
 
+    repaired = corpus.parse_verified_native_export(
+        artifact, parser_version=corpus.PAIZO_NATIVE_PARSER_V5,
+        layout_binding=binding,
+    )
+    assert not repaired.quarantine
+    assert any("table-ambiguous" in section.layout_flags for section in repaired.sections)
+    assert any(block.kind == "table" for section in repaired.sections for block in section.blocks)
+    repaired.verify_seal()
+
+
+def test_v5_quarantines_numeric_heading_artifact():
+    page = _page(1, [
+        ("Rule", 30, 40, "Heading-Bold", 16),
+        ("The mechanic remains authoritative.", 30, 80, "Body", 9),
+        ("123.", 30, 150, "Heading-Bold", 16),
+        ("The following mechanic stays attached.", 30, 190, "Body", 9),
+    ])
+    payload = _trusted_payload([page])
+    artifact = pdf_export.VerifiedNativeExport(
+        payload=payload, product_code="PZO12001", source_basename="PZO12001E.pdf",
+        page_count=1, extractor_profile_version=1, pdf_verified=True,
+        attestation_digest="a" * 64,
+        _verification_token=pdf_export._TRUSTED_PDF_ORIGIN,
+        _payload_digest=pdf_export.trusted_payload_digest(payload),
+    )
+    layout = {
+        "schema_version": 1,
+        "extractor": {"name": "pf2e-codex-pdf-layout", "profile_version": 1},
+        "source": {"sha256": "a" * 64, "page_count": 1},
+        "pages": [{
+            "number": 1, "width": 600.0, "height": 800.0,
+            "regions": [
+                {"label": "paragraph_title", "score": 0.99, "order": 0,
+                 "box": [20, 25, 200, 65]},
+                {"label": "text", "score": 0.99, "order": 1,
+                 "box": [20, 65, 400, 120]},
+                {"label": "text", "score": 0.99, "order": 2,
+                 "box": [20, 175, 400, 230]},
+            ],
+        }],
+    }
+    from pf2e_codex.pdf_layout import bind_layout_to_native_export
+
+    binding = bind_layout_to_native_export(artifact, layout)
+    repaired = corpus.parse_verified_native_export(
+        artifact, parser_version=corpus.PAIZO_NATIVE_PARSER_V5,
+        layout_binding=binding,
+    )
+
+    assert [section.heading for section in repaired.sections] == ["Rule"]
+    assert {item.reason for item in repaired.quarantine} == {"page-number"}
+    assert "following mechanic" in repaired.sections[0].text
+
 
 def test_v4_carries_consecutive_heading_chain_into_next_rule_section():
     page = _page(1, [
@@ -652,10 +743,11 @@ def test_v4_carries_consecutive_heading_chain_into_next_rule_section():
     }
     from pf2e_codex.pdf_layout import bind_layout_to_native_export
 
+    binding = bind_layout_to_native_export(artifact, layout)
     bundle = corpus.parse_verified_native_export(
         artifact,
         parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
-        layout_binding=bind_layout_to_native_export(artifact, layout),
+        layout_binding=binding,
     )
 
     assert len(bundle.sections) == 1
@@ -717,10 +809,11 @@ def test_v4_splits_oversize_sections_on_existing_native_blocks():
     }
     from pf2e_codex.pdf_layout import bind_layout_to_native_export
 
+    binding = bind_layout_to_native_export(artifact, layout)
     bundle = corpus.parse_verified_native_export(
         artifact,
         parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
-        layout_binding=bind_layout_to_native_export(artifact, layout),
+        layout_binding=binding,
     )
 
     assert len(bundle.sections) == 2
@@ -767,15 +860,27 @@ def test_v4_quarantines_contradictory_same_band_layout_order():
     }
     from pf2e_codex.pdf_layout import bind_layout_to_native_export
 
+    binding = bind_layout_to_native_export(artifact, layout)
     bundle = corpus.parse_verified_native_export(
         artifact,
         parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
-        layout_binding=bind_layout_to_native_export(artifact, layout),
+        layout_binding=binding,
     )
 
     assert not bundle.sections
     assert {item.reason for item in bundle.quarantine} == {"layout-order-conflict"}
     bundle.verify_seal()
+
+    repaired = corpus.parse_verified_native_export(
+        artifact, parser_version=corpus.PAIZO_NATIVE_PARSER_V5,
+        layout_binding=binding,
+    )
+    assert not repaired.quarantine
+    assert all(
+        "layout-order-conflict" in section.layout_flags
+        for section in repaired.sections
+    )
+    repaired.verify_seal()
 
 
 def test_v4_sentence_like_model_title_cannot_bypass_heading_checks():
@@ -811,10 +916,11 @@ def test_v4_sentence_like_model_title_cannot_bypass_heading_checks():
     }
     from pf2e_codex.pdf_layout import bind_layout_to_native_export
 
+    binding = bind_layout_to_native_export(artifact, layout)
     bundle = corpus.parse_verified_native_export(
         artifact,
         parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
-        layout_binding=bind_layout_to_native_export(artifact, layout),
+        layout_binding=binding,
     )
 
     assert [section.heading for section in bundle.sections] == ["Actual Rule"]
@@ -859,15 +965,25 @@ def test_v4_quarantines_one_indivisible_oversize_native_block():
     }
     from pf2e_codex.pdf_layout import bind_layout_to_native_export
 
+    binding = bind_layout_to_native_export(artifact, layout)
     bundle = corpus.parse_verified_native_export(
         artifact,
         parser_version=corpus.PAIZO_NATIVE_PARSER_V4,
-        layout_binding=bind_layout_to_native_export(artifact, layout),
+        layout_binding=binding,
     )
 
     assert not bundle.sections
     assert {item.reason for item in bundle.quarantine} == {"oversize-block"}
     bundle.verify_seal()
+
+    repaired = corpus.parse_verified_native_export(
+        artifact, parser_version=corpus.PAIZO_NATIVE_PARSER_V5,
+        layout_binding=binding,
+    )
+    assert not repaired.quarantine
+    assert len(repaired.sections) == 1
+    assert "oversize-block" in repaired.sections[0].layout_flags
+    repaired.verify_seal()
 
 
 def test_parse_uses_geometry_for_two_column_reading_order(tmp_path):

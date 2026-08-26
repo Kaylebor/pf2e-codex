@@ -35,36 +35,27 @@ def _model_licensed_core_digest(conn: sqlite3.Connection) -> str:
         licensed_core_contract_digest,
     )
 
-    revision_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(licensed_revisions)")
-    }
-    section_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(licensed_sections)")
-    }
-    has_revision_printing = "printing_revision" in revision_columns
-    has_section_printing = "printing_revision" in section_columns
     revisions: list[dict[str, object]] = []
     for row in conn.execute(
-        f"""SELECT product_code, content_fingerprint, license, era, parser_version,
-                   source_schema_version, policy_versions
-                   {', printing_revision' if has_revision_printing else ''}
+        """SELECT product_code, content_fingerprint, license, era, parser_version,
+                   source_schema_version, policy_versions, printing_revision
             FROM licensed_revisions ORDER BY product_code, content_fingerprint"""
     ):
         policies = json.loads(row[6])
         if not isinstance(policies, list):
             raise ValueError("licensed revision policies are not a list")
-        revision = {
+        revisions.append(
+            {
                 "product_code": str(row[0]),
                 "content_fingerprint": str(row[1]),
                 "license": str(row[2]),
                 "era": str(row[3]),
                 "parser_version": str(row[4]),
                 "source_schema_version": str(row[5]) if row[5] is not None else None,
+                "printing_revision": str(row[7]),
                 "policy_versions": sorted(str(value) for value in policies),
             }
-        if has_revision_printing:
-            revision["printing_revision"] = str(row[7])
-        revisions.append(revision)
+        )
     notices = [
         {"notice_key": str(row[0]), "license": str(row[1]), "content_hash": str(row[2])}
         for row in conn.execute(
@@ -73,12 +64,12 @@ def _model_licensed_core_digest(conn: sqlite3.Connection) -> str:
     ]
     sections: list[dict[str, object]] = []
     for row in conn.execute(
-        f"""SELECT ls.public_id, ls.heading, ls.page_start, ls.page_end,
+        """SELECT ls.public_id, ls.heading, ls.page_start, ls.page_end,
                   ls.printed_page, ls.product_code, ls.content_fingerprint,
                   ls.source_section_id, ls.source_section_hash, ls.content_hash,
                   ls.license, ls.era, ls.extraction_method, ls.policy_version,
-                  ls.parser_version, lr.source_schema_version, ls.notice_key
-                  {', ls.printing_revision' if has_section_printing else ''}
+                  ls.parser_version, lr.source_schema_version, ls.notice_key,
+                  ls.printing_revision
            FROM licensed_sections AS ls JOIN licensed_revisions AS lr
              ON lr.product_code=ls.product_code
             AND lr.content_fingerprint=ls.content_fingerprint
@@ -98,8 +89,37 @@ def _model_licensed_core_digest(conn: sqlite3.Connection) -> str:
             "source_schema_version": str(row[15]) if row[15] is not None else None,
             "notice_key": str(row[16]),
         }
-        if has_section_printing:
-            provenance["printing_revision"] = str(row[17])
+        provenance["printing_revision"] = str(row[17])
+        provenance["sources"] = [
+            {
+                "product_code": str(source[0]),
+                "content_fingerprint": str(source[1]),
+                "source_section_id": str(source[2]),
+                "source_section_hash": str(source[3]),
+                "page_start": source[4],
+                "page_end": source[5],
+                "printed_page": source[6],
+                "parser_version": str(source[7]),
+                "printing_revision": str(source[8]),
+                "source_schema_version": (
+                    str(source[9]) if source[9] is not None else None
+                ),
+                "notice_key": str(source[10]),
+            }
+            for source in conn.execute(
+                """SELECT lss.product_code, lss.content_fingerprint,
+                          lss.source_section_id, lss.source_section_hash,
+                          lss.page_start, lss.page_end, lss.printed_page,
+                          lss.parser_version, lss.printing_revision,
+                          lr2.source_schema_version, lss.notice_key
+                     FROM licensed_section_sources AS lss
+                     JOIN licensed_revisions AS lr2
+                       ON lr2.product_code=lss.product_code
+                      AND lr2.content_fingerprint=lss.content_fingerprint
+                    WHERE lss.public_id=? ORDER BY lss.source_ordinal""",
+                (str(row[0]),),
+            )
+        ]
         sections.append(
             {
                 "id": str(row[0]),
@@ -111,11 +131,38 @@ def _model_licensed_core_digest(conn: sqlite3.Connection) -> str:
                 "provenance": provenance,
             }
         )
+    required_foundry_rows = [
+        {
+            "foundry_id": str(row[0]),
+            "source_hash": str(row[1]),
+            "normalized_hash": str(row[2]),
+            "publication_title": str(row[3]),
+            "license": str(row[4]),
+            "era": str(row[5]),
+        }
+        for row in conn.execute(
+            """SELECT foundry_id, source_hash, normalized_hash, publication_title,
+                      license, era
+                 FROM required_foundry_rows ORDER BY foundry_id"""
+        )
+    ]
+    scope_row = conn.execute(
+        "SELECT value FROM _meta WHERE key='licensed_core_covered_products'"
+    ).fetchone()
+    if scope_row is None:
+        raise ValueError("licensed-core product scope is missing")
+    covered_products = json.loads(str(scope_row[0]))
+    if not isinstance(covered_products, list) or any(
+        not isinstance(value, str) for value in covered_products
+    ):
+        raise ValueError("licensed-core product scope is invalid")
     return licensed_core_contract_digest(
         schema_version=LICENSED_CORE_SCHEMA_VERSION,
         source_revisions=revisions,
         notices=notices,
         sections=sections,
+        required_foundry_rows=required_foundry_rows,
+        covered_products=covered_products,
     )
 
 
@@ -216,7 +263,10 @@ def inspect_database_scope(db_path: Path | str) -> DistributionAudit:
                 )
                 foundry_scope_verified = True
         if licensed_core_chunks:
-            required = {"licensed_sections", "licensed_revisions", "license_notices", "sources"}
+            required = {
+                "licensed_sections", "licensed_section_sources", "licensed_revisions",
+                "license_notices", "required_foundry_rows", "sources",
+            }
             missing = required - tables
             if missing:
                 licensed_core_issues.append(
@@ -228,6 +278,17 @@ def inspect_database_scope(db_path: Path | str) -> DistributionAudit:
                 )
                 if section_count != licensed_core_chunks:
                     licensed_core_issues.append("chunk/provenance count mismatch")
+                missing_source_provenance = int(
+                    conn.execute(
+                        """SELECT COUNT(*) FROM licensed_sections AS ls
+                           WHERE NOT EXISTS (
+                               SELECT 1 FROM licensed_section_sources AS lss
+                               WHERE lss.public_id=ls.public_id
+                           )"""
+                    ).fetchone()[0]
+                )
+                if missing_source_provenance:
+                    licensed_core_issues.append("missing multi-source provenance")
                 bad_links = int(
                     conn.execute(
                         """SELECT COUNT(*) FROM chunks AS c
@@ -276,7 +337,10 @@ def inspect_database_scope(db_path: Path | str) -> DistributionAudit:
                         row[1] != "licensed-core"
                         or not str(row[2]).startswith("PZO")
                         or len(str(row[3])) != 64
-                        or set(provenance) - {"content_fingerprint", "public_schema_version"}
+                        or set(provenance) - {
+                            "content_fingerprint", "public_schema_version",
+                            "printing_revision",
+                        }
                         or provenance.get("content_fingerprint") != row[3]
                     ):
                         licensed_core_issues.append(f"unsafe source provenance: {row[0]}")

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from .model_manager import ModelManager
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 _CHUNK_PROVENANCE_COLUMNS = {
@@ -209,6 +209,34 @@ def migrate_db(conn) -> None:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS licensed_sections_by_revision
         ON licensed_sections(product_code, content_fingerprint)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS licensed_section_sources (
+            public_id TEXT NOT NULL,
+            source_ordinal INTEGER NOT NULL,
+            product_code TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            source_section_id TEXT NOT NULL,
+            source_section_hash TEXT NOT NULL,
+            page_start INTEGER NOT NULL,
+            page_end INTEGER NOT NULL,
+            printed_page TEXT,
+            parser_version TEXT NOT NULL,
+            printing_revision TEXT NOT NULL,
+            notice_key TEXT NOT NULL,
+            PRIMARY KEY(public_id, source_ordinal),
+            UNIQUE(public_id, product_code, content_fingerprint, source_section_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS required_foundry_rows (
+            foundry_id TEXT PRIMARY KEY,
+            source_hash TEXT NOT NULL,
+            normalized_hash TEXT NOT NULL,
+            publication_title TEXT NOT NULL,
+            license TEXT NOT NULL,
+            era TEXT NOT NULL
+        )
     """)
     conn.execute(
         "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",

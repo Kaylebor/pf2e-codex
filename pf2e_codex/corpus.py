@@ -42,6 +42,11 @@ PAIZO_NATIVE_PARSER_V2 = "paizo-native-v2"
 PAIZO_NATIVE_PARSER_V3 = "paizo-native-v3"
 PAIZO_NATIVE_LAYOUT_V1 = "paizo-native-v3+pp-doclayout-v3-v1"
 PAIZO_NATIVE_PARSER_V4 = "paizo-native-v4"
+# V5 is the deterministic repair profile. It preserves the V4 native-word and
+# layout evidence contract, but promotes ambiguous rule-bearing layout into
+# exact native-text sections carrying fail-closed review flags. Non-rule
+# quarantine remains quarantine.
+PAIZO_NATIVE_PARSER_V5 = "paizo-native-v5"
 PAIZO_NATIVE_PARSER_VERSION = PAIZO_NATIVE_PARSER_V1
 
 
@@ -323,7 +328,7 @@ class TrustedParseBundle:
 
     def verify_seal(self) -> None:
         """Raise if this immutable bundle no longer matches its canonical seal."""
-        if self.parser_version == PAIZO_NATIVE_PARSER_V4:
+        if self.parser_version in {PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}:
             for section in self.sections:
                 block_anchors = tuple(
                     anchor for block in section.blocks for anchor in block.coverage_anchors
@@ -337,7 +342,7 @@ class TrustedParseBundle:
                     != section.text
                 ):
                     raise ValueError(
-                        "trusted v4 section does not match its ordered native blocks"
+                        "trusted structural section does not match its ordered native blocks"
                     )
             assigned = Counter(
                 anchor
@@ -1661,8 +1666,12 @@ def _parse_rulebook_payload_v4(
     product: ProductSpec,
     binding: Any,
     fallback_filename: str,
+    parser_version: str = PAIZO_NATIVE_PARSER_V4,
 ) -> _V4ParseResult:
     """Reconstruct review sections from native words ordered by bound layout regions."""
+    repair_ambiguous = parser_version == PAIZO_NATIVE_PARSER_V5
+    if parser_version not in {PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}:
+        raise ValueError("structural parser requires V4 or V5")
     if binding.product_code != product.code:
         raise ValueError("native layout binding does not match the parser product")
     inventory = native_word_inventory(payload, product.code, strict=True)
@@ -1698,6 +1707,7 @@ def _parse_rulebook_payload_v4(
     quarantine_ordinals: Counter[tuple[int, str]] = Counter()
     assigned: set[str] = set()
     fallback_anchors: set[str] = set()
+    repair_flags_by_anchor: dict[str, str] = {}
 
     def quarantine(reason: str, page: int, text: str, anchors: Sequence[str]) -> None:
         unique = tuple(anchor for anchor in anchors if anchor not in assigned)
@@ -1752,15 +1762,40 @@ def _parse_rulebook_payload_v4(
                 for anchor in page_regions[region_index].native_word_anchors
                 if anchor in words_by_anchor and anchor not in assigned
             )
-            quarantine(
-                "layout-order-conflict",
-                page_number,
-                " ".join(
-                    str(words_by_anchor[anchor].get("text", ""))
-                    for anchor in conflict_anchors
-                ),
-                conflict_anchors,
-            )
+            if repair_ambiguous:
+                conflict_page = dict(page)
+                conflict_page["words"] = [words_by_anchor[anchor] for anchor in conflict_anchors]
+                conflict_order = min(
+                    float(page_regions[index].order) for index in order_conflicts
+                )
+                for line in _reading_order_v2(
+                    conflict_page, _lines_for_page_v2(conflict_page)
+                ):
+                    line_anchors = tuple(
+                        anchor for anchor in line.native_word_anchors if anchor not in assigned
+                    )
+                    if not line_anchors:
+                        continue
+                    page_ordered.append(
+                        (
+                            conflict_order, line.top, line.x0, "native-repair",
+                            replace(line, layout_kind="native-repair"), (),
+                        )
+                    )
+                    assigned.update(line_anchors)
+                    repair_flags_by_anchor.update(
+                        (anchor, "layout-order-conflict") for anchor in line_anchors
+                    )
+            else:
+                quarantine(
+                    "layout-order-conflict",
+                    page_number,
+                    " ".join(
+                        str(words_by_anchor[anchor].get("text", ""))
+                        for anchor in conflict_anchors
+                    ),
+                    conflict_anchors,
+                )
         for region_index, region in enumerate(page_regions):
             anchors = tuple(
                 anchor
@@ -1780,10 +1815,29 @@ def _parse_rulebook_payload_v4(
             if region.label == "table":
                 rows = _v4_table_rows(region_page, raw_lines)
                 if rows is None:
-                    quarantine(
-                        "unresolved-table", page_number,
-                        " ".join(line.text for line in raw_lines), anchors,
-                    )
+                    if repair_ambiguous:
+                        for line in _reading_order_v2(region_page, raw_lines):
+                            line_anchors = tuple(
+                                anchor for anchor in line.native_word_anchors
+                                if anchor not in assigned
+                            )
+                            if not line_anchors:
+                                continue
+                            page_ordered.append(
+                                (
+                                    float(region.order), line.top, line.x0,
+                                    "table-repair", replace(line, layout_kind="table-repair"), (),
+                                )
+                            )
+                            assigned.update(line_anchors)
+                            repair_flags_by_anchor.update(
+                                (anchor, "table-ambiguous") for anchor in line_anchors
+                            )
+                    else:
+                        quarantine(
+                            "unresolved-table", page_number,
+                            " ".join(line.text for line in raw_lines), anchors,
+                        )
                     continue
                 for row in rows:
                     line = _table_block(row, layout_kind="table-grid")
@@ -1797,15 +1851,42 @@ def _parse_rulebook_payload_v4(
                     assigned.update(line.native_word_anchors)
                 continue
             if region.label not in _V4_BODY_LABELS | _V4_SIDEBAR_LABELS | _V4_HEADING_LABELS:
-                quarantine(
-                    "unresolved-layout", page_number,
-                    " ".join(line.text for line in raw_lines), anchors,
-                )
+                if repair_ambiguous:
+                    for line in _reading_order_v2(region_page, raw_lines):
+                        line_anchors = tuple(
+                            anchor for anchor in line.native_word_anchors if anchor not in assigned
+                        )
+                        if not line_anchors:
+                            continue
+                        page_ordered.append(
+                            (
+                                float(region.order), line.top, line.x0, "native-repair",
+                                replace(line, layout_kind="native-repair"), (),
+                            )
+                        )
+                        assigned.update(line_anchors)
+                        repair_flags_by_anchor.update(
+                            (anchor, "unsupported-layout") for anchor in line_anchors
+                        )
+                else:
+                    quarantine(
+                        "unresolved-layout", page_number,
+                        " ".join(line.text for line in raw_lines), anchors,
+                    )
                 continue
             lines = _reading_order_v2(region_page, raw_lines)
             for line in lines:
                 line_anchors = tuple(anchor for anchor in line.native_word_anchors if anchor not in assigned)
                 if not line_anchors:
+                    continue
+                compact_heading = re.sub(r"[\s\W_]", "", line.text, flags=re.UNICODE)
+                if (
+                    repair_ambiguous
+                    and region.label in _V4_HEADING_LABELS
+                    and compact_heading
+                    and compact_heading.isdecimal()
+                ):
+                    quarantine("page-number", page_number, line.text, line_anchors)
                     continue
                 normalized = _normalize_name(re.sub(r"\b\d+\b", "", line.text))
                 margin = bool(height and (line.top < height * 0.12 or line.bottom > height * 0.88))
@@ -1900,14 +1981,20 @@ def _parse_rulebook_payload_v4(
     def flush() -> None:
         nonlocal title, body_lines, blocks, anchors, pages_in_section, layout_flags
         if title is None or not body_lines:
-            quarantine_open("heading-artifact" if title else "unresolved-continuation")
-            return
+            reason = "heading-artifact" if title else "unresolved-continuation"
+            if not repair_ambiguous or not blocks:
+                quarantine_open(reason)
+                return
+            title = title or f"Continuation on page {pages_in_section[0]}"
+            layout_flags.add(reason)
         if any(len(block.text) > _V4_SECTION_TARGET_CHARS for block in blocks):
-            quarantine_open("oversize-block")
-            return
+            if not repair_ambiguous:
+                quarantine_open("oversize-block")
+                return
+            layout_flags.add("oversize-block")
         heading_chain = tuple(
             block.text for block in blocks if block.kind == "heading"
-        )
+        ) or (title,)
         identity_heading = "\n".join(heading_chain) or title
         groups: list[list[TrustedBlock]] = []
         current: list[TrustedBlock] = []
@@ -1955,6 +2042,12 @@ def _parse_rulebook_payload_v4(
                 group_flags.add("oversize-split")
             if fallback_anchors.intersection(group_anchors):
                 group_flags.add("native-layout-fallback")
+            group_flags.update(
+                repair_flags_by_anchor[anchor]
+                for anchor in group_anchors
+                if anchor in repair_flags_by_anchor
+            )
+            group_flags.update(layout_flags)
             provenance = {
                 "export_schema_version": payload.get("schema_version"),
                 "title": product.title,
@@ -1980,7 +2073,7 @@ def _parse_rulebook_payload_v4(
                     source_sha256="", pages=page_values, page_start=page_start,
                     page_end=page_values[-1], printed_page=None,
                     section_hash=section_hash, provenance=provenance,
-                    ordinal=ordinal, parser_version=PAIZO_NATIVE_PARSER_V4,
+                    ordinal=ordinal, parser_version=parser_version,
                 ).as_chunk()
             )
             blocks_by_section_id[section_id] = group_blocks
@@ -2001,6 +2094,22 @@ def _parse_rulebook_payload_v4(
 
     for page_number, kind, line, table_cells in ordered:
         heading = _v4_is_heading(line, page_sizes[page_number], kind)
+        compact_heading = re.sub(r"[\s\W_]", "", line.text, flags=re.UNICODE)
+        if (
+            repair_ambiguous
+            and heading
+            and compact_heading
+            and compact_heading.isdecimal()
+        ):
+            key = (page_number, "page-number")
+            quarantined.append(
+                _v4_quarantine(
+                    product, "page-number", page_number,
+                    quarantine_ordinals[key], line.text, line.native_word_anchors,
+                )
+            )
+            quarantine_ordinals[key] += 1
+            continue
         if heading:
             if (
                 title is not None
@@ -2031,7 +2140,11 @@ def _parse_rulebook_payload_v4(
                 )
             ]
             continue
-        block_kind = "body" if kind == "native-fallback" else kind
+        block_kind = (
+            "table" if kind == "table-repair"
+            else "body" if kind in {"native-fallback", "native-repair"}
+            else kind
+        )
         if title is None:
             # Keep collecting until a real heading is observed; the group is
             # quarantined deterministically at the next boundary/end.
@@ -2056,7 +2169,7 @@ def _parse_rulebook_payload_v4(
                 coverage_anchors=line.native_word_anchors, table_cells=table_cells,
             )
         )
-        if kind == "table":
+        if kind in {"table", "table-repair"}:
             layout_flags.add("structured-table")
         elif kind == "sidebar":
             layout_flags.add("structured-sidebar")
@@ -2072,7 +2185,7 @@ def _parse_rulebook_payload_v4(
         for anchor in anchor_group
     )
     if set(ownership) != expected or any(value != 1 for value in ownership.values()):
-        raise ValueError("v4 parser did not assign every native anchor exactly once")
+        raise ValueError("structural parser did not assign every native anchor exactly once")
     return _V4ParseResult(tuple(sections), MappingProxyType(blocks_by_section_id), tuple(quarantined))
 
 
@@ -2092,6 +2205,52 @@ def _stable_section_identity(
         )
     )
     return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _disambiguate_v5_stable_identities(sections: list[dict[str, Any]]) -> None:
+    """Resolve rare flattened-heading collisions without renumbering other sections.
+
+    The frozen V2 identity normalizes a complete heading chain as one string.
+    Consequently, two different chains such as ``["A B", "C"]`` and
+    ``["A", "B C"]`` can have the same flattened identity. Keep every
+    non-colliding identity unchanged so exact V4 work remains reusable, while
+    deriving collision-only identities from the length-delimited chain and the
+    first authoritative native anchor.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for section in sections:
+        provenance = section.get("provenance")
+        if isinstance(provenance, dict):
+            identity = provenance.get("stable_section_identity")
+            if isinstance(identity, str):
+                grouped[identity].append(section)
+    for identity, collisions in grouped.items():
+        if len(collisions) < 2:
+            continue
+        replacement_ids: set[str] = set()
+        for section in collisions:
+            provenance = section["provenance"]
+            heading_chain = provenance.get("heading_chain", [section.get("name", "")])
+            anchors = provenance.get("native_word_anchors", [])
+            if (
+                not isinstance(heading_chain, list)
+                or any(not isinstance(value, str) for value in heading_chain)
+                or not isinstance(anchors, list)
+                or not anchors
+                or not isinstance(anchors[0], str)
+            ):
+                raise ValueError("V5 identity collision lacks structural provenance")
+            material = json.dumps({
+                "version": "paizo-section-identity-v2-collision-1",
+                "base": identity,
+                "heading_chain": [_normalize_name(value) for value in heading_chain],
+                "first_native_anchor": anchors[0],
+            }, sort_keys=True, separators=(",", ":"))
+            replacement = hashlib.sha256(material.encode("utf-8")).hexdigest()
+            if replacement in replacement_ids:
+                raise ValueError("V5 stable identity collision remains ambiguous")
+            replacement_ids.add(replacement)
+            provenance["stable_section_identity"] = replacement
 
 
 def _trusted_section_canonical(section: TrustedSection) -> dict[str, object]:
@@ -2488,21 +2647,23 @@ def parse_verified_native_export(
         raise ValueError("verified export references an unsupported PZO product")
     inventory = native_word_inventory(artifact.payload, product.code, strict=True)
     v4_result: _V4ParseResult | None = None
-    if parser_version == PAIZO_NATIVE_PARSER_V4:
+    if parser_version in {PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}:
         if layout_binding is None:
-            raise ValueError("paizo-native-v4 requires complete bound layout evidence")
+            raise ValueError(f"{parser_version} requires complete bound layout evidence")
         v4_result = _parse_rulebook_payload_v4(
             artifact.payload, product=product, binding=layout_binding,
-            fallback_filename=artifact.source_basename,
+            fallback_filename=artifact.source_basename, parser_version=parser_version,
         )
         sections = list(v4_result.chunks)
     else:
         if layout_binding is not None:
-            raise ValueError("bound layout input is only accepted by paizo-native-v4")
+            raise ValueError("bound layout input is only accepted by structural parsers")
         sections = parse_rulebook_payload(
             artifact.payload, product=product, parser_version=parser_version,
             fallback_filename=artifact.source_basename,
         )
+    if parser_version == PAIZO_NATIVE_PARSER_V5:
+        _disambiguate_v5_stable_identities(sections)
     trusted_sections: list[TrustedSection] = []
     for section in sections:
         provenance = section.get("provenance")
@@ -2612,10 +2773,12 @@ def load_and_parse_verified_pdf(
         catalog_title_markers=catalog_title_markers,
     )
     if layout_artifact is None:
-        if parser_version == PAIZO_NATIVE_PARSER_V4:
-            raise ValueError("paizo-native-v4 requires complete layout evidence")
+        if parser_version in {PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}:
+            raise ValueError(f"{parser_version} requires complete layout evidence")
         return parse_verified_native_export(artifact, parser_version=parser_version)
-    if parser_version not in {PAIZO_NATIVE_PARSER_V3, PAIZO_NATIVE_PARSER_V4}:
+    if parser_version not in {
+        PAIZO_NATIVE_PARSER_V3, PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5,
+    }:
         raise ValueError("layout evidence requires the current licensed-review parser")
     from .pdf_layout import bind_layout_to_native_export
 
@@ -2631,7 +2794,7 @@ def load_and_parse_verified_pdf(
         raise ValueError(
             "trusted layout evidence must cover every exported native PDF page"
         )
-    if parser_version == PAIZO_NATIVE_PARSER_V4:
+    if parser_version in {PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}:
         return parse_verified_native_export(
             artifact, parser_version=parser_version, layout_binding=binding
         )
@@ -2901,6 +3064,7 @@ __all__ = [
     "PAIZO_NATIVE_PARSER_V2",
     "PAIZO_NATIVE_PARSER_V3",
     "PAIZO_NATIVE_PARSER_V4",
+    "PAIZO_NATIVE_PARSER_V5",
     "PAIZO_NATIVE_LAYOUT_V1",
     "PAIZO_NATIVE_PARSER_VERSION",
     "PRODUCT_CATALOG",

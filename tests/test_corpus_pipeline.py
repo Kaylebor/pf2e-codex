@@ -106,7 +106,8 @@ def _licensed_chunk() -> dict:
             "era": "remaster",
             "provenance": {
                 "content_fingerprint": fingerprint,
-                "public_schema_version": 1,
+                "public_schema_version": 3,
+                "printing_revision": "printing-1",
             },
         },
         "section_hash": content_hash,
@@ -125,7 +126,23 @@ def _licensed_chunk() -> dict:
             "policy_version": "mechanics-v1",
             "parser_version": "paizo-native-v1",
             "source_schema_version": "1",
+            "printing_revision": "printing-1",
             "notice_key": "ORC",
+            "sources": [
+                {
+                    "product_code": "PZO12001",
+                    "content_fingerprint": fingerprint,
+                    "source_section_id": "pzo12001:player-core:p10:h0123456789abcdef:i0",
+                    "source_section_hash": source_section_hash,
+                    "page_start": 10,
+                    "page_end": 10,
+                    "printed_page": "8",
+                    "parser_version": "paizo-native-v1",
+                    "printing_revision": "printing-1",
+                    "source_schema_version": "1",
+                    "notice_key": "ORC",
+                }
+            ],
         },
         "licensed_notice": {
             "notice_key": "ORC",

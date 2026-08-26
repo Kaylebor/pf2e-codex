@@ -30,28 +30,42 @@ from urllib.request import Request, urlopen
 
 from .corpus import (
     PAIZO_NATIVE_PARSER_V4,
+    PAIZO_NATIVE_PARSER_V5,
     PRODUCT_CATALOG,
     CorpusSource,
     discover_sources,
     select_revisions,
 )
-from .corpus_quality import audit_workspace, compare_quality, validate_quality
+from .corpus_quality import (
+    audit_workspace,
+    compare_quality,
+    compare_repair_quality,
+    validate_quality,
+)
 from .licensed_core import licensed_core_digest, load_licensed_core
 from .licensed_corpus import (
     REVIEW_SCHEMA_VERSION,
+    REVIEW_SCOPE_VERSION,
     _ensure_workspace_migrated,
+    _foundry_coverage_evidence_for_snapshot,
+    _review_scope_rows,
+    _semantic_scope_sql,
     activate_parser_run,
     build_public_corpus,
     claim_draft_screening_batch,
     claim_review,
     claim_shard,
     draft_screening_status,
+    foundry_coverage_evidence,
     initialize_trusted_workspace,
+    prepare_deterministic_review,
     read_claimed_review,
     read_claimed_shard,
     reclaim_interrupted_shard,
     release_draft_screening_batch,
     reopen_draft_screening,
+    review_product_scope,
+    set_review_product_scope,
     stage_trusted_native_pdf,
     stage_trusted_native_pdf_with_approved_stitches,
     submit_candidate,
@@ -59,10 +73,11 @@ from .licensed_corpus import (
     submit_review,
     workspace_status,
 )
+from .licensed_coverage import NORMALIZER_VERSION, load_clean_foundry
 from .licensed_policy import LICENSED_CORE_POLICY_VERSION, licensed_policy_digest
 
-RUNNER_VERSION = "licensed-corpus-runner-v1"
-PROMPT_VERSION = "licensed-review-v1"
+RUNNER_VERSION = "licensed-corpus-runner-v3"
+PROMPT_VERSION = "licensed-review-v2"
 EXPECTED_PRODUCTS = ("PZO2101", "PZO12001", "PZO12002", "PZO12003", "PZO12004")
 MODEL_BY_QUEUE = {
     "stitch-select": "gpt-5.6-luna",
@@ -165,8 +180,12 @@ SCHEMAS: dict[str, dict[str, object]] = {
                 "type": ["string", "null"],
                 "enum": [None, "no-mechanics", "duplicate", "setting-prose", "layout", "scope", "complex-rule", "insufficient-context"],
             },
+            "foundry_ids": {
+                "type": "array", "items": {"type": "string"},
+                "maxItems": 3, "uniqueItems": True,
+            },
         },
-        ("id", "decision", "reason"),
+        ("id", "decision", "reason", "foundry_ids"),
     ),
     "classify": _object_schema(
         {
@@ -264,6 +283,8 @@ def validate_result_schema(results: Sequence[Mapping[str, Any]], schema: Mapping
                 item_type = rule.get("items", {}).get("type")
                 if item_type and any(not _matches_type(item, item_type) for item in value):
                     raise ResultSchemaError(f"worker result {name} has invalid items")
+                if rule.get("uniqueItems") and len(value) != len(set(value)):
+                    raise ResultSchemaError(f"worker result {name} contains duplicate items")
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 if value < rule.get("minimum", value) or value > rule.get("maximum", value):
                     raise ResultSchemaError(f"worker result {name} is outside its bounds")
@@ -336,6 +357,15 @@ class CodexResult:
     result_hash: str
 
 
+class _CodexProcessError(RuntimeError):
+    """Sanitized Codex CLI failure classification without captured output."""
+
+    def __init__(self, category: str, *, retryable: bool) -> None:
+        super().__init__(category)
+        self.category = category
+        self.retryable = retryable
+
+
 class CodexExecutor:
     """Schema-constrained noninteractive Codex process adapter."""
 
@@ -390,7 +420,14 @@ class CodexExecutor:
             timeout=self.timeout,
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"codex exec failed with exit code {completed.returncode}")
+            diagnostic = f"{completed.stdout}\n{completed.stderr}".casefold()
+            if "hit your usage limit" in diagnostic or "usage limit for" in diagnostic:
+                raise _CodexProcessError("model-usage-limit", retryable=False)
+            if "authentication" in diagnostic or "not logged in" in diagnostic:
+                raise _CodexProcessError("authentication-required", retryable=False)
+            raise _CodexProcessError(
+                f"codex-exit-{completed.returncode}", retryable=True
+            )
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         events: list[dict[str, Any]] = []
         for line in completed.stdout.splitlines():
@@ -555,9 +592,9 @@ def _evidence_context(workspace: Path, workdir: Path, ids: Sequence[str], foundr
 
 def _worker_prompt(queue: str, records: Sequence[dict[str, Any]]) -> str:
     policies = {
-        "screen": "Return add for potentially redistributable mechanics, reject only clear non-mechanics/duplicates, and defer when the bounded reason applies. False negatives are worse than adds.",
-        "screen-deferred": "Resolve each deferred screen. Use the evidence command when useful. If still uncertain, return add.",
-        "screen-terra": "Final complex-rule screen escalation. Use bounded evidence when useful. If still uncertain, return defer; the supervisor will conservatively retain it.",
+        "screen": "Return add for potentially redistributable mechanics, reject only clear non-mechanics/duplicates, and defer when the bounded reason applies. For a Foundry duplicate, reject only when the supplied Foundry rows jointly cover every mechanic and return only their supplied IDs; otherwise return an empty foundry_ids array. False negatives are worse than adds.",
+        "screen-deferred": "Resolve each deferred screen. Use supplied Foundry evidence when useful. A duplicate requires complete mechanical coverage and only supplied IDs. If still uncertain, return add with an empty foundry_ids array.",
+        "screen-terra": "Final complex-rule screen escalation. Use bounded evidence when useful. A duplicate requires complete mechanical coverage and only supplied IDs. If still uncertain, return defer with an empty foundry_ids array; the supervisor will conservatively retain it.",
         "classify": "Classify under mechanics-v1. PUBLIC_AS_IS means the whole supplied section is functional public mechanics; MIXED_NEEDS_EXTRACTION means mechanics must be reconstructed; exclusions and uncertainty produce no prose.",
         "extract": "Write concise mechanics-only text under mechanics-v1. Do not copy narrative, setting prose, examples, art captions, trademarks, or attribution. Preserve complete functional conditions and outcomes.",
         "review": "Independently review the candidate against the source and mechanics-v1. APPROVE only public text; REJECT only confirms EXCLUDE/UNCERTAIN; otherwise REVISE.",
@@ -631,6 +668,16 @@ def run_codex_batch(
             )
             _finish_session(workspace, queue, slot, result, evidence_bytes)
             return values
+        except _CodexProcessError as exc:
+            kind = "transport-failure"
+            _record_attempt(
+                workspace, queue=queue, batch_key=batch_key, slot=slot, model=model,
+                cli_version=cli_version,
+                thread_id=session.get("thread_id"), attempt=attempt,
+                input_digest=input_digest, status=kind, error_kind=exc.category,
+            )
+            if not exc.retryable:
+                raise RuntimeError(f"{queue} blocked by {exc.category}") from exc
         except (OSError, subprocess.SubprocessError, RuntimeError, json.JSONDecodeError) as exc:
             kind = "transport-failure"
             _record_attempt(
@@ -655,16 +702,23 @@ def run_codex_batch(
 def _active_product_rows(workspace: Path) -> list[sqlite3.Row]:
     with _connect(workspace, readonly=True) as conn:
         return conn.execute(
-            """SELECT p.*, r.era, r.license
+            f"""SELECT p.*, r.era, r.license
                FROM parser_runs AS p
                JOIN source_revisions AS r ON r.product_code=p.product_code
                 AND r.content_fingerprint=(SELECT content_fingerprint FROM source_sections
                     WHERE parser_run_id=p.parser_run_id LIMIT 1)
-               WHERE p.state='active' AND p.review_enabled=1 ORDER BY p.product_code"""
+               WHERE p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}
+               ORDER BY p.product_code"""
         ).fetchall()
 
 
-def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -> dict[str, Any]:
+def verify_workspace(
+    workspace: Path | str,
+    *,
+    require_complete: bool = False,
+    foundry_database: Path | str | None = None,
+) -> dict[str, Any]:
     path = Path(workspace).expanduser().resolve()
     _ensure_workspace_migrated(path)
     with _connect(path, readonly=True) as conn:
@@ -687,22 +741,46 @@ def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -
             (int(time.time()),) * 4,
         ).fetchone()[0])
         maintenance = int(conn.execute(
-            "SELECT COUNT(*) FROM runner_maintenance WHERE resolved_at IS NULL"
+            f"""SELECT COUNT(*) FROM runner_maintenance AS maintenance
+                WHERE maintenance.resolved_at IS NULL AND (
+                  EXISTS (SELECT 1 FROM source_sections AS section
+                          WHERE section.section_key=maintenance.subject_id
+                            AND {_semantic_scope_sql('section.product_code')})
+                  OR EXISTS (SELECT 1 FROM candidates AS candidate
+                             JOIN source_sections AS section
+                               ON section.section_key=candidate.section_key
+                             WHERE candidate.candidate_id=maintenance.subject_id
+                               AND {_semantic_scope_sql('section.product_code')})
+                  OR EXISTS (SELECT 1 FROM stitch_candidates AS stitch
+                             WHERE stitch.candidate_id=maintenance.subject_id
+                               AND {_semantic_scope_sql('stitch.product_code')})
+                )"""
         ).fetchone()[0])
         unsafe_runner_metadata = 0
         for table in (
             "runner_sessions", "runner_attempts", "runner_maintenance",
             "runner_screen_escalations", "runner_screen_rejections",
             "stitch_candidates", "stitch_votes", "stitch_claims", "aon_cache",
+            "duplicate_groups", "duplicate_group_members", "foundry_snapshots",
+            "foundry_snapshot_rows", "foundry_coverage_candidates",
+            "foundry_coverage_confirmations", "review_product_scope",
         ):
             for row in conn.execute(f"SELECT * FROM {table}"):
                 encoded = _canonical(dict(row)).casefold()
                 if any(marker in encoded for marker in (".local-corpus", "/home/", "\\users\\", "file://")) or "@" in encoded:
                     unsafe_runner_metadata += 1
         unresolved_resolutions = int(conn.execute(
-            """SELECT COUNT(*) FROM source_sections AS s
+            f"""SELECT COUNT(*) FROM source_sections AS s
                JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
-               WHERE p.state='active' AND p.review_enabled=1 AND NOT EXISTS (
+               WHERE p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}
+                 AND EXISTS (
+                   SELECT 1 FROM draft_screening_current AS screen
+                   WHERE screen.parser_run_id=s.parser_run_id
+                     AND screen.section_key=s.section_key
+                     AND screen.decision IN ('ADD','REJECT')
+                 )
+                 AND NOT EXISTS (
                  SELECT 1 FROM candidates AS c JOIN reviews AS r ON r.candidate_id=c.candidate_id
                  LEFT JOIN review_invalidations AS i ON i.review_id=r.review_id
                  WHERE c.section_key=s.section_key
@@ -710,8 +788,37 @@ def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -
                    AND i.review_id IS NULL
                    AND ((c.decision IN ('PUBLIC_AS_IS','MIXED_NEEDS_EXTRACTION') AND r.verdict='APPROVE')
                      OR (c.decision IN ('EXCLUDE','UNCERTAIN') AND r.verdict='REJECT'))
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM duplicate_group_members AS member
+                 WHERE member.section_key=s.section_key AND member.source_ordinal>0
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM foundry_coverage_confirmations AS coverage
+                 JOIN metadata AS active ON active.key='active_foundry_snapshot'
+                    AND active.value=coverage.snapshot_digest
+                 WHERE coverage.section_key=s.section_key
                )"""
         ).fetchone()[0])
+        intentional = ("page-number", "repeated-furniture", "contents-index", "credits-legal")
+        placeholders = ",".join("?" for _ in intentional)
+        global_unresolved_quarantine = int(conn.execute(
+            f"""SELECT COUNT(*) FROM parser_quarantine AS q JOIN parser_runs AS p
+                   ON p.parser_run_id=q.parser_run_id
+                  WHERE p.state='active' AND p.review_enabled=1
+                    AND q.reason NOT IN ({placeholders})""",
+            intentional,
+        ).fetchone()[0])
+        unresolved_quarantine = int(conn.execute(
+            f"""SELECT COUNT(*) FROM parser_quarantine AS q JOIN parser_runs AS p
+                   ON p.parser_run_id=q.parser_run_id
+                  WHERE p.state='active' AND p.review_enabled=1
+                    AND {_semantic_scope_sql('p.product_code')}
+                    AND q.reason NOT IN ({placeholders})""",
+            intentional,
+        ).fetchone()[0])
+        active_snapshot = conn.execute(
+            "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+        ).fetchone()
+    scope = review_product_scope(path)
     errors: list[str] = []
     if integrity != "ok":
         errors.append("sqlite-integrity")
@@ -721,6 +828,10 @@ def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -
         str(row["product_code"]) for row in products
     } != set(EXPECTED_PRODUCTS):
         errors.append("five-product-catalog")
+    if {
+        str(item["product_code"]) for item in scope["products"]
+    } != {str(row["product_code"]) for row in products}:
+        errors.append("product-scope-catalog")
     if unsafe_runner_metadata:
         errors.append("runner-metadata-privacy")
     for row in products:
@@ -736,6 +847,15 @@ def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -
     )
     if require_complete:
         unresolved += unresolved_resolutions
+        if unresolved_quarantine:
+            errors.append("unresolved-rule-quarantine")
+            unresolved += unresolved_quarantine
+        if foundry_database is None:
+            errors.append("foundry-database-required")
+        else:
+            snapshot = load_clean_foundry(foundry_database)
+            if active_snapshot is None or str(active_snapshot[0]) != snapshot.digest:
+                errors.append("stale-foundry-coverage")
         if live_claims:
             errors.append("live-claims")
         if unresolved:
@@ -753,9 +873,12 @@ def verify_workspace(workspace: Path | str, *, require_complete: bool = False) -
             }
             for row in products
         ],
+        "semantic_scope": scope,
         "live_claims": live_claims,
         "maintainer_items": maintenance,
         "unresolved": unresolved,
+        "unresolved_rule_quarantine": unresolved_quarantine,
+        "global_unresolved_rule_quarantine": global_unresolved_quarantine,
     }
 
 
@@ -784,11 +907,40 @@ def compare_workspace_quality(
     return compare_quality(baseline, candidate).as_dict()
 
 
+def _compact_retired_structural_evidence(workspace: Path) -> int:
+    """Drop bulky retired parser geometry after carry-forward and comparison.
+
+    Candidate, review, screening, stitch, source, and parser-run audit rows stay
+    intact. Only native-anchor/block/quarantine material owned exclusively by
+    retired runs is removed from the already validated sibling.
+    """
+    deleted = 0
+    with _connect(workspace) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        retired = "SELECT parser_run_id FROM parser_runs WHERE state='retired'"
+        for table in (
+            "parser_section_block_anchors",
+            "parser_section_blocks",
+            "parser_quarantine_anchors",
+            "parser_quarantine",
+            "parser_section_anchors",
+            "parser_ignored_anchors",
+        ):
+            deleted += conn.execute(
+                f"DELETE FROM {table} WHERE parser_run_id IN ({retired})"
+            ).rowcount
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("VACUUM")
+    return deleted
+
+
 def prepare_workspace(
     workspace: Path | str,
     sources_root: Path | str,
     *,
-    parser_version: str = PAIZO_NATIVE_PARSER_V4,
+    parser_version: str = PAIZO_NATIVE_PARSER_V5,
     shard_size: int = MAX_BATCH_RECORDS,
     layout_model_dir: Path | str | None = None,
     layout_provider: str | None = None,
@@ -887,7 +1039,11 @@ def prepare_workspace(
             if set(baseline_runs) != set(candidate_runs):
                 raise ValueError("carry-forward workspace does not contain the complete five-product baseline")
             baseline_quality = audit_workspace(sibling, parser_run_ids=baseline_runs)
-            compared = compare_quality(baseline_quality, quality)
+            compared = (
+                compare_repair_quality(baseline_quality, quality)
+                if parser_version == PAIZO_NATIVE_PARSER_V5
+                else compare_quality(baseline_quality, quality)
+            )
             comparison = compared.as_dict()
             if not compared.passed:
                 failed = _failed_comparison_gates(comparison["gates"])
@@ -895,6 +1051,7 @@ def prepare_workspace(
                     "candidate parser failed the deterministic quality gates: "
                     + ", ".join(failed)
                 )
+        compacted_structural_rows = _compact_retired_structural_evidence(sibling)
         with _connect(sibling) as checkpoint_conn:
             checkpoint_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         journal_conn = sqlite3.connect(sibling, timeout=30)
@@ -910,6 +1067,7 @@ def prepare_workspace(
             "quality": quality.as_dict(),
             "comparison": comparison,
             "carried_forward": bool(baseline_runs),
+            "compacted_structural_rows": compacted_structural_rows,
         }
     except BaseException:
         sibling.unlink(missing_ok=True)
@@ -1243,10 +1401,11 @@ def refresh_aon_cache(
     with _connect(path, readonly=True) as conn:
         headings = [
             str(row[0]) for row in conn.execute(
-                """SELECT DISTINCT s.heading FROM draft_screening_current AS d
+                f"""SELECT DISTINCT s.heading FROM draft_screening_current AS d
                    JOIN source_sections AS s ON s.section_key=d.section_key
                    JOIN parser_runs AS p ON p.parser_run_id=d.parser_run_id
                    WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')}
                      AND d.decision='DEFER' AND d.defer_reason='scope'
                    ORDER BY s.heading"""
             )
@@ -1344,34 +1503,38 @@ def runner_status(workspace: Path | str) -> dict[str, Any]:
                 "queue": str(row["queue_name"]),
                 "model": str(row["model"]),
                 "status": str(row["status"]),
+                "error_kind": str(row["error_kind"] or "") or None,
                 "attempts": int(row["attempts"]),
                 "retries": int(row["retries"]),
             }
             for row in conn.execute(
-                """SELECT queue_name, model, status, COUNT(*) AS attempts,
+                """SELECT queue_name, model, status, error_kind, COUNT(*) AS attempts,
                           SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries
                    FROM runner_attempts
-                   GROUP BY queue_name, model, status
-                   ORDER BY queue_name, model, status"""
+                   GROUP BY queue_name, model, status, error_kind
+                   ORDER BY queue_name, model, status, error_kind"""
             )
         ]
         stitches = {
             "candidates": int(conn.execute(
-                """SELECT COUNT(*) FROM stitch_candidates AS c JOIN parser_runs AS p
+                f"""SELECT COUNT(*) FROM stitch_candidates AS c JOIN parser_runs AS p
                    ON p.parser_run_id=c.parser_run_id
-                   WHERE p.state='active' AND p.review_enabled=1"""
+                   WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')}"""
             ).fetchone()[0]),
             "selector_pending": int(conn.execute(
-                """SELECT COUNT(*) FROM stitch_candidates AS c JOIN parser_runs AS p
+                f"""SELECT COUNT(*) FROM stitch_candidates AS c JOIN parser_runs AS p
                    ON p.parser_run_id=c.parser_run_id
-                   WHERE p.state='active' AND p.review_enabled=1 AND NOT EXISTS
+                   WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')} AND NOT EXISTS
                    (SELECT 1 FROM stitch_votes WHERE candidate_id=c.candidate_id AND role='selector')"""
             ).fetchone()[0]),
             "confirmer_pending": int(conn.execute(
-                """SELECT COUNT(*) FROM stitch_candidates AS c JOIN stitch_votes AS s
+                f"""SELECT COUNT(*) FROM stitch_candidates AS c JOIN stitch_votes AS s
                    ON s.candidate_id=c.candidate_id AND s.role='selector' AND s.decision='merge'
                    JOIN parser_runs AS p ON p.parser_run_id=c.parser_run_id
-                   WHERE p.state='active' AND p.review_enabled=1 AND NOT EXISTS
+                   WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')} AND NOT EXISTS
                    (SELECT 1 FROM stitch_votes WHERE candidate_id=c.candidate_id AND role='confirmer')"""
             ).fetchone()[0]),
             "live_claims": int(conn.execute(
@@ -1379,8 +1542,22 @@ def runner_status(workspace: Path | str) -> dict[str, Any]:
                 (int(time.time()),),
             ).fetchone()[0]),
         }
+        maintenance_predicate = f"""maintenance.resolved_at IS NULL AND (
+            EXISTS (SELECT 1 FROM source_sections AS section
+                    WHERE section.section_key=maintenance.subject_id
+                      AND {_semantic_scope_sql('section.product_code')})
+            OR EXISTS (SELECT 1 FROM candidates AS candidate
+                       JOIN source_sections AS section
+                         ON section.section_key=candidate.section_key
+                       WHERE candidate.candidate_id=maintenance.subject_id
+                         AND {_semantic_scope_sql('section.product_code')})
+            OR EXISTS (SELECT 1 FROM stitch_candidates AS stitch
+                       WHERE stitch.candidate_id=maintenance.subject_id
+                         AND {_semantic_scope_sql('stitch.product_code')})
+        )"""
         maintenance = int(conn.execute(
-            "SELECT COUNT(*) FROM runner_maintenance WHERE resolved_at IS NULL"
+            "SELECT COUNT(*) FROM runner_maintenance AS maintenance WHERE "
+            + maintenance_predicate
         ).fetchone()[0])
         maintenance_items = [
             {
@@ -1391,8 +1568,9 @@ def runner_status(workspace: Path | str) -> dict[str, Any]:
             }
             for row in conn.execute(
                 """SELECT item_id AS maintenance_id, queue_name, subject_id, reason
-                   FROM runner_maintenance WHERE resolved_at IS NULL
-                   ORDER BY queue_name, item_id"""
+                   FROM runner_maintenance AS maintenance WHERE """
+                + maintenance_predicate
+                + """ ORDER BY queue_name, item_id"""
             )
         ]
         aon = {
@@ -1401,8 +1579,117 @@ def runner_status(workspace: Path | str) -> dict[str, Any]:
                 "SELECT status, COUNT(*) AS count FROM aon_cache GROUP BY status ORDER BY status"
             )
         }
+        active_snapshot = conn.execute(
+            "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+        ).fetchone()
+        snapshot_digest = str(active_snapshot[0]) if active_snapshot else None
+        coverage = {
+            "normalizer_version": NORMALIZER_VERSION,
+            "snapshot_digest": snapshot_digest,
+            "canonical_sections": int(conn.execute(
+                "SELECT COUNT(*) FROM duplicate_groups"
+            ).fetchone()[0]),
+            "shadow_duplicates": int(conn.execute(
+                "SELECT COUNT(*) FROM duplicate_group_members WHERE source_ordinal>0"
+            ).fetchone()[0]),
+            "foundry_candidates": int(conn.execute(
+                "SELECT COUNT(*) FROM foundry_coverage_candidates WHERE snapshot_digest=?",
+                (snapshot_digest,),
+            ).fetchone()[0]) if snapshot_digest else 0,
+            "confirmed_foundry": int(conn.execute(
+                "SELECT COUNT(*) FROM foundry_coverage_confirmations WHERE snapshot_digest=?",
+                (snapshot_digest,),
+            ).fetchone()[0]) if snapshot_digest else 0,
+            "stale_foundry": int(conn.execute(
+                "SELECT COUNT(*) FROM foundry_coverage_confirmations WHERE snapshot_digest<>?",
+                (snapshot_digest,),
+            ).fetchone()[0]) if snapshot_digest else int(conn.execute(
+                "SELECT COUNT(*) FROM foundry_coverage_confirmations"
+            ).fetchone()[0]),
+        }
+        coverage["semantic_scope"] = {
+            "canonical_sections": int(conn.execute(
+                f"""SELECT COUNT(*) FROM duplicate_groups AS groups_
+                    JOIN source_sections AS section
+                      ON section.section_key=groups_.canonical_section_key
+                    WHERE {_semantic_scope_sql('section.product_code')}"""
+            ).fetchone()[0]),
+            "shadow_duplicates": int(conn.execute(
+                f"""SELECT COUNT(*) FROM duplicate_group_members AS member
+                    JOIN source_sections AS section ON section.section_key=member.section_key
+                    WHERE member.source_ordinal>0
+                      AND {_semantic_scope_sql('section.product_code')}"""
+            ).fetchone()[0]),
+            "foundry_candidates": int(conn.execute(
+                f"""SELECT COUNT(*) FROM foundry_coverage_candidates AS candidate
+                    JOIN source_sections AS section ON section.section_key=candidate.section_key
+                    WHERE candidate.snapshot_digest=?
+                      AND {_semantic_scope_sql('section.product_code')}""",
+                (snapshot_digest,),
+            ).fetchone()[0]) if snapshot_digest else 0,
+            "confirmed_foundry": int(conn.execute(
+                f"""SELECT COUNT(*) FROM foundry_coverage_confirmations AS confirmation
+                    JOIN source_sections AS section ON section.section_key=confirmation.section_key
+                    WHERE confirmation.snapshot_digest=?
+                      AND {_semantic_scope_sql('section.product_code')}""",
+                (snapshot_digest,),
+            ).fetchone()[0]) if snapshot_digest else 0,
+        }
+        intentional_quarantine = {
+            "page-number", "repeated-furniture", "contents-index", "credits-legal"
+        }
+        quarantine_rows = conn.execute(
+            """SELECT q.reason, COUNT(*) AS records, SUM(q.anchor_count) AS anchors
+                 FROM parser_quarantine AS q JOIN parser_runs AS p
+                   ON p.parser_run_id=q.parser_run_id
+                WHERE p.state='active' AND p.review_enabled=1
+                GROUP BY q.reason ORDER BY q.reason"""
+        ).fetchall()
+        scoped_quarantine_rows = conn.execute(
+            f"""SELECT q.reason, COUNT(*) AS records, SUM(q.anchor_count) AS anchors
+                 FROM parser_quarantine AS q JOIN parser_runs AS p
+                   ON p.parser_run_id=q.parser_run_id
+                WHERE p.state='active' AND p.review_enabled=1
+                  AND {_semantic_scope_sql('p.product_code')}
+                GROUP BY q.reason ORDER BY q.reason"""
+        ).fetchall()
+        quarantine = {
+            "intentional_records": sum(
+                int(row["records"]) for row in quarantine_rows
+                if str(row["reason"]) in intentional_quarantine
+            ),
+            "unresolved_rule_records": sum(
+                int(row["records"]) for row in quarantine_rows
+                if str(row["reason"]) not in intentional_quarantine
+            ),
+            "unresolved_rule_anchors": sum(
+                int(row["anchors"] or 0) for row in quarantine_rows
+                if str(row["reason"]) not in intentional_quarantine
+            ),
+            "by_reason": {
+                str(row["reason"]): {
+                    "records": int(row["records"]), "anchors": int(row["anchors"] or 0)
+                }
+                for row in quarantine_rows
+            },
+            "semantic_scope": {
+                "intentional_records": sum(
+                    int(row["records"]) for row in scoped_quarantine_rows
+                    if str(row["reason"]) in intentional_quarantine
+                ),
+                "unresolved_rule_records": sum(
+                    int(row["records"]) for row in scoped_quarantine_rows
+                    if str(row["reason"]) not in intentional_quarantine
+                ),
+                "unresolved_rule_anchors": sum(
+                    int(row["anchors"] or 0) for row in scoped_quarantine_rows
+                    if str(row["reason"]) not in intentional_quarantine
+                ),
+            },
+        }
     return {
         "workspace_scope": "private-review-runner",
+        "semantic_scope": review_product_scope(path),
         "review": base,
         "screening": screen,
         "stitches": stitches,
@@ -1410,6 +1697,8 @@ def runner_status(workspace: Path | str) -> dict[str, Any]:
         "attempts": attempts,
         "attempts_by_queue": attempts_by_queue,
         "aon_cache": aon,
+        "coverage": coverage,
+        "quarantine": quarantine,
         "needs_maintainer": maintenance,
         "maintainer_items": maintenance_items,
     }
@@ -1420,6 +1709,22 @@ def _candidate_records(workspace: Path, shard_id: int, worker: str) -> list[dict
     with _connect(workspace, readonly=True) as conn:
         values = []
         for record in records:
+            terminal = conn.execute(
+                """SELECT 1
+                     WHERE EXISTS (
+                       SELECT 1 FROM duplicate_group_members AS member
+                       WHERE member.section_key=? AND member.source_ordinal>0
+                     ) OR EXISTS (
+                       SELECT 1 FROM foundry_coverage_confirmations AS coverage
+                       JOIN metadata AS active
+                         ON active.key='active_foundry_snapshot'
+                        AND active.value=coverage.snapshot_digest
+                       WHERE coverage.section_key=?
+                     )""",
+                (record["section_key"], record["section_key"]),
+            ).fetchone()
+            if terminal is not None:
+                continue
             exists = conn.execute("SELECT 1 FROM candidates WHERE section_key=?", (record["section_key"],)).fetchone()
             if exists is not None:
                 continue
@@ -1440,6 +1745,285 @@ def _candidate_records(workspace: Path, shard_id: int, worker: str) -> list[dict
                 "screen_reject_reason": screen["reject_reason"],
             })
         return values
+
+
+def _screen_records_for_shard(
+    workspace: Path,
+    shard_id: int,
+    foundry_db: Path,
+    *,
+    deferred: bool = False,
+    terra: bool = False,
+    prepared_coverage: Mapping[str, list[dict[str, object]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Serialize exactly the eligible records from one screening shard."""
+    with _connect(workspace, readonly=True) as conn:
+        all_rows = conn.execute(
+            """SELECT s.section_key AS id, s.heading, s.source_text AS text,
+                      s.page_start, s.page_end, s.layout_flags, r.era AS rules_era,
+                      d.decision AS current_decision, d.defer_reason,
+                      EXISTS(SELECT 1 FROM runner_screen_escalations e
+                             WHERE e.section_key=s.section_key) AS luna_attempted
+               FROM source_sections AS s
+               JOIN source_revisions AS r USING(product_code, content_fingerprint)
+               LEFT JOIN draft_screening_current AS d
+                 ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
+               WHERE s.shard_id=?
+               ORDER BY s.source_section_id""",
+            (shard_id,),
+        ).fetchall()
+    records = [
+        {
+            **{key: value for key, value in dict(row).items() if key != "current_decision"},
+            "_index": index,
+            "layout_flags": json.loads(str(row["layout_flags"] or "[]")),
+        }
+        for index, row in enumerate(all_rows)
+        if (
+            row["current_decision"] is None
+            if not deferred
+            else (
+                row["current_decision"] == "DEFER"
+                and (bool(row["luna_attempted"]) if terra else not bool(row["luna_attempted"]))
+                and (not terra or row["defer_reason"] == "complex-rule")
+            )
+        )
+    ]
+    coverage = prepared_coverage
+    if coverage is None:
+        coverage = foundry_coverage_evidence(
+            workspace, foundry_db, [str(record["id"]) for record in records]
+        )
+    for record in records:
+        record["foundry_candidates"] = coverage.get(str(record["id"]), [])
+    return records
+
+
+def prepare_review_data(
+    workspace: Path | str,
+    foundry_database: Path | str,
+) -> dict[str, object]:
+    """Run only deterministic duplicate and Foundry evidence preparation."""
+    path = Path(workspace).expanduser().resolve()
+    foundry = Path(foundry_database).expanduser().resolve()
+    return prepare_deterministic_review(path, foundry)
+
+
+def preview_screen_batches(
+    workspace: Path | str,
+    foundry_database: Path | str,
+) -> dict[str, object]:
+    """Read-only preview of the exact ordinary Spark screening envelopes."""
+    path = Path(workspace).expanduser().resolve()
+    foundry = Path(foundry_database).expanduser().resolve()
+    snapshot = load_clean_foundry(foundry)
+    with _connect(path, readonly=True) as conn:
+        schema = conn.execute(
+            "SELECT value FROM metadata WHERE key='review_schema_version'"
+        ).fetchone()
+        if schema is None or str(schema[0]) != str(REVIEW_SCHEMA_VERSION):
+            raise ValueError("screen preview requires the current review schema")
+        active_snapshot = conn.execute(
+            "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+        ).fetchone()
+        if active_snapshot is None or str(active_snapshot[0]) != snapshot.digest:
+            raise ValueError("screen preview requires prepared current Foundry evidence")
+        scope_rows = _review_scope_rows(conn)
+        scope_products = [
+            {
+                "product_code": str(row["product_code"]),
+                "state": "enabled" if int(row["enabled"]) else "held",
+                "reason": str(row["reason"]),
+            }
+            for row in scope_rows
+        ]
+        scope = {
+            "version": REVIEW_SCOPE_VERSION,
+            "digest": _digest(REVIEW_SCOPE_VERSION, _canonical(scope_products)),
+            "enabled_products": [
+                str(row["product_code"]) for row in scope_rows if int(row["enabled"])
+            ],
+            "held_products": [
+                str(row["product_code"]) for row in scope_rows if not int(row["enabled"])
+            ],
+            "products": scope_products,
+        }
+        now = int(time.time())
+        live_claims = int(conn.execute(
+            """SELECT
+                (SELECT COUNT(*) FROM review_shards
+                  WHERE claimant IS NOT NULL AND lease_expires_at>=?)
+              + (SELECT COUNT(*) FROM review_claims WHERE lease_expires_at>=?)
+              + (SELECT COUNT(*) FROM draft_screening_claims WHERE lease_expires_at>=?)
+              + (SELECT COUNT(*) FROM stitch_claims WHERE lease_expires_at>=?)""",
+            (now, now, now, now),
+        ).fetchone()[0])
+        pending_layout = int(conn.execute(
+            f"""SELECT COUNT(*) FROM stitch_candidates AS candidate
+                JOIN parser_runs AS run ON run.parser_run_id=candidate.parser_run_id
+                WHERE run.state='active' AND run.review_enabled=1
+                  AND {_semantic_scope_sql('run.product_code')}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM stitch_votes AS vote
+                    WHERE vote.candidate_id=candidate.candidate_id
+                      AND vote.role='selector'
+                  )"""
+        ).fetchone()[0]) + int(conn.execute(
+            f"""SELECT COUNT(*) FROM stitch_candidates AS candidate
+                JOIN stitch_votes AS selector
+                  ON selector.candidate_id=candidate.candidate_id
+                 AND selector.role='selector' AND selector.decision='merge'
+                JOIN parser_runs AS run ON run.parser_run_id=candidate.parser_run_id
+                WHERE run.state='active' AND run.review_enabled=1
+                  AND {_semantic_scope_sql('run.product_code')}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM stitch_votes AS vote
+                    WHERE vote.candidate_id=candidate.candidate_id
+                      AND vote.role='confirmer'
+                  )"""
+        ).fetchone()[0])
+        intentional = ("page-number", "repeated-furniture", "contents-index", "credits-legal")
+        placeholders = ",".join("?" for _ in intentional)
+        unresolved_quarantine = int(conn.execute(
+            f"""SELECT COUNT(*) FROM parser_quarantine AS quarantine
+                JOIN parser_runs AS run ON run.parser_run_id=quarantine.parser_run_id
+                WHERE run.state='active' AND run.review_enabled=1
+                  AND {_semantic_scope_sql('run.product_code')}
+                  AND quarantine.reason NOT IN ({placeholders})""",
+            intentional,
+        ).fetchone()[0])
+        maintainer_items = int(conn.execute(
+            f"""SELECT COUNT(*) FROM runner_maintenance AS maintenance
+                WHERE maintenance.resolved_at IS NULL AND (
+                  EXISTS (SELECT 1 FROM source_sections AS section
+                          WHERE section.section_key=maintenance.subject_id
+                            AND {_semantic_scope_sql('section.product_code')})
+                  OR EXISTS (SELECT 1 FROM candidates AS candidate
+                             JOIN source_sections AS section
+                               ON section.section_key=candidate.section_key
+                             WHERE candidate.candidate_id=maintenance.subject_id
+                               AND {_semantic_scope_sql('section.product_code')})
+                  OR EXISTS (SELECT 1 FROM stitch_candidates AS stitch
+                             WHERE stitch.candidate_id=maintenance.subject_id
+                               AND {_semantic_scope_sql('stitch.product_code')})
+                )"""
+        ).fetchone()[0])
+        shards = [
+            (int(row["shard_id"]), str(row["product_code"]))
+            for row in conn.execute(
+                f"""SELECT shard.shard_id, run.product_code
+                    FROM review_shards AS shard
+                    JOIN parser_runs AS run ON run.parser_run_id=shard.parser_run_id
+                    WHERE run.state='active' AND run.review_enabled=1
+                      AND {_semantic_scope_sql('run.product_code')}
+                      AND EXISTS (
+                        SELECT 1 FROM source_sections AS section
+                        WHERE section.shard_id=shard.shard_id
+                          AND NOT EXISTS (
+                            SELECT 1 FROM draft_screening_current AS current
+                            WHERE current.parser_run_id=run.parser_run_id
+                              AND current.section_key=section.section_key
+                          )
+                      )
+                    ORDER BY run.product_code, shard.shard_ordinal, shard.shard_id"""
+            )
+        ]
+        eligible_ids = [
+            str(row[0])
+            for row in conn.execute(
+                f"""SELECT section.section_key
+                    FROM source_sections AS section
+                    JOIN parser_runs AS run ON run.parser_run_id=section.parser_run_id
+                    WHERE run.state='active' AND run.review_enabled=1
+                      AND {_semantic_scope_sql('run.product_code')}
+                      AND NOT EXISTS (
+                        SELECT 1 FROM draft_screening_current AS current
+                        WHERE current.parser_run_id=run.parser_run_id
+                          AND current.section_key=section.section_key
+                      )
+                    ORDER BY run.product_code, section.source_section_id"""
+            )
+        ]
+    blockers = []
+    if live_claims:
+        blockers.append("live-claims")
+    if pending_layout:
+        blockers.append("layout-review-required")
+    if unresolved_quarantine:
+        blockers.append("unresolved-rule-quarantine")
+    if maintainer_items:
+        blockers.append("needs-maintainer")
+    coverage = _foundry_coverage_evidence_for_snapshot(path, snapshot, eligible_ids)
+    by_product: dict[str, dict[str, object]] = {
+        product: {
+            "product_code": product,
+            "eligible_records": 0,
+            "batches": 0,
+            "evidence_bytes": 0,
+            "min_batch_bytes": None,
+            "max_batch_bytes": 0,
+            "foundry_candidate_records": 0,
+            "exact_foundry_candidate_records": 0,
+            "lexical_foundry_candidate_records": 0,
+            "batch_digests": [],
+        }
+        for product in scope["enabled_products"]
+    }
+    for shard_id, product in shards:
+        records = _screen_records_for_shard(
+            path, shard_id, foundry, prepared_coverage=coverage,
+        )
+        prompt_records = [
+            {key: value for key, value in record.items() if key != "_index"}
+            for record in records
+        ]
+        product_result = by_product[product]
+        product_result["eligible_records"] = int(product_result["eligible_records"]) + len(records)
+        for record in records:
+            candidates = list(record.get("foundry_candidates", []))
+            if candidates:
+                product_result["foundry_candidate_records"] = int(
+                    product_result["foundry_candidate_records"]
+                ) + 1
+                if any(bool(item.get("metrics", {}).get("exact_identity")) for item in candidates):
+                    product_result["exact_foundry_candidate_records"] = int(
+                        product_result["exact_foundry_candidate_records"]
+                    ) + 1
+                else:
+                    product_result["lexical_foundry_candidate_records"] = int(
+                        product_result["lexical_foundry_candidate_records"]
+                    ) + 1
+        for batch in _prompt_batches("screen", prompt_records):
+            prompt = _worker_prompt("screen", batch)
+            size = len(prompt.encode("utf-8"))
+            product_result["batches"] = int(product_result["batches"]) + 1
+            product_result["evidence_bytes"] = int(product_result["evidence_bytes"]) + size
+            minimum = product_result["min_batch_bytes"]
+            product_result["min_batch_bytes"] = size if minimum is None else min(int(minimum), size)
+            product_result["max_batch_bytes"] = max(int(product_result["max_batch_bytes"]), size)
+            product_result["batch_digests"].append(_digest("screen-preview-v1", prompt))
+    products = []
+    manifest_digests = []
+    for product in sorted(by_product):
+        result = by_product[product]
+        batch_digests = list(result.pop("batch_digests"))
+        result["batch_digest"] = _digest("screen-product-preview-v1", *batch_digests)
+        manifest_digests.extend(batch_digests)
+        products.append(result)
+    return {
+        "preview_version": "screen-batch-preview-v1",
+        "ready": not blockers,
+        "blockers": blockers,
+        "model": MODEL_BY_QUEUE["screen"],
+        "limits": {"records": MAX_BATCH_RECORDS, "bytes": MAX_BATCH_BYTES},
+        "foundry_release": snapshot.release,
+        "foundry_snapshot_digest": snapshot.digest,
+        "scope": scope,
+        "products": products,
+        "eligible_records": sum(int(item["eligible_records"]) for item in products),
+        "batches": sum(int(item["batches"]) for item in products),
+        "evidence_digest": _digest("screen-preview-v1", *manifest_digests),
+    }
 
 
 def _process_screen(
@@ -1463,6 +2047,7 @@ def _process_screen(
                       ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
                     JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
                     WHERE p.state='active' AND p.review_enabled=1 AND d.decision='DEFER'
+                      AND {_semantic_scope_sql('p.product_code')}
                       AND {eligibility}
                     ORDER BY p.product_code, s.shard_id LIMIT 1"""
             ).fetchone()
@@ -1478,46 +2063,23 @@ def _process_screen(
     if claim is None:
         return False
     shard_id = int(claim["shard_id"])
-    with _connect(workspace, readonly=True) as conn:
-        all_rows = conn.execute(
-            """SELECT s.section_key AS id, s.heading, s.source_text AS text,
-                      s.page_start, s.page_end, s.layout_flags, r.era AS rules_era,
-                      d.defer_reason,
-                      EXISTS(SELECT 1 FROM runner_screen_escalations e WHERE e.section_key=s.section_key)
-                        AS luna_attempted
-               FROM source_sections AS s
-               JOIN source_revisions AS r USING(product_code, content_fingerprint)
-               LEFT JOIN draft_screening_current AS d
-                 ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
-               WHERE s.shard_id=?
-               ORDER BY s.source_section_id""",
-            (shard_id,),
-        ).fetchall()
-    records = [
-        {**dict(row), "_index": index, "layout_flags": json.loads(str(row["layout_flags"] or "[]"))}
-        for index, row in enumerate(all_rows)
-        if (
-            not deferred
-            or (
-                row["defer_reason"] is not None
-                and (bool(row["luna_attempted"]) if terra else not bool(row["luna_attempted"]))
-                and (not terra or row["defer_reason"] == "complex-rule")
-            )
-        )
-    ]
+    if foundry_db is None:
+        raise ValueError("screening requires --foundry-database")
+    records = _screen_records_for_shard(
+        workspace, shard_id, foundry_db, deferred=deferred, terra=terra,
+    )
     try:
+        if not records:
+            release_draft_screening_batch(workspace, shard_id, worker)
+            return False
         if pilot:
-            records = _prompt_batches(queue, prompt_records := [
+            selected_prompt = _prompt_batches(queue, [
                 {key: value for key, value in record.items() if key != "_index"}
                 for record in records
             ])[0]
-            selected_ids = {str(record["id"]) for record in records}
-            records = [record for record in all_rows if str(record["id"]) in selected_ids]
-            records = [
-                {**dict(row), "_index": index, "layout_flags": json.loads(str(row["layout_flags"] or "[]"))}
-                for index, row in enumerate(all_rows)
-                if str(row["id"]) in selected_ids
-            ]
+            selected_ids = {str(record["id"]) for record in selected_prompt}
+            records = [record for record in records if str(record["id"]) in selected_ids]
+            prompt_records = selected_prompt
         else:
             prompt_records = [
                 {key: value for key, value in record.items() if key != "_index"}
@@ -1536,6 +2098,17 @@ def _process_screen(
                 raise ValueError("rejected screen result requires a bounded reject reason")
             if result["decision"] == "add" and result["reason"] is not None:
                 raise ValueError("added screen result must not carry a reason")
+            foundry_ids = result["foundry_ids"]
+            if foundry_ids and not (
+                result["decision"] == "reject" and result["reason"] == "duplicate"
+            ):
+                raise ValueError("Foundry IDs require a duplicate rejection")
+            source_record = next(row for row in records if row["id"] == result["id"])
+            supplied = {
+                str(item["id"]) for item in source_record.get("foundry_candidates", [])
+            }
+            if not set(foundry_ids).issubset(supplied):
+                raise ValueError("screen result selected an unsupplied Foundry candidate")
         for result in results:
             decision = str(result["decision"])
             reason = result.get("reason")
@@ -1556,6 +2129,7 @@ def _process_screen(
                 next(int(row["_index"]) for row in records if row["id"] == result["id"]),
                 decision, defer_reason=defer_reason,
                 reject_reason=str(reason) if decision == "reject" else None,
+                foundry_ids=tuple(str(value) for value in result["foundry_ids"]),
             )
         release_draft_screening_batch(workspace, shard_id, worker)
         return True
@@ -1600,11 +2174,12 @@ def _submit_decision(
 def _process_candidates(workspace: Path, slot: int, foundry_db: Path | None, executor: CodexExecutor) -> bool:
     with _connect(workspace, readonly=True) as conn:
         unresolved_screen = conn.execute(
-            """SELECT 1 FROM source_sections AS s
+            f"""SELECT 1 FROM source_sections AS s
                JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
                LEFT JOIN draft_screening_current AS d
                  ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
                WHERE p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}
                  AND (d.section_key IS NULL OR d.decision='DEFER') LIMIT 1"""
         ).fetchone()
     if unresolved_screen is not None:
@@ -1614,9 +2189,10 @@ def _process_candidates(workspace: Path, slot: int, foundry_db: Path | None, exe
     if claim is None:
         with _connect(workspace, readonly=True) as conn:
             partial = conn.execute(
-                """SELECT sh.shard_id FROM review_shards AS sh
+                f"""SELECT sh.shard_id FROM review_shards AS sh
                    JOIN parser_runs AS p ON p.parser_run_id=sh.parser_run_id
                    WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')}
                      AND (sh.claimant IS NULL OR sh.lease_expires_at<?)
                      AND EXISTS(SELECT 1 FROM source_sections s JOIN candidates c ON c.section_key=s.section_key WHERE s.shard_id=sh.shard_id)
                      AND EXISTS(SELECT 1 FROM source_sections s WHERE s.shard_id=sh.shard_id AND NOT EXISTS(SELECT 1 FROM candidates c WHERE c.section_key=s.section_key))
@@ -1757,7 +2333,8 @@ def _stitch_records(
             rows = conn.execute(
                 f"""SELECT c.* FROM stitch_candidates AS c
                    JOIN parser_runs AS p ON p.parser_run_id=c.parser_run_id
-                   WHERE p.state='active' AND p.review_enabled=1 AND NOT EXISTS
+                   WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')} AND NOT EXISTS
                     (SELECT 1 FROM stitch_votes WHERE candidate_id=c.candidate_id AND role='selector')
                    AND NOT EXISTS (SELECT 1 FROM stitch_claims
                      WHERE candidate_id=c.candidate_id AND role=?)
@@ -1770,7 +2347,8 @@ def _stitch_records(
                    JOIN parser_runs AS p ON p.parser_run_id=c.parser_run_id
                    JOIN stitch_votes AS v ON v.candidate_id=c.candidate_id
                      AND v.role='selector' AND v.decision='merge'
-                   WHERE p.state='active' AND p.review_enabled=1 AND NOT EXISTS
+                   WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')} AND NOT EXISTS
                     (SELECT 1 FROM stitch_votes WHERE candidate_id=c.candidate_id AND role='confirmer')
                    AND NOT EXISTS (SELECT 1 FROM stitch_claims
                      WHERE candidate_id=c.candidate_id AND role=?)
@@ -1933,9 +2511,9 @@ def _screening_pilot(
     foundry_db: Path | None,
     executor: CodexExecutor,
 ) -> dict[str, Any]:
-    """Run exactly one ordinary Spark screen batch for every catalog product."""
+    """Run exactly one ordinary Spark batch for every enabled product."""
     workers = max(1, min(concurrency, MODEL_CAPS[MODEL_BY_QUEUE["screen"]]))
-    pending = list(EXPECTED_PRODUCTS)
+    pending = list(review_product_scope(workspace)["enabled_products"])
     pending_lock = threading.Lock()
     completed: list[str] = []
     completed_lock = threading.Lock()
@@ -1971,9 +2549,9 @@ def _stitch_pilot(
     concurrency: int,
     executor: CodexExecutor,
 ) -> dict[str, Any]:
-    """Run at most one stitch batch for every catalog product."""
+    """Run at most one stitch batch for every enabled product."""
     workers = max(1, min(concurrency, MODEL_CAPS[MODEL_BY_QUEUE[queue]]))
-    pending = list(EXPECTED_PRODUCTS)
+    pending = list(review_product_scope(workspace)["enabled_products"])
     pending_lock = threading.Lock()
     completed: list[str] = []
     completed_lock = threading.Lock()
@@ -2030,15 +2608,17 @@ def _reconcile_stitch_maintenance(workspace: Path) -> int:
                FROM stitch_candidates AS c
                JOIN parser_runs AS p ON p.parser_run_id=c.parser_run_id
                WHERE p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}
                  AND {_APPROVED_STITCH_PREDICATE}
                ORDER BY c.product_code, c.candidate_id"""
         ).fetchall()
         disagreements = conn.execute(
-            """SELECT c.candidate_id FROM stitch_candidates c
+            f"""SELECT c.candidate_id FROM stitch_candidates c
                JOIN stitch_votes s ON s.candidate_id=c.candidate_id AND s.role='selector' AND s.decision='merge'
                JOIN stitch_votes t ON t.candidate_id=c.candidate_id AND t.role='confirmer' AND t.decision='no-merge'
                JOIN parser_runs p ON p.parser_run_id=c.parser_run_id
-               WHERE p.state='active' AND p.review_enabled=1"""
+               WHERE p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}"""
         ).fetchall()
     seen: dict[str, set[str]] = {}
     overlaps: list[str] = []
@@ -2061,7 +2641,13 @@ def _reconcile_stitch_maintenance(workspace: Path) -> int:
                 ("maintainer:" + _digest(row[0], "stitch-disagreement"), row[0], now),
             )
         open_items = int(conn.execute(
-            "SELECT COUNT(*) FROM runner_maintenance WHERE resolved_at IS NULL"
+            f"""SELECT COUNT(*) FROM runner_maintenance AS maintenance
+                JOIN stitch_candidates AS stitch
+                  ON stitch.candidate_id=maintenance.subject_id
+                JOIN parser_runs AS run ON run.parser_run_id=stitch.parser_run_id
+                WHERE maintenance.resolved_at IS NULL
+                  AND run.state='active' AND run.review_enabled=1
+                  AND {_semantic_scope_sql('run.product_code')}"""
         ).fetchone()[0])
         conn.commit()
     return open_items
@@ -2087,6 +2673,16 @@ def resolve_maintainer_item(
             raise KeyError("unknown maintainer item")
         if row["queue_name"] != "stitch" or row["reason"] != "independent-disagreement":
             raise ValueError("this maintainer item needs a specialized resolution")
+        scoped = conn.execute(
+            f"""SELECT 1 FROM stitch_candidates AS stitch
+                JOIN parser_runs AS run ON run.parser_run_id=stitch.parser_run_id
+                WHERE stitch.candidate_id=?
+                  AND run.state='active' AND run.review_enabled=1
+                  AND {_semantic_scope_sql('run.product_code')}""",
+            (row["subject_id"],),
+        ).fetchone()
+        if scoped is None:
+            raise ValueError("maintainer item is outside the semantic product scope")
         if row["resolved_at"] is not None:
             if row["resolution"] != decision:
                 raise ValueError("maintainer item already has a different resolution")
@@ -2120,11 +2716,18 @@ def maintainer_item_evidence(
         if item["queue_name"] != "stitch" or item["reason"] != "independent-disagreement":
             raise ValueError("this maintainer item needs a specialized inspection command")
         candidate = conn.execute(
-            "SELECT * FROM stitch_candidates WHERE candidate_id=?",
+            f"""SELECT stitch.* FROM stitch_candidates AS stitch
+                JOIN parser_runs AS run ON run.parser_run_id=stitch.parser_run_id
+                WHERE stitch.candidate_id=?
+                  AND run.state='active' AND run.review_enabled=1
+                  AND {_semantic_scope_sql('run.product_code')}""",
             (item["subject_id"],),
         ).fetchone()
         if candidate is None:
-            raise ValueError("maintainer item refers to a missing stitch candidate")
+            raise ValueError(
+                "maintainer item is outside the semantic product scope or refers "
+                "to a missing stitch candidate"
+            )
         section_keys = json.loads(str(candidate["section_keys"]))
         if not isinstance(section_keys, list) or not 2 <= len(section_keys) <= 3:
             raise ValueError("maintainer stitch candidate has an invalid section set")
@@ -2185,6 +2788,7 @@ def _apply_confirmed_stitches(workspace: Path, sources_root: Path) -> int:
                 f"""SELECT DISTINCT c.product_code, p.parser_version FROM stitch_candidates AS c
                    JOIN parser_runs AS p ON p.parser_run_id=c.parser_run_id
                    WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')}
                      AND {_APPROVED_STITCH_PREDICATE}
                    ORDER BY c.product_code"""
             )
@@ -2196,14 +2800,20 @@ def _apply_confirmed_stitches(workspace: Path, sources_root: Path) -> int:
         source = sources[product]
         layout_artifact = (
             _layout_artifact_path(sources_root, source)
-            if active_parser == "paizo-native-v3+pp-doclayout-v3-v1"
+            if active_parser
+            in {"paizo-native-v3+pp-doclayout-v3-v1", PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}
             else None
         )
         if layout_artifact is not None and not layout_artifact.is_file():
             raise ValueError(f"{product} is missing its source-bound layout artifact")
         staged = stage_trusted_native_pdf_with_approved_stitches(
             workspace, source.path, product_code=product,
-            parser_version="paizo-native-v3", shard_size=MAX_BATCH_RECORDS,
+            parser_version=(
+                "paizo-native-v3"
+                if active_parser == "paizo-native-v3+pp-doclayout-v3-v1"
+                else active_parser
+            ),
+            shard_size=MAX_BATCH_RECORDS,
             layout_artifact=layout_artifact,
         )
         activate_parser_run(workspace, str(staged["parser_run_id"]))
@@ -2234,6 +2844,7 @@ def _run_layout_phase(
                     f"""SELECT 1 FROM stitch_candidates c
                        JOIN parser_runs p ON p.parser_run_id=c.parser_run_id
                        WHERE p.state='active' AND p.review_enabled=1
+                         AND {_semantic_scope_sql('p.product_code')}
                          AND {_APPROVED_STITCH_PREDICATE} LIMIT 1"""
                 ).fetchone()
             if approved is not None:
@@ -2263,6 +2874,9 @@ def run_queues(
     foundry = Path(foundry_database).expanduser().resolve() if foundry_database else None
     process = executor or CodexExecutor()
     completed: dict[str, int] = {}
+    screen_queues = {"screen", "screen-deferred", "screen-terra"}
+    if (queue == "all" or queue in screen_queues) and foundry is None:
+        raise ValueError(f"{queue} requires --foundry-database")
     if pilot:
         generate_stitch_candidates(path)
         if queue in {"stitch-select", "stitch-confirm"}:
@@ -2287,6 +2901,7 @@ def run_queues(
                 f"""SELECT 1 FROM stitch_candidates c
                    JOIN parser_runs p ON p.parser_run_id=c.parser_run_id
                    WHERE p.state='active' AND p.review_enabled=1
+                     AND {_semantic_scope_sql('p.product_code')}
                      AND {_APPROVED_STITCH_PREDICATE} LIMIT 1"""
             ).fetchone()
         if approved is not None:
@@ -2307,6 +2922,8 @@ def run_queues(
                 }
         if runner_status(path)["needs_maintainer"]:
             return {"completed_batches": 0, "stopped": "needs-maintainer"}
+        assert foundry is not None
+        prepare_deterministic_review(path, foundry)
         return _screening_pilot(
             path, concurrency=concurrency, foundry_db=foundry, executor=process,
         )
@@ -2325,6 +2942,8 @@ def run_queues(
         if queue == "layout":
             return {"completed_batches": completed, "status": runner_status(path)}
     if queue == "all":
+        assert foundry is not None
+        prepare_deterministic_review(path, foundry)
         completed["screen"] = _drain(path, "screen", concurrency, foundry, process)
         completed["aon"] = sum(refresh_aon_cache(path).get(key, 0) for key in ("match", "no-match", "inconclusive"))
         for name in ("screen-deferred", "screen-terra", "classify", "review"):
@@ -2345,6 +2964,9 @@ def run_queues(
         raise ValueError(f"{queue} is routed internally; run classify or review")
     if queue not in {"stitch-select", "stitch-confirm", "screen", "screen-deferred", "screen-terra", "classify", "review"}:
         raise ValueError("unknown runner queue")
+    if queue in screen_queues:
+        assert foundry is not None
+        prepare_deterministic_review(path, foundry)
     completed[queue] = _drain(path, queue, concurrency, foundry, process)
     return {"completed_batches": completed, "status": runner_status(path)}
 
@@ -2353,8 +2975,11 @@ def build_base(
     workspace: Path | str,
     output: Path | str,
     notices: Path | str,
+    foundry_database: Path | str,
 ) -> dict[str, Any]:
-    verification = verify_workspace(workspace, require_complete=True)
+    verification = verify_workspace(
+        workspace, require_complete=True, foundry_database=foundry_database
+    )
     if not verification["ok"]:
         raise ValueError("base build is blocked: " + ", ".join(verification["errors"]))
     output_path = Path(output).expanduser().resolve()
@@ -2405,7 +3030,9 @@ __all__ = [
     "generate_stitch_candidates",
     "maintainer_item_evidence",
     "pack_batches",
+    "prepare_review_data",
     "prepare_workspace",
+    "preview_screen_batches",
     "promote_base",
     "quality_workspace",
     "reopen_screening",
@@ -2414,6 +3041,7 @@ __all__ = [
     "run_codex_batch",
     "run_queues",
     "runner_status",
+    "set_review_product_scope",
     "validate_exact_results",
     "verify_workspace",
 ]

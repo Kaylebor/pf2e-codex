@@ -9,7 +9,7 @@ import sqlite3
 import threading
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
@@ -1080,7 +1080,11 @@ def test_invalidated_public_approval_cannot_build_until_independently_rechecked(
     )
     assert build_public_corpus(
         workspace, tmp_path / "public.sqlite3", _notices(tmp_path)
-    ) == {"sections": 1, "revisions": 1, "notices": 1}
+    ) == {
+            "sections": 1, "sources": 1, "foundry_requirements": 0,
+            "revisions": 1, "notices": 1, "covered_products": 1,
+            "review_scope_digest": ANY,
+    }
 
 
 def test_invalidated_revise_requires_active_rereview_before_rework_and_build(tmp_path: Path):
@@ -1137,7 +1141,11 @@ def test_invalidated_revise_requires_active_rereview_before_rework_and_build(tmp
 
     assert build_public_corpus(
         workspace, tmp_path / "public.sqlite3", _notices(tmp_path)
-    ) == {"sections": 1, "revisions": 1, "notices": 1}
+    ) == {
+            "sections": 1, "sources": 1, "foundry_requirements": 0,
+            "revisions": 1, "notices": 1, "covered_products": 1,
+            "review_scope_digest": ANY,
+    }
 
 
 def test_public_build_is_logically_deterministic_and_excludes_private_fields(tmp_path: Path):
@@ -1149,15 +1157,23 @@ def test_public_build_is_logically_deterministic_and_excludes_private_fields(tmp
     second = tmp_path / "second.sqlite3"
     notices = _notices(tmp_path)
 
-    assert build_public_corpus(workspace, first, notices) == {"sections": 1, "revisions": 1, "notices": 1}
-    assert build_public_corpus(workspace, second, notices) == {"sections": 1, "revisions": 1, "notices": 1}
+    expected = {
+        "sections": 1, "sources": 1, "foundry_requirements": 0,
+        "revisions": 1, "notices": 1, "covered_products": 1,
+        "review_scope_digest": ANY,
+    }
+    assert build_public_corpus(workspace, first, notices) == expected
+    assert build_public_corpus(workspace, second, notices) == expected
 
     def logical_rows(path: Path) -> dict[str, list[tuple]]:
         conn = sqlite3.connect(path)
         try:
             return {
                 table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
-                for table in ("metadata", "source_revisions", "notices", "licensed_sections")
+                for table in (
+                    "metadata", "source_revisions", "notices", "licensed_rules",
+                    "licensed_rule_sources", "required_foundry_rows",
+                )
             }
         finally:
             conn.close()
@@ -1165,18 +1181,46 @@ def test_public_build_is_logically_deterministic_and_excludes_private_fields(tmp
     assert logical_rows(first) == logical_rows(second)
     conn = sqlite3.connect(first)
     try:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(licensed_sections)")}
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(licensed_rules)")}
         assert "source_text" not in columns
         assert "claimant" not in columns
         assert "worker" not in columns
         assert "url" not in columns
-        values = " ".join(str(value) for row in conn.execute("SELECT * FROM licensed_sections") for value in row)
+        values = " ".join(
+            str(value)
+            for table in ("licensed_rules", "licensed_rule_sources")
+            for row in conn.execute(f"SELECT * FROM {table}")
+            for value in row
+        )
         assert PRIVATE_TEXT not in values
         assert PUBLIC_TEXT in values
         public_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "evidence" not in public_tables
     finally:
         conn.close()
+
+
+def test_public_build_deduplicates_converged_rules_and_keeps_all_sources(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    bundle = _trusted_multi_section_bundle(("Private source A.", "Private source B."))
+    with patch("pf2e_codex.licensed_corpus.load_and_parse_verified_pdf", return_value=bundle):
+        staged = stage_trusted_native_pdf(
+            workspace, tmp_path / "owned.pdf", product_code="PZO12001",
+            parser_version="paizo-native-v1", shard_size=1,
+        )
+    activate_parser_run(workspace, str(staged["parser_run_id"]))
+    for producer, reviewer in (("worker-a", "reviewer-a"), ("worker-b", "reviewer-b")):
+        _, section = _claim_and_read(workspace, producer)
+        candidate = _submit_public(workspace, section, producer)
+        _approve(workspace, candidate, reviewer)
+
+    output = tmp_path / "deduplicated.sqlite3"
+    result = build_public_corpus(workspace, output, _notices(tmp_path))
+    assert result["sections"] == 1
+    assert result["sources"] == 2
+    with sqlite3.connect(output) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM licensed_rules").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM licensed_rule_sources").fetchone()[0] == 2
 
 
 def test_build_rejects_multiple_approved_candidates_for_one_source(tmp_path: Path):
@@ -1652,8 +1696,12 @@ def test_quarantine_schema_upgrade_preserves_records_and_anchors(tmp_path: Path)
         assert "oversize-block" in sql
 
 
-def _trusted_multi_section_bundle(texts: tuple[str, ...]) -> TrustedParseBundle:
+def _trusted_multi_section_bundle(
+    texts: tuple[str, ...], *, headings: tuple[str, ...] | None = None
+) -> TrustedParseBundle:
     """Build a sealed direct-PDF fixture with deterministic, distinct sections."""
+    if headings is not None and len(headings) != len(texts):
+        raise ValueError("fixture headings must match fixture texts")
     fingerprint = hashlib.sha256(b"multi-section-source-fingerprint").hexdigest()
     sections: list[TrustedSection] = []
     anchors: list[str] = []
@@ -1664,7 +1712,7 @@ def _trusted_multi_section_bundle(texts: tuple[str, ...]) -> TrustedParseBundle:
             TrustedSection(
                 id=f"private:section:{index}",
                 source_section_id=f"pzo12001:player-core:p{index + 1}:h{index:016x}:i0",
-                heading=f"Source heading {index}",
+                heading=headings[index] if headings is not None else f"Source heading {index}",
                 text=text,
                 text_hash=hashlib.sha256(text.encode()).hexdigest(),
                 physical_pages=(index + 1,),
@@ -1822,12 +1870,15 @@ def test_binary_screen_is_private_minimal_and_idempotent(tmp_path: Path):
     assert final["live_claims"] == 0
 
 
-def test_binary_screen_rejects_exact_duplicates_deterministically(tmp_path: Path):
+def test_binary_screen_does_not_guess_unprepared_duplicate_groups(tmp_path: Path):
     workspace = _workspace(tmp_path)
     _activate_bundle(
         workspace,
         tmp_path,
-        _trusted_multi_section_bundle(("Same private rule.", "Same private rule.")),
+        _trusted_multi_section_bundle(
+            ("Same private rule.", "Same private rule."),
+            headings=("Same heading", "Same heading"),
+        ),
     )
     claim = claim_draft_screening_batch(workspace, "screen-a")
     assert claim is not None
@@ -1839,18 +1890,18 @@ def test_binary_screen_rejects_exact_duplicates_deterministically(tmp_path: Path
     canonical = submit_draft_screening_decision(
         workspace, shard_id, "screen-a", 0, "add"
     )
-    assert duplicate["decision"] == "reject"
-    assert duplicate["duplicate_rejected"] is True
+    assert duplicate["decision"] == "add"
+    assert duplicate["duplicate_rejected"] is False
     assert canonical["decision"] == "add"
     status = draft_screening_status(workspace)["products"][0]
     assert status == {
             "product_code": "PZO12001",
             "sections": 2,
             "unprocessed": 0,
-            "accepted": 1,
-            "rejected": 1,
+            "accepted": 2,
+            "rejected": 0,
             "deferred": 0,
-            "duplicate_rejected": 1,
+            "duplicate_rejected": 0,
             "unprocessed_batches": 0,
             "deferred_batches": 0,
             "live_claims": 0,

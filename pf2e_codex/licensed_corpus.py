@@ -15,20 +15,29 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from .corpus import (
     PAIZO_NATIVE_PARSER_V4,
+    PAIZO_NATIVE_PARSER_V5,
     PRODUCT_CATALOG,
     TrustedParseBundle,
     load_and_parse_verified_pdf,
     repair_trusted_bundle,
 )
+from .licensed_coverage import (
+    NORMALIZER_VERSION,
+    FoundryMatcher,
+    duplicate_identity,
+    load_clean_foundry,
+    normalized_hash,
+)
 from .licensed_policy import LICENSED_CORE_POLICY_VERSION, licensed_policy_digest
 
-REVIEW_SCHEMA_VERSION = 18
-PUBLIC_SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSION = 20
+PUBLIC_SCHEMA_VERSION = 3
+REVIEW_SCOPE_VERSION = "semantic-products-v1"
 POLICY_DECISIONS = {
     "PUBLIC_AS_IS",
     "MIXED_NEEDS_EXTRACTION",
@@ -47,6 +56,7 @@ SCREENING_DEFER_REASONS = {
 }
 SCREENING_REJECT_REASONS = {"no-mechanics", "duplicate", "setting-prose"}
 SCREENING_REOPEN_REASONS = {"parser-quality", "scope-correction", "maintainer-review"}
+REVIEW_SCOPE_HOLD_REASONS = {"legacy-study", "maintainer-hold"}
 PUBLIC_DECISIONS = {"PUBLIC_AS_IS", "MIXED_NEEDS_EXTRACTION"}
 _REVIEW_VERDICT_ALIASES = {
     "APPROVE_PUBLIC": "APPROVE",
@@ -85,6 +95,12 @@ _LEGACY_RUN_ORIGIN = "legacy-untrusted"
 
 
 _RUNNER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS review_product_scope (
+    product_code TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    reason TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runner_sessions (
     queue_name TEXT NOT NULL,
     slot INTEGER NOT NULL,
@@ -194,6 +210,67 @@ CREATE TABLE IF NOT EXISTS stitch_claims (
 );
 CREATE INDEX IF NOT EXISTS stitch_claims_by_claimant
     ON stitch_claims(claimant, lease_expires_at);
+CREATE TABLE IF NOT EXISTS duplicate_groups (
+    group_id TEXT PRIMARY KEY,
+    normalizer_version TEXT NOT NULL,
+    license TEXT NOT NULL CHECK(license IN ('OGL','ORC')),
+    era TEXT NOT NULL CHECK(era IN ('legacy','remaster','unknown')),
+    heading_hash TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    canonical_section_key TEXT NOT NULL REFERENCES source_sections(section_key),
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS duplicate_group_members (
+    group_id TEXT NOT NULL REFERENCES duplicate_groups(group_id) ON DELETE CASCADE,
+    section_key TEXT NOT NULL REFERENCES source_sections(section_key),
+    source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 0),
+    PRIMARY KEY(group_id, section_key),
+    UNIQUE(section_key)
+);
+CREATE INDEX IF NOT EXISTS duplicate_members_by_canonical
+    ON duplicate_group_members(group_id, source_ordinal);
+CREATE TABLE IF NOT EXISTS foundry_snapshots (
+    snapshot_digest TEXT PRIMARY KEY,
+    pf2e_release TEXT NOT NULL,
+    row_count INTEGER NOT NULL CHECK(row_count >= 0),
+    normalizer_version TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS foundry_snapshot_rows (
+    snapshot_digest TEXT NOT NULL REFERENCES foundry_snapshots(snapshot_digest) ON DELETE CASCADE,
+    foundry_id TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    normalized_hash TEXT NOT NULL,
+    heading_hash TEXT NOT NULL,
+    publication_title TEXT NOT NULL,
+    license TEXT NOT NULL,
+    era TEXT NOT NULL,
+    entry_type TEXT NOT NULL,
+    PRIMARY KEY(snapshot_digest, foundry_id)
+);
+CREATE TABLE IF NOT EXISTS foundry_coverage_candidates (
+    section_key TEXT NOT NULL REFERENCES source_sections(section_key),
+    snapshot_digest TEXT NOT NULL REFERENCES foundry_snapshots(snapshot_digest),
+    candidate_rank INTEGER NOT NULL CHECK(candidate_rank BETWEEN 0 AND 2),
+    foundry_id TEXT NOT NULL,
+    proof_digest TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    PRIMARY KEY(section_key, snapshot_digest, foundry_id),
+    UNIQUE(section_key, snapshot_digest, candidate_rank),
+    FOREIGN KEY(snapshot_digest, foundry_id)
+        REFERENCES foundry_snapshot_rows(snapshot_digest, foundry_id)
+);
+CREATE TABLE IF NOT EXISTS foundry_coverage_confirmations (
+    section_key TEXT NOT NULL REFERENCES source_sections(section_key),
+    snapshot_digest TEXT NOT NULL REFERENCES foundry_snapshots(snapshot_digest),
+    foundry_ids_json TEXT NOT NULL,
+    proof_digest TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    decided_at INTEGER NOT NULL,
+    PRIMARY KEY(section_key, snapshot_digest)
+);
+CREATE INDEX IF NOT EXISTS foundry_confirmations_by_snapshot
+    ON foundry_coverage_confirmations(snapshot_digest, section_key);
 """
 
 
@@ -388,7 +465,8 @@ def _validate_candidate_layout(candidate: Mapping[str, object], section: Mapping
     complex_layout = {
         "unclassified-native-coverage", "complex-layout", "table-ambiguous", "table-cell",
         "layout-model-complex", "layout-model-table", "layout-model-unbound",
-        "layout-order-conflict", "layout-region-split",
+        "layout-order-conflict", "layout-region-split", "unsupported-layout",
+        "unresolved-continuation", "heading-artifact", "oversize-block",
     }
     if candidate["decision"] == "PUBLIC_AS_IS" and flags.intersection(complex_layout):
         raise ValueError("PUBLIC_AS_IS candidate has unreviewed complex layout")
@@ -1306,6 +1384,18 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
             """CREATE UNIQUE INDEX IF NOT EXISTS parser_runs_one_active_target
             ON parser_runs(product_code) WHERE state='active' AND review_enabled=1"""
         )
+        # Semantic scheduling is deliberately independent from parser-run
+        # activation.  Existing workspaces retain their prior all-product
+        # behavior until a maintainer explicitly narrows the scope.
+        now = int(time.time())
+        conn.execute(
+            """INSERT OR IGNORE INTO review_product_scope
+               (product_code, enabled, reason, updated_at)
+               SELECT DISTINCT product_code, 1, 'enabled', ?
+                 FROM parser_runs
+                WHERE state='active' AND review_enabled=1""",
+            (now,),
+        )
         if schema_row is None or schema_row["value"] != str(REVIEW_SCHEMA_VERSION):
             _repair_staged_native_coverage_digests(conn)
         if schema_row is None or schema_row["value"] != str(REVIEW_SCHEMA_VERSION):
@@ -1329,12 +1419,476 @@ def _ensure_workspace_migrated(workspace: Path | str) -> None:
         conn.close()
 
 
+def _semantic_scope_sql(product_expression: str) -> str:
+    """Return the SQL predicate for a product in the configured semantic scope."""
+    return f"""EXISTS (
+        SELECT 1 FROM review_product_scope AS semantic_scope
+        WHERE semantic_scope.product_code={product_expression}
+          AND semantic_scope.enabled=1
+    )"""
+
+
+def _review_scope_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT scope.product_code, scope.enabled, scope.reason, scope.updated_at
+             FROM review_product_scope AS scope
+             JOIN parser_runs AS run ON run.product_code=scope.product_code
+              AND run.state='active' AND run.review_enabled=1
+            GROUP BY scope.product_code
+            ORDER BY scope.product_code"""
+    ).fetchall()
+
+
+def review_product_scope(workspace: Path | str) -> dict[str, object]:
+    """Return the persistent semantic product scope without private source data."""
+    _ensure_workspace_migrated(workspace)
+    conn = _connect(workspace, readonly=True)
+    try:
+        rows = _review_scope_rows(conn)
+        products = [
+            {
+                "product_code": str(row["product_code"]),
+                "state": "enabled" if int(row["enabled"]) else "held",
+                "reason": str(row["reason"]),
+            }
+            for row in rows
+        ]
+        digest = _digest(REVIEW_SCOPE_VERSION, _canonical_json(products))
+        return {
+            "version": REVIEW_SCOPE_VERSION,
+            "digest": digest,
+            "enabled_products": [
+                str(row["product_code"]) for row in rows if int(row["enabled"])
+            ],
+            "held_products": [
+                str(row["product_code"]) for row in rows if not int(row["enabled"])
+            ],
+            "products": products,
+        }
+    finally:
+        conn.close()
+
+
+def set_review_product_scope(
+    workspace: Path | str,
+    enabled_products: Sequence[str],
+    *,
+    held_reason: str = "maintainer-hold",
+) -> dict[str, object]:
+    """Atomically set semantic scheduling scope without deleting review work."""
+    selected = tuple(sorted(set(enabled_products)))
+    if not selected or len(selected) != len(tuple(enabled_products)):
+        raise ValueError("review scope requires a non-empty unique product list")
+    if any(product not in PRODUCT_CATALOG for product in selected):
+        raise ValueError("review scope contains an unknown product")
+    if held_reason not in REVIEW_SCOPE_HOLD_REASONS:
+        raise ValueError("review scope requires a bounded hold reason")
+    _ensure_workspace_migrated(workspace)
+    conn = _connect(workspace)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        active = {
+            str(row[0])
+            for row in conn.execute(
+                """SELECT product_code FROM parser_runs
+                    WHERE state='active' AND review_enabled=1 ORDER BY product_code"""
+            )
+        }
+        unknown = set(selected) - active
+        if unknown:
+            raise ValueError(
+                "review scope products have no active trusted parser run: "
+                + ", ".join(sorted(unknown))
+            )
+        now = int(time.time())
+        live_claims = int(conn.execute(
+            """SELECT
+                (SELECT COUNT(*) FROM review_shards
+                  WHERE claimant IS NOT NULL AND lease_expires_at>=?)
+              + (SELECT COUNT(*) FROM review_claims WHERE lease_expires_at>=?)
+              + (SELECT COUNT(*) FROM draft_screening_claims WHERE lease_expires_at>=?)
+              + (SELECT COUNT(*) FROM stitch_claims WHERE lease_expires_at>=?)""",
+            (now, now, now, now),
+        ).fetchone()[0])
+        if live_claims:
+            raise ValueError("review scope cannot change while claims are live")
+        for product in sorted(active):
+            enabled = int(product in selected)
+            conn.execute(
+                """INSERT INTO review_product_scope
+                   (product_code, enabled, reason, updated_at) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(product_code) DO UPDATE SET
+                     enabled=excluded.enabled, reason=excluded.reason,
+                     updated_at=excluded.updated_at""",
+                (product, enabled, "enabled" if enabled else held_reason, now),
+            )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return review_product_scope(workspace)
+
+
+def prepare_deterministic_review(
+    workspace: Path | str,
+    foundry_database: Path | str,
+) -> dict[str, object]:
+    """Refresh exact duplicate groups and bounded clean-Foundry candidates.
+
+    The operation stores no normalized private text and never treats a
+    Foundry match as a decision. Exact same-era/same-license PDF shadows are
+    terminal deterministic duplicates; their canonical section alone enters
+    semantic screening.
+    """
+    _ensure_workspace_migrated(workspace)
+    snapshot = load_clean_foundry(foundry_database)
+    matcher = FoundryMatcher(snapshot)
+    conn = _connect(workspace)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """SELECT s.*, r.license, r.era
+                 FROM source_sections AS s
+                 JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
+                 JOIN source_revisions AS r USING(product_code, content_fingerprint)
+                WHERE p.state='active' AND p.review_enabled=1
+                ORDER BY s.product_code, s.page_start, s.stable_identity, s.section_key"""
+        ).fetchall()
+        catalog_order = {code: ordinal for ordinal, code in enumerate(PRODUCT_CATALOG)}
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            identity = duplicate_identity(
+                heading=row["heading"], text=row["source_text"],
+                license_name=row["license"], era=row["era"],
+            )
+            grouped.setdefault(identity, []).append(row)
+
+        conn.execute("DELETE FROM duplicate_group_members")
+        conn.execute("DELETE FROM duplicate_groups")
+        now = int(time.time())
+        canonical_keys: set[str] = set()
+        shadow_count = 0
+        for group_id, members in sorted(grouped.items()):
+            members.sort(key=lambda row: (
+                catalog_order.get(str(row["product_code"]), 999),
+                int(row["page_start"] or 0), str(row["stable_identity"]),
+                str(row["section_key"]),
+            ))
+            canonical = members[0]
+            canonical_key = str(canonical["section_key"])
+            canonical_keys.add(canonical_key)
+            conn.execute(
+                """INSERT INTO duplicate_groups
+                   (group_id, normalizer_version, license, era, heading_hash,
+                    body_hash, canonical_section_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    group_id, NORMALIZER_VERSION, canonical["license"], canonical["era"],
+                    normalized_hash(canonical["heading"], heading=True),
+                    normalized_hash(canonical["source_text"]), canonical_key, now,
+                ),
+            )
+            for ordinal, member in enumerate(members):
+                section_key = str(member["section_key"])
+                conn.execute(
+                    "INSERT INTO duplicate_group_members VALUES (?, ?, ?)",
+                    (group_id, section_key, ordinal),
+                )
+                if ordinal == 0:
+                    continue
+                shadow_count += 1
+                current = conn.execute(
+                    """SELECT decision, duplicate_of_section_key FROM draft_screening_current
+                       WHERE parser_run_id=? AND section_key=?""",
+                    (member["parser_run_id"], section_key),
+                ).fetchone()
+                if current is not None and (
+                    str(current["decision"]) != "REJECT"
+                    or str(current["duplicate_of_section_key"] or "") != canonical_key
+                ):
+                    latest = conn.execute(
+                        """SELECT event_id FROM draft_screening_events
+                           WHERE parser_run_id=? AND section_key=? ORDER BY event_id DESC LIMIT 1""",
+                        (member["parser_run_id"], section_key),
+                    ).fetchone()
+                    conn.execute(
+                        """INSERT INTO draft_screening_events
+                           (parser_run_id, section_key, event_type, worker, decided_at,
+                            reopen_reason, supersedes_event_id)
+                           VALUES (?, ?, 'REOPEN', 'deterministic-dedup', ?,
+                                   'scope-correction', ?)""",
+                        (member["parser_run_id"], section_key, now, latest["event_id"]),
+                    )
+                    current = None
+                if current is None:
+                    conn.execute(
+                        """INSERT INTO draft_screening_events
+                           (parser_run_id, section_key, event_type, requested_decision,
+                            decision, duplicate_of_section_key, reject_reason, worker, decided_at)
+                           VALUES (?, ?, 'DECISION', 'REJECT', 'REJECT', ?, 'duplicate',
+                                   'deterministic-dedup', ?)""",
+                        (member["parser_run_id"], section_key, canonical_key, now),
+                    )
+                    conn.execute(
+                        """INSERT INTO runner_screen_rejections(section_key, reason, worker, decided_at)
+                           VALUES (?, 'duplicate', 'deterministic-dedup', ?)
+                           ON CONFLICT(section_key) DO UPDATE SET reason=excluded.reason,
+                               worker=excluded.worker, decided_at=excluded.decided_at""",
+                        (section_key, now),
+                    )
+
+        # A Foundry snapshot digest commits to the release and every stable
+        # source/normalized row hash. Any terminal decision backed by a
+        # different digest is therefore reopened before the new candidates
+        # are installed. Historical confirmations remain audit evidence.
+        shadow_keys = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT section_key FROM duplicate_group_members WHERE source_ordinal>0"
+            )
+        }
+        stale_sections = conn.execute(
+            """SELECT DISTINCT confirmation.section_key, section.parser_run_id
+                 FROM foundry_coverage_confirmations AS confirmation
+                 JOIN source_sections AS section
+                   ON section.section_key=confirmation.section_key
+                 JOIN parser_runs AS run ON run.parser_run_id=section.parser_run_id
+                 JOIN draft_screening_current AS current
+                   ON current.parser_run_id=section.parser_run_id
+                  AND current.section_key=section.section_key
+                WHERE confirmation.snapshot_digest<>?
+                  AND run.state='active' AND run.review_enabled=1
+                ORDER BY confirmation.section_key""",
+            (snapshot.digest,),
+        ).fetchall()
+        stale_reopened = 0
+        for stale in stale_sections:
+            section_key = str(stale["section_key"])
+            if section_key in shadow_keys:
+                continue
+            latest = conn.execute(
+                """SELECT event_id FROM draft_screening_events
+                    WHERE parser_run_id=? AND section_key=?
+                    ORDER BY event_id DESC LIMIT 1""",
+                (stale["parser_run_id"], section_key),
+            ).fetchone()
+            if latest is None:
+                continue
+            conn.execute(
+                """INSERT INTO draft_screening_events
+                   (parser_run_id, section_key, event_type, worker, decided_at,
+                    reopen_reason, supersedes_event_id)
+                   VALUES (?, ?, 'REOPEN', 'deterministic-foundry-refresh', ?,
+                           'scope-correction', ?)""",
+                (stale["parser_run_id"], section_key, now, latest["event_id"]),
+            )
+            conn.execute(
+                "DELETE FROM runner_screen_rejections WHERE section_key=?",
+                (section_key,),
+            )
+            stale_reopened += 1
+
+        conn.execute(
+            """INSERT OR IGNORE INTO foundry_snapshots
+               (snapshot_digest, pf2e_release, row_count, normalizer_version, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (snapshot.digest, snapshot.release, len(snapshot.rows), NORMALIZER_VERSION, now),
+        )
+        conn.executemany(
+            """INSERT OR IGNORE INTO foundry_snapshot_rows
+               (snapshot_digest, foundry_id, source_hash, normalized_hash, heading_hash,
+                publication_title, license, era, entry_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                (
+                    snapshot.digest, row.chunk_id, row.source_hash, row.normalized_hash,
+                    row.heading_hash, row.publication_title, row.license, row.era, row.type,
+                )
+                for row in snapshot.rows
+            ),
+        )
+        conn.execute(
+            "DELETE FROM foundry_coverage_candidates WHERE snapshot_digest=?",
+            (snapshot.digest,),
+        )
+        candidate_count = 0
+        for row in rows:
+            section_key = str(row["section_key"])
+            if section_key not in canonical_keys:
+                continue
+            spec = PRODUCT_CATALOG[str(row["product_code"])]
+            section = {
+                **dict(row),
+                "publication_title": spec.title,
+            }
+            for rank, candidate in enumerate(matcher.candidates(section)):
+                proof_digest = _digest(
+                    "foundry-coverage-candidate-v1", NORMALIZER_VERSION,
+                    section_key, snapshot.digest, str(candidate["foundry_id"]),
+                    normalized_hash(row["source_text"]),
+                    str(candidate["normalized_hash"]),
+                    _canonical_json(candidate["metrics"]),
+                )
+                conn.execute(
+                    """INSERT INTO foundry_coverage_candidates
+                       (section_key, snapshot_digest, candidate_rank, foundry_id,
+                        proof_digest, metrics_json) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        section_key, snapshot.digest, rank, candidate["foundry_id"],
+                        proof_digest, _canonical_json(candidate["metrics"]),
+                    ),
+                )
+                candidate_count += 1
+        conn.execute(
+            """INSERT INTO metadata(key, value) VALUES ('active_foundry_snapshot', ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (snapshot.digest,),
+        )
+        product_counts = []
+        for product in sorted({str(row["product_code"]) for row in rows}):
+            product_counts.append({
+                "product_code": product,
+                "canonical_sections": int(conn.execute(
+                    """SELECT COUNT(*) FROM duplicate_groups AS groups_
+                       JOIN source_sections AS section
+                         ON section.section_key=groups_.canonical_section_key
+                      WHERE section.product_code=?""",
+                    (product,),
+                ).fetchone()[0]),
+                "shadow_duplicates": int(conn.execute(
+                    """SELECT COUNT(*) FROM duplicate_group_members AS member
+                       JOIN source_sections AS section ON section.section_key=member.section_key
+                      WHERE member.source_ordinal>0 AND section.product_code=?""",
+                    (product,),
+                ).fetchone()[0]),
+                "coverage_candidates": int(conn.execute(
+                    """SELECT COUNT(*) FROM foundry_coverage_candidates AS candidate
+                       JOIN source_sections AS section ON section.section_key=candidate.section_key
+                      WHERE candidate.snapshot_digest=? AND section.product_code=?""",
+                    (snapshot.digest, product),
+                ).fetchone()[0]),
+            })
+        scope_by_product = {
+            str(row["product_code"]): bool(row["enabled"])
+            for row in _review_scope_rows(conn)
+        }
+        prepared_manifest = {
+            "version": "deterministic-review-preparation-v1",
+            "normalizer_version": NORMALIZER_VERSION,
+            "snapshot_digest": snapshot.digest,
+            "duplicate_groups": [
+                tuple(row) for row in conn.execute(
+                    """SELECT group_id, canonical_section_key FROM duplicate_groups
+                       ORDER BY group_id"""
+                )
+            ],
+            "duplicate_members": [
+                tuple(row) for row in conn.execute(
+                    """SELECT group_id, section_key, source_ordinal
+                       FROM duplicate_group_members
+                       ORDER BY group_id, source_ordinal, section_key"""
+                )
+            ],
+            "coverage_candidates": [
+                tuple(row) for row in conn.execute(
+                    """SELECT section_key, candidate_rank, foundry_id, proof_digest
+                       FROM foundry_coverage_candidates WHERE snapshot_digest=?
+                       ORDER BY section_key, candidate_rank, foundry_id""",
+                    (snapshot.digest,),
+                )
+            ],
+        }
+        preparation_digest = _digest(_canonical_json(prepared_manifest))
+        conn.commit()
+        return {
+            "preparation_version": "deterministic-review-preparation-v1",
+            "preparation_digest": preparation_digest,
+            "normalizer_version": NORMALIZER_VERSION,
+            "foundry_release": snapshot.release,
+            "snapshot_digest": snapshot.digest,
+            "foundry_rows": len(snapshot.rows),
+            "duplicate_groups": len(grouped),
+            "shadow_duplicates": shadow_count,
+            "canonical_sections": len(canonical_keys),
+            "coverage_candidates": candidate_count,
+            "stale_coverage_reopened": stale_reopened,
+            "products": [
+                {
+                    **counts,
+                    "scope_state": (
+                        "enabled" if scope_by_product.get(str(counts["product_code"]), False)
+                        else "held"
+                    ),
+                }
+                for counts in product_counts
+            ],
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def foundry_coverage_evidence(
+    workspace: Path | str,
+    foundry_database: Path | str,
+    section_keys: Sequence[str],
+) -> dict[str, list[dict[str, object]]]:
+    """Return bounded public Foundry text for prepared claimed sections."""
+    snapshot = load_clean_foundry(foundry_database)
+    return _foundry_coverage_evidence_for_snapshot(workspace, snapshot, section_keys)
+
+
+def _foundry_coverage_evidence_for_snapshot(
+    workspace: Path | str,
+    snapshot: object,
+    section_keys: Sequence[str],
+) -> dict[str, list[dict[str, object]]]:
+    """Internal shared serializer for live claims and read-only previews."""
+    rows_by_id = {row.chunk_id: row for row in snapshot.rows}
+    conn = _connect(workspace, readonly=True)
+    try:
+        active = conn.execute(
+            "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+        ).fetchone()
+        if active is None or str(active[0]) != snapshot.digest:
+            raise ValueError("Foundry coverage snapshot is stale or unprepared")
+        result: dict[str, list[dict[str, object]]] = {}
+        for section_key in section_keys:
+            prepared = conn.execute(
+                """SELECT * FROM foundry_coverage_candidates
+                   WHERE section_key=? AND snapshot_digest=? ORDER BY candidate_rank""",
+                (section_key, snapshot.digest),
+            ).fetchall()
+            values = []
+            for item in prepared:
+                row = rows_by_id[str(item["foundry_id"])]
+                values.append({
+                    "id": row.chunk_id,
+                    "name": row.name,
+                    "type": row.type,
+                    "publication_title": row.publication_title,
+                    "license": row.license,
+                    "era": row.era,
+                    "text": row.text,
+                    "metrics": json.loads(str(item["metrics_json"])),
+                })
+            result[section_key] = values
+        return result
+    finally:
+        conn.close()
+
+
 def _review_target_sql(section_alias: str = "s") -> str:
-    """Restrict work to the sole active, review-enabled parser run per product."""
+    """Restrict semantic work to active parser runs in the configured scope."""
     return f"""EXISTS (
         SELECT 1 FROM parser_runs AS parser_run
         WHERE parser_run.parser_run_id={section_alias}.parser_run_id
           AND parser_run.state='active' AND parser_run.review_enabled=1
+          AND {_semantic_scope_sql('parser_run.product_code')}
     )"""
 
 
@@ -1785,7 +2339,8 @@ def claim_shard(
             f"""SELECT * FROM review_shards
             WHERE claimant = ? AND lease_expires_at >= ?
               AND EXISTS (SELECT 1 FROM parser_runs AS p WHERE p.parser_run_id=review_shards.parser_run_id
-                          AND p.state='active' AND p.review_enabled=1)
+                          AND p.state='active' AND p.review_enabled=1
+                          AND {_semantic_scope_sql('p.product_code')})
               AND EXISTS (
                   SELECT 1 FROM source_sections AS s
                   WHERE s.shard_id=review_shards.shard_id AND ({_PENDING_SECTION_SQL})
@@ -1818,7 +2373,8 @@ def claim_shard(
                 FROM review_shards
                 WHERE (claimant IS NULL OR lease_expires_at < ?)
                   AND EXISTS (SELECT 1 FROM parser_runs AS p WHERE p.parser_run_id=review_shards.parser_run_id
-                              AND p.state='active' AND p.review_enabled=1)
+                              AND p.state='active' AND p.review_enabled=1
+                              AND {_semantic_scope_sql('p.product_code')})
                   {target_clause}
                   AND ({_claimable_shard_sql('review_shards')})
                 ORDER BY product_code, content_fingerprint, shard_ordinal, shard_id LIMIT 1""",
@@ -1881,9 +2437,10 @@ def reclaim_interrupted_shard(
         _migrate_review_workspace(conn)
         conn.execute("BEGIN IMMEDIATE")
         shard = conn.execute(
-            """SELECT sh.* FROM review_shards AS sh
+            f"""SELECT sh.* FROM review_shards AS sh
                JOIN parser_runs AS p ON p.parser_run_id=sh.parser_run_id
-               WHERE sh.shard_id=? AND p.state='active' AND p.review_enabled=1""",
+               WHERE sh.shard_id=? AND p.state='active' AND p.review_enabled=1
+                 AND {_semantic_scope_sql('p.product_code')}""",
             (shard_id,),
         ).fetchone()
         if shard is None:
@@ -1930,10 +2487,11 @@ def read_claimed_shard(workspace: Path | str, shard_id: int, claimant: str) -> l
         _require_unambiguous_targets(conn)
         now = int(time.time())
         claim = conn.execute(
-            """SELECT 1 FROM review_shards
+            f"""SELECT 1 FROM review_shards
             WHERE shard_id=? AND claimant=? AND lease_expires_at >= ?
               AND EXISTS (SELECT 1 FROM parser_runs AS p WHERE p.parser_run_id=review_shards.parser_run_id
-                          AND p.state='active' AND p.review_enabled=1)""",
+                          AND p.state='active' AND p.review_enabled=1
+                          AND {_semantic_scope_sql('p.product_code')})""",
             (shard_id, claimant, now),
         ).fetchone()
         if claim is None:
@@ -1955,7 +2513,8 @@ def read_claimed_shard(workspace: Path | str, shard_id: int, claimant: str) -> l
 def _screening_run_sql(alias: str) -> str:
     return (
         f"{alias}.state='active' AND {alias}.review_enabled=1 "
-        f"AND {alias}.complete=1 AND {alias}.origin='{_TRUSTED_RUN_ORIGIN}'"
+        f"AND {alias}.complete=1 AND {alias}.origin='{_TRUSTED_RUN_ORIGIN}' "
+        f"AND {_semantic_scope_sql(f'{alias}.product_code')}"
     )
 
 
@@ -2307,19 +2866,23 @@ def _screening_stored_decision(
     section: sqlite3.Row,
     requested: str,
 ) -> tuple[str, str | None]:
-    """Resolve exact ADD duplicates without involving a screening worker."""
+    """Resolve only versioned same-heading duplicate-group shadows."""
     if requested != "ADD":
         return requested, None
     canonical = conn.execute(
-        """SELECT section_key FROM source_sections
-           WHERE parser_run_id=? AND text_hash=?
-           ORDER BY stable_identity, source_section_id, section_key LIMIT 1""",
-        (run_id, section["text_hash"]),
+        """SELECT groups.canonical_section_key
+             FROM duplicate_group_members AS member
+             JOIN duplicate_groups AS groups ON groups.group_id=member.group_id
+            WHERE member.section_key=?""",
+        (section["section_key"],),
     ).fetchone()
     if canonical is None:
-        raise ValueError("screening record has no canonical source section")
-    if str(canonical["section_key"]) != str(section["section_key"]):
-        return "REJECT", str(canonical["section_key"])
+        # Low-level tests and manual screening may precede deterministic
+        # preparation; absence of a group must fail open, never deduplicate.
+        return requested, None
+    canonical_key = str(canonical["canonical_section_key"])
+    if canonical_key != str(section["section_key"]):
+        return "REJECT", canonical_key
     return requested, None
 
 
@@ -2346,6 +2909,50 @@ def _screening_batch_complete(
     return pending is None
 
 
+def _store_foundry_confirmation(
+    conn: sqlite3.Connection,
+    *,
+    section_key: str,
+    foundry_ids: Sequence[str],
+    worker: str,
+    decided_at: int,
+) -> str | None:
+    if not foundry_ids:
+        return None
+    active = conn.execute(
+        "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+    ).fetchone()
+    if active is None:
+        raise ValueError("Foundry duplicate confirmation requires a prepared snapshot")
+    snapshot = str(active[0])
+    placeholders = ",".join("?" for _ in foundry_ids)
+    candidates = conn.execute(
+        f"""SELECT foundry_id, proof_digest FROM foundry_coverage_candidates
+            WHERE section_key=? AND snapshot_digest=?
+              AND foundry_id IN ({placeholders}) ORDER BY foundry_id""",
+        (section_key, snapshot, *foundry_ids),
+    ).fetchall()
+    if len(candidates) != len(foundry_ids):
+        raise ValueError("Foundry duplicate result selected an unsupplied or stale candidate")
+    ordered_ids = sorted(foundry_ids)
+    proof_digest = _digest(
+        "foundry-coverage-confirmation-v1", section_key, snapshot,
+        _canonical_json(ordered_ids),
+        _canonical_json([str(row["proof_digest"]) for row in candidates]),
+    )
+    conn.execute(
+        """INSERT INTO foundry_coverage_confirmations
+           (section_key, snapshot_digest, foundry_ids_json, proof_digest, worker, decided_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(section_key, snapshot_digest) DO UPDATE SET
+             foundry_ids_json=excluded.foundry_ids_json,
+             proof_digest=excluded.proof_digest,
+             worker=excluded.worker, decided_at=excluded.decided_at""",
+        (section_key, snapshot, _canonical_json(ordered_ids), proof_digest, worker, decided_at),
+    )
+    return proof_digest
+
+
 def submit_draft_screening_decision(
     workspace: Path | str,
     shard_id: int,
@@ -2355,6 +2962,7 @@ def submit_draft_screening_decision(
     *,
     defer_reason: str | None = None,
     reject_reason: str | None = None,
+    foundry_ids: Sequence[str] = (),
 ) -> dict[str, object]:
     """Persist one quad-state decision or resolve one deferred decision."""
     requested = decision.upper()
@@ -2367,6 +2975,10 @@ def submit_draft_screening_decision(
         or (requested != "DEFER" and defer_reason is not None)
         or (requested == "REJECT" and reject_reason is not None and reject_reason not in SCREENING_REJECT_REASONS)
         or (requested != "REJECT" and reject_reason is not None)
+        or len(foundry_ids) > 3
+        or len(set(foundry_ids)) != len(foundry_ids)
+        or any(not isinstance(value, str) or not value for value in foundry_ids)
+        or (bool(foundry_ids) and (requested != "REJECT" or reject_reason != "duplicate"))
     ):
         raise ValueError(
             "screening requires shard, claimant, index, add/reject/defer, "
@@ -2415,8 +3027,13 @@ def submit_draft_screening_decision(
         }:
             if claim is None or str(claim["claim_mode"]) != "escalation":
                 raise PermissionError("deferred records require a live escalation claim")
-            stored, duplicate_of = _screening_stored_decision(
-                conn, run_id, section, requested
+            stored, duplicate_of = (
+                ("REJECT", None)
+                if foundry_ids else _screening_stored_decision(conn, run_id, section, requested)
+            )
+            _store_foundry_confirmation(
+                conn, section_key=str(section["section_key"]), foundry_ids=foundry_ids,
+                worker=claimant, decided_at=now,
             )
             if latest_event is None or str(latest_event["event_type"]) != "DECISION":
                 raise ValueError("screening record has no deferred event to resolve")
@@ -2490,8 +3107,13 @@ def submit_draft_screening_decision(
 
         if claim is None or str(claim["claim_mode"]) != "ordinary":
             raise PermissionError("unprocessed records require a live ordinary claim")
-        stored, duplicate_of = _screening_stored_decision(
-            conn, run_id, section, requested
+        stored, duplicate_of = (
+            ("REJECT", None)
+            if foundry_ids else _screening_stored_decision(conn, run_id, section, requested)
+        )
+        _store_foundry_confirmation(
+            conn, section_key=str(section["section_key"]), foundry_ids=foundry_ids,
+            worker=claimant, decided_at=now,
         )
         conn.execute(
             """INSERT INTO draft_screening_events
@@ -2618,6 +3240,16 @@ def reopen_draft_screening(
     try:
         _migrate_review_workspace(conn)
         conn.execute("BEGIN IMMEDIATE")
+        requested_section_key = section_key
+        grouped = conn.execute(
+            """SELECT groups.canonical_section_key
+                 FROM duplicate_group_members AS member
+                 JOIN duplicate_groups AS groups ON groups.group_id=member.group_id
+                WHERE member.section_key=?""",
+            (section_key,),
+        ).fetchone()
+        if grouped is not None:
+            section_key = str(grouped["canonical_section_key"])
         section = conn.execute(
             """SELECT s.section_key, s.parser_run_id, s.shard_id
                  FROM source_sections AS s
@@ -2640,6 +3272,15 @@ def reopen_draft_screening(
             raise PermissionError("cannot reopen screening while the section has a live claim")
         latest = _screening_latest_event(conn, str(section["parser_run_id"]), section_key)
         if latest is None or str(latest["event_type"]) != "DECISION":
+            if requested_section_key != section_key:
+                conn.commit()
+                return {
+                    "requested_section_key": requested_section_key,
+                    "section_key": section_key,
+                    "state": "already-open",
+                    "previous_decision": None,
+                    "event_id": None,
+                }
             raise ValueError("section has no current terminal screening decision")
         current = conn.execute(
             """SELECT decision FROM draft_screening_current
@@ -2661,6 +3302,7 @@ def reopen_draft_screening(
             if str(prior["reopen_reason"]) == reason and str(prior["worker"]) == maintainer:
                 conn.commit()
                 return {
+                    "requested_section_key": requested_section_key,
                     "section_key": section_key,
                     "state": "unchanged",
                     "previous_decision": str(current["decision"]).lower(),
@@ -2679,6 +3321,7 @@ def reopen_draft_screening(
         )
         conn.commit()
         return {
+            "requested_section_key": requested_section_key,
             "section_key": section_key,
             "state": "reopened",
             "previous_decision": str(current["decision"]).lower(),
@@ -2811,7 +3454,8 @@ def submit_candidate(workspace: Path | str, submission: Mapping[str, object]) ->
         complex_layout = {
             "unclassified-native-coverage", "complex-layout", "table-ambiguous", "table-cell",
             "layout-model-complex", "layout-model-table", "layout-model-unbound",
-            "layout-order-conflict", "layout-region-split",
+            "layout-order-conflict", "layout-region-split", "unsupported-layout",
+            "unresolved-continuation", "heading-artifact", "oversize-block",
         }
         if decision == "PUBLIC_AS_IS" and layout_flags.intersection(complex_layout):
             raise ValueError("PUBLIC_AS_IS is forbidden for unclassified or complex layout")
@@ -3445,7 +4089,8 @@ def stage_trusted_native_pdf(
     bundle.verify_seal()
     expected_parser = (
         parser_version
-        if parser_version == PAIZO_NATIVE_PARSER_V4 or layout_artifact is None
+        if parser_version in {PAIZO_NATIVE_PARSER_V4, PAIZO_NATIVE_PARSER_V5}
+        or layout_artifact is None
         else "paizo-native-v3+pp-doclayout-v3-v1"
     )
     if bundle.product_code != product_code or bundle.parser_version != expected_parser or not _is_sha256(bundle.sealed_digest):
@@ -4490,6 +5135,12 @@ def activate_parser_run(workspace: Path | str, parser_run_id: str) -> dict[str, 
             WHERE parser_run_id=?""", (now, parser_run_id),
         )
         conn.execute(
+            """INSERT OR IGNORE INTO review_product_scope
+               (product_code, enabled, reason, updated_at)
+               VALUES (?, 1, 'enabled', ?)""",
+            (target["product_code"], now),
+        )
+        conn.execute(
             """UPDATE parser_run_sections SET membership_state='retired'
             WHERE parser_run_id IN (SELECT parser_run_id FROM parser_runs
                                     WHERE product_code=? AND state='retired')""",
@@ -4541,6 +5192,20 @@ def _approved_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
     approved: list[sqlite3.Row] = []
     for section in sections:
+        terminal = conn.execute(
+            """SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM duplicate_group_members AS member
+                 WHERE member.section_key=? AND member.source_ordinal>0
+               ) OR EXISTS (
+                 SELECT 1 FROM foundry_coverage_confirmations AS coverage
+                 JOIN metadata AS active ON active.key='active_foundry_snapshot'
+                    AND active.value=coverage.snapshot_digest
+                 WHERE coverage.section_key=?
+               )""",
+            (section["section_key"], section["section_key"]),
+        ).fetchone()
+        if terminal is not None:
+            continue
         candidates = conn.execute(
             "SELECT * FROM candidates WHERE section_key=? ORDER BY candidate_ordinal",
             (section["section_key"],),
@@ -4589,15 +5254,26 @@ def build_public_corpus(
     output: Path | str,
     notices_path: Path | str,
 ) -> dict[str, int]:
-    """Build a compact public database from fully reviewed candidate text only."""
+    """Build a compact v3 public base with scoped many-source provenance."""
     notices = _notices(notices_path)
     _ensure_workspace_migrated(workspace)
     review = _connect(workspace, readonly=True)
     try:
         _require_unambiguous_targets(review)
+        scope_rows = _review_scope_rows(review)
+        covered_products = [
+            str(row["product_code"]) for row in scope_rows if int(row["enabled"])
+        ]
+        if not covered_products:
+            raise ValueError("public build requires a non-empty semantic product scope")
+        scope_manifest = [
+            {"product_code": product, "state": "enabled"}
+            for product in covered_products
+        ]
+        scope_digest = _digest(REVIEW_SCOPE_VERSION, _canonical_json(scope_manifest))
         untrusted = review.execute(
             """SELECT 1 FROM parser_runs WHERE state='active' AND review_enabled=1
-            AND (origin != ? OR complete != 1 OR manifest_version != ?) LIMIT 1""",
+               AND (origin != ? OR complete != 1 OR manifest_version != ?) LIMIT 1""",
             (_TRUSTED_RUN_ORIGIN, _TRUSTED_MANIFEST_VERSION),
         ).fetchone()
         if untrusted is not None:
@@ -4606,168 +5282,257 @@ def build_public_corpus(
             "SELECT * FROM parser_runs WHERE state='active' AND review_enabled=1"
         ):
             _validate_trusted_run_commitments(review, target)
-        candidates = _approved_rows(review)
-        rows: list[dict[str, object]] = []
+
+        approved = _approved_rows(review)
+        catalog_order = {code: ordinal for ordinal, code in enumerate(PRODUCT_CATALOG)}
+        prepared: list[dict[str, object]] = []
         revisions: dict[tuple[str, str], sqlite3.Row] = {}
         licenses: set[str] = set()
-        for candidate in candidates:
-            section = review.execute(
+        for candidate in approved:
+            primary = review.execute(
                 """SELECT s.*, r.license, r.era, r.source_schema_version,
-                           r.printing_revision,
-                           parser_run.parser_version AS parser_run_version,
-                           source_asset.source_content_fingerprint AS canonical_content_fingerprint
-                FROM source_sections AS s JOIN source_revisions AS r
-                  ON (r.product_code=s.product_code AND r.content_fingerprint=s.content_fingerprint)
-                JOIN parser_runs AS parser_run ON parser_run.parser_run_id=s.parser_run_id
-                JOIN source_assets AS source_asset ON source_asset.asset_id=parser_run.asset_id
-                WHERE s.section_key=?""",
+                          r.printing_revision, p.parser_version AS parser_run_version,
+                          a.source_content_fingerprint AS canonical_content_fingerprint
+                     FROM source_sections AS s
+                     JOIN source_revisions AS r USING(product_code, content_fingerprint)
+                     JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
+                     JOIN source_assets AS a ON a.asset_id=p.asset_id
+                    WHERE s.section_key=?""",
                 (candidate["section_key"],),
             ).fetchone()
-            assert section is not None
+            assert primary is not None
             approvals = [
-                item for item in _active_valid_reviews(review, candidate)
-                if item["verdict"] == "APPROVE"
+                row for row in _active_valid_reviews(review, candidate)
+                if row["verdict"] == "APPROVE"
             ]
             if not approvals:
                 raise ValueError("approved candidate has no trusted approval")
-            policy_version = str(approvals[0]["policy_version"])
-            license_name = str(section["license"])
+            policy_versions = {str(row["policy_version"]) for row in approvals}
+            if len(policy_versions) != 1:
+                raise ValueError("approved candidate has ambiguous policy provenance")
+            text = str(candidate["candidate_text"])
+            heading = _validate_public_scalar(candidate["public_heading"], field="candidate heading")
+            _validate_public_text(text, field="candidate text")
+            method = _validate_public_scalar(candidate["extraction_method"], field="extraction method")
+            group = review.execute(
+                "SELECT group_id FROM duplicate_group_members WHERE section_key=?",
+                (candidate["section_key"],),
+            ).fetchone()
+            if group is None:
+                source_rows = [primary]
+            else:
+                source_rows = review.execute(
+                    """SELECT s.*, r.license, r.era, r.source_schema_version,
+                              r.printing_revision, p.parser_version AS parser_run_version,
+                              a.source_content_fingerprint AS canonical_content_fingerprint
+                         FROM duplicate_group_members AS member
+                         JOIN source_sections AS s ON s.section_key=member.section_key
+                         JOIN source_revisions AS r USING(product_code, content_fingerprint)
+                         JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
+                         JOIN source_assets AS a ON a.asset_id=p.asset_id
+                        WHERE member.group_id=?
+                          AND """ + _semantic_scope_sql("s.product_code") +
+                        """ ORDER BY member.source_ordinal""",
+                    (group["group_id"],),
+                ).fetchall()
+            prepared.append({
+                "candidate": candidate, "primary": primary, "sources": source_rows,
+                "heading": heading, "text": text, "method": method,
+                "policy_version": next(iter(policy_versions)),
+                "public_group": duplicate_identity(
+                    heading=heading, text=text, license_name=primary["license"], era=primary["era"],
+                ),
+            })
+
+        public_groups: dict[str, list[dict[str, object]]] = {}
+        for item in prepared:
+            public_groups.setdefault(str(item["public_group"]), []).append(item)
+        rules: list[dict[str, object]] = []
+        rule_sources: list[dict[str, object]] = []
+        for _group_id, items in sorted(public_groups.items()):
+            items.sort(key=lambda item: (
+                catalog_order.get(str(item["primary"]["product_code"]), 999),
+                int(item["primary"]["page_start"] or 0),
+                str(item["primary"]["stable_identity"]),
+            ))
+            canonical = items[0]
+            primary = canonical["primary"]
+            policy_versions = {str(item["policy_version"]) for item in items}
+            if len(policy_versions) != 1:
+                raise ValueError("deduplicated public rule has inconsistent policy versions")
+            public_id = "licensed:" + _digest(
+                "licensed-rule-v2", str(primary["stable_identity"])
+            )
+            text = str(canonical["text"])
+            license_name = str(primary["license"])
+            era = str(primary["era"])
             licenses.add(license_name)
-            candidate_text = str(candidate["candidate_text"])
-            _validate_public_text(candidate_text, field="candidate text")
-            public_heading = _validate_public_scalar(candidate["public_heading"], field="candidate heading")
-            extraction_method = _validate_public_scalar(candidate["extraction_method"], field="extraction method")
-            for field, value in (
-                ("product", section["product_code"]),
-                ("source section ID", section["source_section_id"]),
-                ("source section hash", section["text_hash"]),
-                ("content fingerprint", section["canonical_content_fingerprint"]),
-                ("license", section["license"]),
-                ("era", section["era"]),
-                ("parser version", section["parser_run_version"]),
-                ("printing revision", section["printing_revision"]),
-            ):
-                _validate_public_scalar(value, field=field)
-            if not _PUBLIC_SOURCE_ID_RE.fullmatch(str(section["source_section_id"])):
-                raise ValueError("public source section ID has unsafe structure")
-            _validate_page_provenance(
-                section["source_section_id"], section["page_start"], section["page_end"]
-            )
-            if section["printed_page"] is not None:
-                _validate_public_scalar(section["printed_page"], field="printed page")
-            public_id = "licensed:" + _digest("licensed-section-v1", str(section["stable_identity"]))
-            rows.append(
-                {
-                    "public_id": public_id,
-                    "product": section["product_code"],
-                    "fingerprint": section["canonical_content_fingerprint"],
-                    "source_id": section["source_section_id"],
-                    "source_hash": section["text_hash"],
-                    "page_start": section["page_start"],
-                    "page_end": section["page_end"],
-                    "printed_page": section["printed_page"],
-                    "heading": public_heading,
-                    "text": candidate_text,
-                    "content_hash": hashlib.sha256(candidate_text.encode("utf-8")).hexdigest(),
-                    "license": license_name,
-                    "era": section["era"],
-                    "method": extraction_method,
-                    "policy_version": policy_version,
-                    "parser_version": section["parser_run_version"],
-                    "printing_revision": section["printing_revision"],
-                }
-            )
-            revisions[(str(section["product_code"]), str(section["canonical_content_fingerprint"]))] = section
+            rules.append({
+                "public_id": public_id,
+                "heading": canonical["heading"],
+                "text": text,
+                "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "license": license_name,
+                "era": era,
+                "method": canonical["method"],
+                "policy_version": next(iter(policy_versions)),
+            })
+            sources_by_key: dict[str, sqlite3.Row] = {}
+            for item in items:
+                for source in item["sources"]:
+                    sources_by_key[str(source["section_key"])] = source
+            sources = sorted(sources_by_key.values(), key=lambda source: (
+                catalog_order.get(str(source["product_code"]), 999),
+                int(source["page_start"] or 0), str(source["stable_identity"]),
+            ))
+            for ordinal, source in enumerate(sources):
+                for field, value in (
+                    ("product", source["product_code"]),
+                    ("source section ID", source["source_section_id"]),
+                    ("source section hash", source["text_hash"]),
+                    ("content fingerprint", source["canonical_content_fingerprint"]),
+                    ("parser version", source["parser_run_version"]),
+                    ("printing revision", source["printing_revision"]),
+                ):
+                    _validate_public_scalar(value, field=field)
+                if not _PUBLIC_SOURCE_ID_RE.fullmatch(str(source["source_section_id"])):
+                    raise ValueError("public source section ID has unsafe structure")
+                _validate_page_provenance(
+                    source["source_section_id"], source["page_start"], source["page_end"]
+                )
+                if source["printed_page"] is not None:
+                    _validate_public_scalar(source["printed_page"], field="printed page")
+                fingerprint = str(source["canonical_content_fingerprint"])
+                key = (str(source["product_code"]), fingerprint)
+                revisions[key] = source
+                rule_sources.append({
+                    "public_id": public_id, "ordinal": ordinal,
+                    "product": key[0], "fingerprint": fingerprint,
+                    "source_id": source["source_section_id"], "source_hash": source["text_hash"],
+                    "page_start": source["page_start"], "page_end": source["page_end"],
+                    "printed_page": source["printed_page"],
+                    "parser_version": source["parser_run_version"],
+                    "printing_revision": source["printing_revision"],
+                    "notice_key": source["license"],
+                })
+
+        active_snapshot = review.execute(
+            "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+        ).fetchone()
+        requirements: list[dict[str, object]] = []
+        foundry_release = "none"
+        snapshot_digest = "none"
+        if active_snapshot is not None:
+            snapshot_digest = str(active_snapshot[0])
+            snapshot_row = review.execute(
+                "SELECT pf2e_release FROM foundry_snapshots WHERE snapshot_digest=?",
+                (snapshot_digest,),
+            ).fetchone()
+            if snapshot_row is None:
+                raise ValueError("active Foundry snapshot metadata is missing")
+            foundry_release = str(snapshot_row["pf2e_release"])
+            requirements = [dict(row) for row in review.execute(
+                """SELECT DISTINCT snapshot.foundry_id, snapshot.source_hash,
+                          snapshot.normalized_hash, snapshot.publication_title,
+                          snapshot.license, snapshot.era
+                     FROM foundry_coverage_confirmations AS confirmation
+                     JOIN source_sections AS section
+                       ON section.section_key=confirmation.section_key,
+                          json_each(confirmation.foundry_ids_json) AS selected
+                     JOIN foundry_snapshot_rows AS snapshot
+                       ON snapshot.snapshot_digest=confirmation.snapshot_digest
+                      AND snapshot.foundry_id=selected.value
+                    WHERE confirmation.snapshot_digest=?
+                      AND """ + _semantic_scope_sql("section.product_code") +
+                    """ ORDER BY snapshot.foundry_id""",
+                (snapshot_digest,),
+            )]
     finally:
         review.close()
-    missing_notices = sorted(license for license in licenses if license not in notices)
+
+    missing_notices = sorted(license_name for license_name in licenses if license_name not in notices)
     if missing_notices:
         raise ValueError("required notice keys are missing: " + ", ".join(missing_notices))
-
     output_path = Path(output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     staged = output_path.with_name(f".{output_path.name}.staging-{os.getpid()}")
     staged.unlink(missing_ok=True)
     conn = sqlite3.connect(staged)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = DELETE")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.executescript(
             """
             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE source_revisions (
-                product_code TEXT NOT NULL,
-                content_fingerprint TEXT NOT NULL,
-                license TEXT NOT NULL,
-                era TEXT NOT NULL,
-                parser_version TEXT NOT NULL,
-                source_schema_version TEXT,
-                printing_revision TEXT NOT NULL,
-                PRIMARY KEY (product_code, content_fingerprint)
-            );
+                product_code TEXT NOT NULL, content_fingerprint TEXT NOT NULL,
+                license TEXT NOT NULL, era TEXT NOT NULL, parser_version TEXT NOT NULL,
+                source_schema_version TEXT, printing_revision TEXT NOT NULL,
+                PRIMARY KEY(product_code, content_fingerprint));
             CREATE TABLE notices (
-                notice_key TEXT PRIMARY KEY,
-                license TEXT NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE TABLE licensed_sections (
-                public_id TEXT PRIMARY KEY,
-                product_code TEXT NOT NULL,
-                content_fingerprint TEXT NOT NULL,
-                source_section_id TEXT NOT NULL,
-                source_section_hash TEXT NOT NULL,
-                page_start INTEGER,
-                page_end INTEGER,
-                printed_page TEXT,
-                heading TEXT NOT NULL,
-                text TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                license TEXT NOT NULL,
-                era TEXT NOT NULL,
-                extraction_method TEXT,
-                policy_version TEXT NOT NULL,
-                parser_version TEXT NOT NULL,
-                printing_revision TEXT NOT NULL,
-                notice_key TEXT NOT NULL REFERENCES notices(notice_key),
-                FOREIGN KEY (product_code, content_fingerprint)
-                    REFERENCES source_revisions(product_code, content_fingerprint)
-            );
-            CREATE INDEX licensed_sections_by_product ON licensed_sections(product_code, content_fingerprint);
+                notice_key TEXT PRIMARY KEY, license TEXT NOT NULL, text TEXT NOT NULL);
+            CREATE TABLE licensed_rules (
+                public_id TEXT PRIMARY KEY, heading TEXT NOT NULL, text TEXT NOT NULL,
+                content_hash TEXT NOT NULL, license TEXT NOT NULL, era TEXT NOT NULL,
+                extraction_method TEXT NOT NULL, policy_version TEXT NOT NULL,
+                notice_key TEXT NOT NULL REFERENCES notices(notice_key));
+            CREATE TABLE licensed_rule_sources (
+                public_id TEXT NOT NULL REFERENCES licensed_rules(public_id),
+                source_ordinal INTEGER NOT NULL, product_code TEXT NOT NULL,
+                content_fingerprint TEXT NOT NULL, source_section_id TEXT NOT NULL,
+                source_section_hash TEXT NOT NULL, page_start INTEGER NOT NULL,
+                page_end INTEGER NOT NULL, printed_page TEXT, parser_version TEXT NOT NULL,
+                printing_revision TEXT NOT NULL, notice_key TEXT NOT NULL REFERENCES notices(notice_key),
+                PRIMARY KEY(public_id, source_ordinal),
+                UNIQUE(public_id, product_code, content_fingerprint, source_section_id),
+                FOREIGN KEY(product_code, content_fingerprint)
+                    REFERENCES source_revisions(product_code, content_fingerprint));
+            CREATE TABLE required_foundry_rows (
+                foundry_id TEXT PRIMARY KEY, source_hash TEXT NOT NULL,
+                normalized_hash TEXT NOT NULL, publication_title TEXT NOT NULL,
+                license TEXT NOT NULL, era TEXT NOT NULL);
+            CREATE INDEX licensed_rule_sources_by_product
+                ON licensed_rule_sources(product_code, content_fingerprint);
             """
         )
-        conn.executemany(
-            "INSERT INTO metadata VALUES (?, ?)",
-            [
-                ("public_schema_version", str(PUBLIC_SCHEMA_VERSION)),
-                ("content_scope", "licensed-core-reviewed"),
-                ("policy_version", LICENSED_CORE_POLICY_VERSION),
-                ("policy_digest", licensed_policy_digest()),
-            ],
-        )
+        conn.executemany("INSERT INTO metadata VALUES (?, ?)", [
+            ("public_schema_version", str(PUBLIC_SCHEMA_VERSION)),
+            ("content_scope", "licensed-core-reviewed"),
+            ("policy_version", LICENSED_CORE_POLICY_VERSION),
+            ("policy_digest", licensed_policy_digest()),
+            ("normalizer_version", NORMALIZER_VERSION),
+            ("review_scope_version", REVIEW_SCOPE_VERSION),
+            ("covered_products", _canonical_json(covered_products)),
+            ("review_scope_digest", scope_digest),
+            ("foundry_release", foundry_release),
+            ("foundry_snapshot_digest", snapshot_digest),
+        ])
         for key in sorted(notices):
-            notice = notices[key]
-            conn.execute("INSERT INTO notices VALUES (?, ?, ?)", (key, notice["license"], notice["text"]))
+            conn.execute("INSERT INTO notices VALUES (?, ?, ?)", (
+                key, notices[key]["license"], notices[key]["text"],
+            ))
         for key, revision in sorted(revisions.items()):
-            conn.execute(
-                "INSERT INTO source_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    key[0], key[1], revision["license"], revision["era"],
-                    revision["parser_run_version"], revision["source_schema_version"],
-                    revision["printing_revision"],
-                ),
-            )
-        for row in sorted(rows, key=lambda item: str(item["public_id"])):
-                conn.execute(
-                    """INSERT INTO licensed_sections VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    row["public_id"], row["product"], row["fingerprint"], row["source_id"],
-                    row["source_hash"], row["page_start"], row["page_end"], row["printed_page"],
-                    row["heading"], row["text"], row["content_hash"], row["license"], row["era"],
-                    row["method"], row["policy_version"], row["parser_version"],
-                    row["printing_revision"], row["license"],
-                ),
-            )
+            conn.execute("INSERT INTO source_revisions VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                key[0], key[1], revision["license"], revision["era"],
+                revision["parser_run_version"], revision["source_schema_version"],
+                revision["printing_revision"],
+            ))
+        for row in sorted(rules, key=lambda item: str(item["public_id"])):
+            conn.execute("INSERT INTO licensed_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+                row["public_id"], row["heading"], row["text"], row["content_hash"],
+                row["license"], row["era"], row["method"], row["policy_version"], row["license"],
+            ))
+        for row in sorted(rule_sources, key=lambda item: (str(item["public_id"]), int(item["ordinal"]))):
+            conn.execute("INSERT INTO licensed_rule_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+                row["public_id"], row["ordinal"], row["product"], row["fingerprint"],
+                row["source_id"], row["source_hash"], row["page_start"], row["page_end"],
+                row["printed_page"], row["parser_version"], row["printing_revision"], row["notice_key"],
+            ))
+        for row in requirements:
+            conn.execute("INSERT INTO required_foundry_rows VALUES (?, ?, ?, ?, ?, ?)", (
+                row["foundry_id"], row["source_hash"], row["normalized_hash"],
+                row["publication_title"], row["license"], row["era"],
+            ))
         conn.commit()
         conn.execute("VACUUM")
     except BaseException:
@@ -4777,7 +5542,12 @@ def build_public_corpus(
     else:
         conn.close()
     os.replace(staged, output_path)
-    return {"sections": len(rows), "revisions": len(revisions), "notices": len(notices)}
+    return {
+        "sections": len(rules), "sources": len(rule_sources),
+        "foundry_requirements": len(requirements), "revisions": len(revisions),
+        "notices": len(notices), "covered_products": len(covered_products),
+        "review_scope_digest": scope_digest,
+    }
 
 
 __all__ = [
@@ -4785,6 +5555,7 @@ __all__ = [
     "PUBLIC_DECISIONS",
     "PUBLIC_SCHEMA_VERSION",
     "REVIEW_SCHEMA_VERSION",
+    "REVIEW_SCOPE_VERSION",
     "REVIEW_VERDICTS",
     "activate_parser_run",
     "build_public_corpus",
@@ -4792,17 +5563,21 @@ __all__ = [
     "claim_shard",
     "claim_draft_screening_batch",
     "draft_screening_status",
+    "foundry_coverage_evidence",
     "invalidate_reviews",
     "initialize_trusted_workspace",
     "initialize_workspace",
     "next_draft_screening_record",
+    "prepare_deterministic_review",
     "read_claimed_shard",
     "read_claimed_review",
     "read_draft_screening_record",
+    "review_product_scope",
     "reclaim_interrupted_shard",
     "release_draft_screening_batch",
     "reopen_draft_screening",
     "set_review_target",
+    "set_review_product_scope",
     "stage_trusted_native_pdf",
     "stage_trusted_native_pdf_with_approved_stitches",
     "step_draft_screening",

@@ -68,14 +68,26 @@ def _database(
                 );
                 CREATE TABLE licensed_revisions (
                     product_code TEXT, content_fingerprint TEXT, license TEXT, era TEXT,
-                    parser_version TEXT, source_schema_version TEXT, policy_versions TEXT
+                    parser_version TEXT, source_schema_version TEXT, policy_versions TEXT,
+                    printing_revision TEXT
                 );
                 CREATE TABLE licensed_sections (
                     public_id TEXT PRIMARY KEY, product_code TEXT, content_fingerprint TEXT,
                     source_section_id TEXT, source_section_hash TEXT, page_start INTEGER,
                     page_end INTEGER, printed_page TEXT, heading TEXT, content_hash TEXT,
                     license TEXT, era TEXT, extraction_method TEXT, policy_version TEXT,
-                    parser_version TEXT, notice_key TEXT
+                    parser_version TEXT, notice_key TEXT, printing_revision TEXT
+                );
+                CREATE TABLE licensed_section_sources (
+                    public_id TEXT, source_ordinal INTEGER, product_code TEXT,
+                    content_fingerprint TEXT, source_section_id TEXT,
+                    source_section_hash TEXT, page_start INTEGER, page_end INTEGER,
+                    printed_page TEXT, parser_version TEXT, printing_revision TEXT,
+                    notice_key TEXT
+                );
+                CREATE TABLE required_foundry_rows (
+                    foundry_id TEXT, source_hash TEXT, normalized_hash TEXT,
+                    publication_title TEXT, license TEXT, era TEXT
                 );
                 """
             )
@@ -87,7 +99,8 @@ def _database(
                     json.dumps(
                         {
                             "content_fingerprint": fingerprint,
-                            "public_schema_version": 1,
+                            "public_schema_version": 3,
+                            "printing_revision": "printing-1",
                         }
                     ),
                 ),
@@ -97,10 +110,10 @@ def _database(
                 (notice_text, notice_hash),
             )
             conn.execute(
-                "INSERT INTO licensed_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO licensed_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     "PZO12001", fingerprint, "ORC", "remaster", "paizo-native-v1",
-                    "1", '["mechanics-v1"]',
+                    "1", '["mechanics-v1"]', "printing-1",
                 ),
             )
             for index in range(licensed_core_chunks):
@@ -111,7 +124,7 @@ def _database(
                 )
                 conn.execute(
                     """INSERT INTO licensed_sections VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         public_id, "PZO12001", fingerprint,
                         f"pzo12001:player-core:p1:h0123456789abcdef:i{index}",
@@ -119,10 +132,21 @@ def _database(
                         1, 1, None, "Reviewed Rule",
                         content_hash, "ORC", "remaster",
                         "reviewed-v1", "mechanics-v1", "paizo-native-v1", "ORC",
+                        "printing-1",
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO licensed_section_sources VALUES
+                    (?, 0, ?, ?, ?, ?, 1, 1, NULL, ?, ?, ?)""",
+                    (
+                        public_id, "PZO12001", fingerprint,
+                        f"pzo12001:player-core:p1:h0123456789abcdef:i{index}",
+                        hashlib.sha256(f"source:{index}".encode()).hexdigest(),
+                        "paizo-native-v1", "printing-1", "ORC",
                     ),
                 )
             digest = licensed_core_contract_digest(
-                schema_version=1,
+                schema_version=3,
                 source_revisions=[
                     {
                         "product_code": "PZO12001",
@@ -131,6 +155,7 @@ def _database(
                         "era": "remaster",
                         "parser_version": "paizo-native-v1",
                         "source_schema_version": "1",
+                        "printing_revision": "printing-1",
                         "policy_versions": ["mechanics-v1"],
                     }
                 ],
@@ -162,14 +187,40 @@ def _database(
                             "policy_version": "mechanics-v1",
                             "parser_version": "paizo-native-v1",
                             "source_schema_version": "1",
+                            "printing_revision": "printing-1",
                             "notice_key": "ORC",
+                            "sources": [
+                                {
+                                    "product_code": "PZO12001",
+                                    "content_fingerprint": fingerprint,
+                                    "source_section_id": (
+                                        "pzo12001:player-core:p1:"
+                                        f"h0123456789abcdef:i{index}"
+                                    ),
+                                    "source_section_hash": hashlib.sha256(
+                                        f"source:{index}".encode()
+                                    ).hexdigest(),
+                                    "page_start": 1,
+                                    "page_end": 1,
+                                    "printed_page": None,
+                                    "parser_version": "paizo-native-v1",
+                                    "printing_revision": "printing-1",
+                                    "source_schema_version": "1",
+                                    "notice_key": "ORC",
+                                }
+                            ],
                         },
                     }
                     for index in range(licensed_core_chunks)
                 ],
+                required_foundry_rows=[],
+                covered_products=["PZO12001"],
             )
             conn.execute(
                 "INSERT INTO _meta VALUES ('licensed_core_digest', ?)", (digest,)
+            )
+            conn.execute(
+                "INSERT INTO _meta VALUES ('licensed_core_covered_products', '[\"PZO12001\"]')"
             )
         for index, origin in enumerate(extra_origins):
             conn.execute(
@@ -208,39 +259,61 @@ def _trusted_projection(path: Path) -> Path:
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE source_revisions (
             product_code TEXT, content_fingerprint TEXT, license TEXT, era TEXT,
-            parser_version TEXT, source_schema_version TEXT
+            parser_version TEXT, source_schema_version TEXT, printing_revision TEXT
         );
         CREATE TABLE notices (notice_key TEXT PRIMARY KEY, license TEXT, text TEXT);
-        CREATE TABLE licensed_sections (
-            public_id TEXT PRIMARY KEY, product_code TEXT, content_fingerprint TEXT,
-            source_section_id TEXT, source_section_hash TEXT, page_start INTEGER,
-            page_end INTEGER, printed_page TEXT, heading TEXT, text TEXT,
-            content_hash TEXT, license TEXT, era TEXT, extraction_method TEXT,
-            policy_version TEXT, parser_version TEXT, notice_key TEXT
+        CREATE TABLE licensed_rules (
+            public_id TEXT PRIMARY KEY, heading TEXT, text TEXT, content_hash TEXT,
+            license TEXT, era TEXT, extraction_method TEXT, policy_version TEXT,
+            notice_key TEXT
+        );
+        CREATE TABLE licensed_rule_sources (
+            public_id TEXT, source_ordinal INTEGER, product_code TEXT,
+            content_fingerprint TEXT, source_section_id TEXT, source_section_hash TEXT,
+            page_start INTEGER, page_end INTEGER, printed_page TEXT,
+            parser_version TEXT, printing_revision TEXT, notice_key TEXT
+        );
+        CREATE TABLE required_foundry_rows (
+            foundry_id TEXT, source_hash TEXT, normalized_hash TEXT,
+            publication_title TEXT, license TEXT, era TEXT
         );
         """
     )
     conn.executemany(
         "INSERT INTO metadata VALUES (?, ?)",
         [
-            ("public_schema_version", "1"),
+            ("public_schema_version", "3"),
             ("content_scope", "licensed-core-reviewed"),
             ("policy_version", "mechanics-v1"),
             ("policy_digest", licensed_policy_digest()),
+            ("review_scope_version", "semantic-products-v1"),
+            ("covered_products", '["PZO12001"]'),
+            (
+                "review_scope_digest",
+                hashlib.sha256(
+                    b'semantic-products-v1\n[{"product_code":"PZO12001","state":"enabled"}]'
+                ).hexdigest(),
+            ),
         ],
     )
     conn.execute(
-        "INSERT INTO source_revisions VALUES (?, ?, 'ORC', 'remaster', 'paizo-native-v1', '1')",
+        """INSERT INTO source_revisions VALUES
+           (?, ?, 'ORC', 'remaster', 'paizo-native-v1', '1', 'printing-1')""",
         ("PZO12001", fingerprint),
     )
     conn.execute("INSERT INTO notices VALUES ('ORC', 'ORC', 'Complete ORC notice.')")
     conn.execute(
-        """INSERT INTO licensed_sections VALUES
-        ('licensed:0', 'PZO12001', ?,
+        """INSERT INTO licensed_rules VALUES
+        ('licensed:0', 'Reviewed Rule', ?, ?, 'ORC', 'remaster',
+         'reviewed-v1', 'mechanics-v1', 'ORC')""",
+        (text, content_hash),
+    )
+    conn.execute(
+        """INSERT INTO licensed_rule_sources VALUES
+        ('licensed:0', 0, 'PZO12001', ?,
          'pzo12001:player-core:p1:h0123456789abcdef:i0', ?, 1, 1, NULL,
-         'Reviewed Rule', ?, ?, 'ORC', 'remaster', 'reviewed-v1', 'mechanics-v1',
-         'paizo-native-v1', 'ORC')""",
-        (fingerprint, source_section_hash, text, content_hash),
+         'paizo-native-v1', 'printing-1', 'ORC')""",
+        (fingerprint, source_section_hash),
     )
     conn.commit()
     conn.close()

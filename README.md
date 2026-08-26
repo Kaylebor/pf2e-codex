@@ -124,9 +124,12 @@ file.
 
 The normal local-full flow remains pinned to the frozen `paizo-native-v1`
 profile. The older v2 and v3 review profiles are also frozen. Licensed review
-preparation uses `paizo-native-v4`: it combines the authoritative native words
+preparation uses `paizo-native-v5`: it combines the authoritative native words
 with the structural layout artifact to produce ordered blocks, active sections,
-and bounded quarantine records. Section text must be the exact normalized
+and bounded quarantine records. V5 deterministically recovers rule-bearing V4
+quarantine as exact native text with explicit layout flags; only page numbers,
+repeated furniture, contents/index, and credits/legal matter may remain as
+nonblocking quarantine. Section text must be the exact normalized
 projection of its blocks, and every native anchor must occur exactly once in an
 active block, quarantine record, or constrained ignore. Dense native stat-block
 text omitted by the layout model is ordered by native PDF geometry between the
@@ -205,7 +208,7 @@ network or SQLite write path exists.
 The five source products have explicit, independent era metadata: `PZO2101` is
 legacy/pre-Remaster, while `PZO12001` through `PZO12004` are the current
 post-Remaster set. License never determines era. `prepare` stages all five
-selected combined PDFs through `paizo-native-v4` plus a source-bound layout
+selected combined PDFs through `paizo-native-v5` plus a source-bound layout
 artifact in a fresh sibling workspace. One GPU session is reused across all
 five books. It validates complete native-anchor coverage, block/text equality,
 privacy, bounded quarantine, structural metrics, and aggregate general-rule
@@ -217,6 +220,16 @@ Terra confirmation, and any disagreement or overlapping approved group fails
 closed as `needs-maintainer`. After a repair, exact unchanged no-merge decisions
 carry into the sibling parser run and layout review repeats to a fixed point
 before screening may begin.
+The V5 history gate compares repaired structure against the V4 active records
+plus the exact V4 rule-bearing quarantine being recovered; it also requires an
+identical native inventory, zero remaining rule-bearing quarantine, and a lower
+per-product quarantine ratio. This avoids treating newly active exact text as a
+regression merely because V4 had hidden those anchors in quarantine.
+Parser activation and semantic scheduling are separate. All five trusted runs
+remain active and auditable, while a persistent product scope may hold a book
+without deleting its sections, duplicate mappings, decisions, or review history.
+Queue claims, pilots, completion checks, and public projection use only enabled
+products. A scoped base records its exact covered-product list and digest.
 
 ```bash
 # These admin artifacts remain below ignored .local-corpus/ paths.
@@ -224,6 +237,18 @@ scripts/licensed-corpus-runner.py prepare \
   .local-corpus/licensed-review.sqlite3 .local-corpus/sources
 scripts/licensed-corpus-runner.py status .local-corpus/licensed-review.sqlite3
 scripts/licensed-corpus-runner.py quality .local-corpus/licensed-review.sqlite3
+# Enable the four Remaster books while retaining legacy PZO2101 on hold.
+scripts/licensed-corpus-runner.py set-scope .local-corpus/licensed-review.sqlite3 \
+  --include PZO12001 --include PZO12002 --include PZO12003 --include PZO12004 \
+  --held-reason legacy-study
+# Prepare deterministic duplicate/Foundry evidence without starting Codex.
+scripts/licensed-corpus-runner.py prepare-review \
+  .local-corpus/licensed-review.sqlite3 \
+  --foundry-database /path/to/validated-clean.db
+# Serialize and size the exact future Spark envelopes without claims or writes.
+scripts/licensed-corpus-runner.py preview \
+  .local-corpus/licensed-review.sqlite3 --queue screen \
+  --foundry-database /path/to/validated-clean.db
 # Compare explicit historical and candidate parser-run selections when needed.
 # scripts/licensed-corpus-runner.py compare-quality WORKSPACE \
 #   --baseline-runs baseline.json --candidate-runs candidate.json
@@ -238,16 +263,18 @@ scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
 # Drain layout review/repairs to a fixed point, then stop before screening.
 scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
   --queue layout --sources .local-corpus/sources
-# After layout review is terminal, screen one batch from each of the five books.
+# After layout review is terminal, screen one batch from each enabled book.
 scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
-  --queue screen --pilot
+  --queue screen --pilot --foundry-database /path/to/validated-clean.db
 scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
   --sources .local-corpus/sources --foundry-database /path/to/validated-clean.db
 scripts/licensed-corpus-runner.py verify \
-  .local-corpus/licensed-review.sqlite3 --complete
+  .local-corpus/licensed-review.sqlite3 --complete \
+  --foundry-database /path/to/validated-clean.db
 scripts/licensed-corpus-runner.py build-base \
   .local-corpus/licensed-review.sqlite3 \
-  .local-corpus/licensed_core.sqlite3 /path/to/reviewed-notices.json
+  .local-corpus/licensed_core.sqlite3 /path/to/reviewed-notices.json \
+  --foundry-database /path/to/validated-clean.db
 ```
 
 Bulk screening uses Spark; Luna handles ordinary classification and review;
@@ -257,8 +284,18 @@ and reviewers and rotate after four batches, 256 KiB of evidence, or any
 model/prompt/schema/policy/CLI change. AON searches run outside Codex through a
 rate-limited cache and retain only status, title, and URL; no match or failure
 is inconclusive. Pilot mode processes at most one selected-queue batch per
-catalog product and refuses to screen while the active parser run has unresolved
+enabled product and refuses to screen while the active parser run has unresolved
 stitch work.
+An exhausted Codex model quota is recorded as sanitized `model-usage-limit`
+metadata and stops after one attempt; the runner never silently substitutes a
+different, more expensive model.
+Before screening, exact normalized PDF duplicates are grouped within one
+license and rules era; only the canonical occurrence enters semantic queues and
+all shadow occurrences remain as source provenance. A vector-free snapshot of
+the validated clean Foundry database supplies up to three deterministic
+same-era/same-license matches to Spark. Confirmed complete coverage is retained
+as a revalidated proof and required Foundry-row contract; uncertainty and stale
+rows fail open into ordinary review.
 Rejected screening records remain in the private workspace with their source
 section, decision, and provenance. They are excluded from the public projection,
 not deleted. Decisions are append-only, so an explicit maintainer reopen records
@@ -267,10 +304,18 @@ source carries exact unchanged terminal decisions into the new scope; changed,
 deferred, or reopened sections return to review while the retired run remains
 available for audit or later reconsideration.
 
+The model-independent base uses schema v3. It stores one canonical
+`licensed_rules` row per approved public rule, every occurrence in
+`licensed_rule_sources`, and any Foundry dependency in
+`required_foundry_rows`, plus the ordered covered-product scope and digest. It
+contains no embeddings, FTS, Foundry text, private
+paths, prompts, or source-PDF hashes, and the runner requires two byte-identical
+builds before activation of the ignored artifact.
+
 ```bash
 scripts/licensed-corpus-runner.py reopen-screening \
-  .local-corpus/licensed-review.sqlite3 SECTION_KEY MAINTAINER \
-  parser-quality
+  .local-corpus/licensed-review.sqlite3 SECTION_KEY \
+  --maintainer MAINTAINER --reason parser-quality
 ```
 `build-base` stops at a validated, model-independent ignored
 SQLite artifact. `promote-base` is a separate explicit command; embedding DB

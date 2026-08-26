@@ -29,7 +29,21 @@ QUALITY_AUDIT_VERSION = "corpus-quality-v1"
 # caller or logged by a CLI wrapper.
 _ORDER_CONFLICT_FLAG = "layout-order-conflict"
 _UNCLASSIFIED_FLAG = "unclassified-native-coverage"
-_UNRESOLVED_TABLE_FLAGS = {"table-ambiguous", "layout-model-table"}
+# ``table-ambiguous`` is V5's exact-native-text recovery path. It is active
+# review work and is forced through mixed extraction plus independent review;
+# unlike the older ``layout-model-table`` flag, it does not represent missing
+# or unresolved source coverage.
+_UNRESOLVED_TABLE_FLAGS = {"layout-model-table"}
+_RULE_BEARING_QUARANTINE_REASONS = frozenset({
+    "unresolved-table",
+    "unbound-layout",
+    "heading-artifact",
+    "unresolved-continuation",
+    "unresolved-layout",
+    "layout-order-conflict",
+    "oversize-block",
+    "other",
+})
 _QUARANTINE_REASONS = frozenset(
     {
         "repeated-furniture",
@@ -819,6 +833,109 @@ def compare_quality(baseline: QualityReport, candidate: QualityReport) -> Qualit
     return QualityComparison(baseline.digest, candidate.digest, passed, gates)
 
 
+def compare_repair_quality(
+    baseline: QualityReport, candidate: QualityReport
+) -> QualityComparison:
+    """Compare V5 repair output with V4 using conserved structural units.
+
+    V4 quarantines rule-bearing anchors while V5 makes their exact native text
+    active with review flags. Comparing active flags or fragments alone would
+    therefore call recovered content a regression. Bound each candidate metric
+    by the corresponding V4 active metric plus the V4 quarantine records that
+    could legitimately move into it, and require all rule-bearing quarantine to
+    disappear from V5.
+    """
+    baseline_by_product = {row.product_code: row for row in baseline.products}
+    candidate_by_product = {row.product_code: row for row in candidate.products}
+    products = sorted(set(baseline_by_product) | set(candidate_by_product))
+    gates: dict[str, object] = {}
+    passed = True
+
+    def record_gate(name: str, product: str, before: object, after: object, ok: bool) -> None:
+        nonlocal passed
+        group = gates.setdefault(name, {})
+        assert isinstance(group, dict)
+        group[product] = {"baseline": before, "candidate": after, "passed": ok}
+        passed &= ok
+
+    for product in products:
+        before = baseline_by_product.get(product)
+        after = candidate_by_product.get(product)
+        if before is None or after is None:
+            for name in (
+                "anchor_inventory", "rule_bearing_quarantine", "quarantine_ratio",
+                "section_recovery", "layout_conflicts", "sentence_headings",
+                "short_fragments",
+            ):
+                record_gate(name, product, before is not None, after is not None, False)
+            continue
+        rule_bearing = sum(
+            int(before.quarantine_by_reason.get(reason, 0))
+            for reason in _RULE_BEARING_QUARANTINE_REASONS
+        )
+        remaining_rule_bearing = sum(
+            int(after.quarantine_by_reason.get(reason, 0))
+            for reason in _RULE_BEARING_QUARANTINE_REASONS
+        )
+        record_gate(
+            "anchor_inventory", product, before.expected_anchor_count,
+            after.expected_anchor_count,
+            before.expected_anchor_count == after.expected_anchor_count,
+        )
+        record_gate(
+            "rule_bearing_quarantine", product, rule_bearing,
+            remaining_rule_bearing, remaining_rule_bearing == 0,
+        )
+        ratio_ok = (
+            isinstance(before.quarantine_anchor_ratio, float)
+            and isinstance(after.quarantine_anchor_ratio, float)
+            and after.quarantine_anchor_ratio <= before.quarantine_anchor_ratio
+        )
+        record_gate(
+            "quarantine_ratio", product, before.quarantine_anchor_ratio,
+            after.quarantine_anchor_ratio, ratio_ok,
+        )
+        record_gate(
+            "section_recovery", product, before.section_count, after.section_count,
+            before.section_count <= after.section_count <= before.section_count + rule_bearing,
+        )
+        conflict_limit = (
+            before.layout_order_conflict_count
+            + int(before.quarantine_by_reason.get("layout-order-conflict", 0))
+        )
+        record_gate(
+            "layout_conflicts", product, conflict_limit,
+            after.layout_order_conflict_count,
+            after.layout_order_conflict_count <= conflict_limit,
+        )
+        sentence_limit = (
+            before.sentence_like_heading_count
+            + int(before.quarantine_by_reason.get("heading-artifact", 0))
+        )
+        record_gate(
+            "sentence_headings", product, sentence_limit,
+            after.sentence_like_heading_count,
+            after.sentence_like_heading_count <= sentence_limit,
+        )
+        short_limit = before.short_under_40_count + rule_bearing
+        record_gate(
+            "short_fragments", product, short_limit, after.short_under_40_count,
+            after.short_under_40_count <= short_limit,
+        )
+
+    candidate_validation = validate_quality(candidate)
+    hard_checks = {
+        "product_set_unchanged": set(baseline.selected_runs) == set(candidate.selected_runs),
+        **{
+            f"candidate_{name}": bool(value)
+            for name, value in candidate_validation["checks"].items()
+        },
+    }
+    gates["hard_checks"] = hard_checks
+    passed &= all(hard_checks.values())
+    return QualityComparison(baseline.digest, candidate.digest, passed, gates)
+
+
 def compare_workspaces(
     baseline_workspace: Path | str,
     candidate_workspace: Path | str,
@@ -840,6 +957,7 @@ __all__ = [
     "QualityReport",
     "audit_workspace",
     "compare_quality",
+    "compare_repair_quality",
     "compare_workspaces",
     "validate_quality",
 ]
