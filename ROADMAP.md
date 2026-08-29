@@ -85,6 +85,10 @@ Ordered by impact. Check items off as completed.
     without changing the PDF text or coverage inventory. The one-time exporter
     has an isolated, upgradeable PEP 723 lock because the layout checkpoint
     needs Transformers 5 while the embedding exporter remains on Transformers 4.
+  - Evaluation prepared: a manual, one-model-at-a-time specialist vision round
+    will compare PaddleOCR-VL table crops, GLM-OCR corroboration, and bounded
+    Qwen candidate selection against V5. Native words remain authoritative;
+    no OCR text or generated geometry may enter the corpus.
   - Implemented: audited model-independent base build with zero-unresolved-work,
     privacy, manifest/hash, provenance, notice, SQLite, and deterministic
     repeat-build gates. Promotion to the tracked projection is a separate

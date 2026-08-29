@@ -144,6 +144,9 @@ anchors and may add review/stitch flags, but cannot replace, rewrite, omit, or
 certify the native text inventory. Automatic provider selection is GPU-first
 and refuses an accidental CPU-only runtime on supported GPU hardware; CPU is
 available only on hardware without a supported GPU or by explicit request.
+Manual OCR/VLM findings and the next content-free qualification round are in
+[Private PDF vision evaluation](docs/private-vision-evaluation.md). They remain
+exploratory: native words and anchors are still authoritative.
 
 For a manual pip/uv installation, install the optional extraction dependency.
 The Arch package already includes it. Then inspect discovery and build or
