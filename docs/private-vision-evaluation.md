@@ -137,8 +137,15 @@ Model adapters must remain separate:
 | PP-DocLayoutV3 | Primary deterministic region proposals | Boxes/order only; bind native anchors |
 | PaddleOCR-VL 1.6 | First table/crop structure witness | Native task label; OTSL/Markdown; temperature 0 |
 | GLM-OCR | Independent table/crop witness | Exact task labels; HTML/text; deterministic sampling; no reasoning parser |
-| Qwen3.8-27B Q4 | Select bounded order/attachment candidates | Return candidate IDs, never coordinates or transcription |
-| Luna/Terra | Later semantic/license review | Consume repaired native text only; outside this layout round |
+| Qwen3.8-27B Q4 | Local vision-capable generalist parallel to Luna | Judge bounded candidates and later semantic evidence; never act as OCR |
+| Luna | Hosted generalist baseline | Receive the same image/native/candidate packet as Qwen |
+| Terra | Difficult semantic or extraction escalation | Review disagreement or genuinely mixed mechanics |
+
+The longer-term comparison is therefore Qwen versus Luna, not Qwen versus the
+OCR specialists. After layout evidence is repaired, both generalists should
+also be evaluated on the actual workflow decisions: retained/excluded/mixed
+classification and bounded Foundry-coverage judgments. Paddle or GLM output is
+input evidence to that comparison and never the semantic answer.
 
 For GLM-OCR, the documented deterministic profile is temperature 0,
 `top_p=0.00001`, `top_k=1`, repetition penalty 1.1, and an 8,192-token output
@@ -148,9 +155,240 @@ PEG parsing. Paddle's official llama.cpp example also uses temperature 0.
 
 ## Round 2: manual protocol
 
-Round 2 answers whether specialist crops and bounded candidate selection improve
-the existing V5 parser enough to justify integration. It does not review
-licensing, mutate the private review database, or build a public base.
+Round 2 answers whether specialist crops and bounded generalist judgment improve
+the existing V5 parser enough to justify integration. Qwen is not an OCR model:
+it is evaluated as a smaller local alternative to Luna. Where a visual judgment
+is needed, Qwen and Luna should receive the same image, authoritative native
+text, deterministic candidates, and output contract. Terra remains escalation.
+This round does not mutate the private review database or build a public base.
+
+### Progress
+
+The first `table-simple` case is complete. It used a new crop rather than the
+single table from the exploratory round.
+
+| Run | Crop | Result | Native agreement | Completion tokens | Time | Total VRAM used after request |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| PaddleOCR-VL 1.6 | detector box plus 10-point context | heading as one merged row, then 10x2 table | 1.000 over expanded crop | 226 | 0.919 s | 4,190 MiB |
+| GLM-OCR | detector box plus 10-point context | 10x2 table; excluded the nearby heading | 1.000 over contained table words | 351 | 1.702 s | 5,236 MiB |
+| PaddleOCR-VL 1.6 | exact detector box | 10x2 table | 1.000 over 72 contained native words | 218 | 0.835 s | within the first Paddle envelope |
+
+The expanded-crop Paddle output was textually perfect but structurally wrong:
+it treated a nearby heading as a merged table row. Using the exact deterministic
+detector box removed that error. Text agreement by itself would therefore have
+selected the wrong structure. Exact detector boxes are now the default input to
+specialist recognizers; context margins must be a separately named candidate,
+never an implicit crop modification.
+
+GLM also established a local adapter requirement. With flash attention disabled,
+this llama.cpp build rejects a quantized V cache before accepting requests.
+GLM must use its F16 K/V cache profile; that setting is not shared with Paddle or
+Qwen. The failed load processed no image and left no model server running.
+
+No Qwen selection was needed because exact cropping left only one valid table
+structure. The review database was not opened for writes, and all model servers
+were stopped before advancing.
+
+The second `table-dense` case is also complete. It contained 190 native words
+(191 normalized tokens) across long prose-heavy cells.
+
+| Model | Structure | Native agreement | Completion tokens | Time | Total VRAM used after request |
+| --- | --- | ---: | ---: | ---: | ---: |
+| PaddleOCR-VL 1.6 | 7x2, no merged cells | 1.000; 191/191 tokens | 407 | 1.534 s | 4,254 MiB |
+| GLM-OCR | 7x2, no merged cells | 0.998; 187/191 tokens | 526 | 2.370 s | 5,291 MiB |
+
+Both models independently agreed on the structure, so Qwen was again skipped.
+Paddle is the stronger first recognizer on the two table cases so far; GLM is a
+useful independent structural witness but its generated text is less exact.
+This does not affect corpus text because reconstruction continues to use native
+anchors only.
+
+The first dense-image request exceeded the shell argument-size limit before it
+reached the model. Subsequent manual requests read base64 from a private
+temporary file instead of placing it in an argument. The empty-payload HTTP 500
+is a transport-construction failure and is not counted as a model result.
+
+The first generalist `heading-artifact` case is complete. V5 had promoted a
+small repeated trait label into the section heading. The bounded candidates
+were: A, keep the small label as the heading; B, use the larger title and treat
+the small label as a trait/category badge; or `none`.
+
+| Generalist | Mode | Repetitions | Decision | Completion tokens | Inference/wall time |
+| --- | --- | ---: | --- | ---: | ---: |
+| Qwen3.8-27B Q4 | documented xhigh thinking | 2 | B, high confidence | 570 / 620 | 40.833 / 41.454 s |
+| Qwen3.8-27B Q4 | documented non-thinking | 2 | B, high confidence | 35 / 27 | 4.444 / 3.930 s |
+| gpt-5.6-luna | schema-constrained Codex CLI | 1 | B, high confidence | 27 | 5.270 s wall |
+
+All five judgments agreed with the visual hierarchy and the known parser
+defect. The Qwen server's highest observed total VRAM use was 18,853 MiB, above
+the required free-reserve floor. Its cold load took approximately 79 seconds;
+that cost is process-scoped rather than per judgment.
+
+On this easy bounded case, Qwen thinking added no decision quality over
+non-thinking while increasing output and latency substantially. The provisional
+route is therefore local non-thinking Qwen for ordinary visual hierarchy,
+followed by thinking Qwen or Luna only for low confidence, instability, or a
+harder candidate set. This is not yet justified for semantic licensing or
+Foundry-coverage decisions; those require separate Qwen-versus-Luna tests.
+
+The Luna comparison used Codex CLI 0.149.1 in an ephemeral read-only invocation
+with the identical image, candidates, and output schema. It used 18,126 input
+tokens and produced 27 output tokens. No worker tools, source transcription, or
+review-database writes were permitted.
+
+Two read-only `foundry-coverage` cases then tested the actual corpus decision.
+The first candidate had complete lexical, trigram, and numeric coverage. The
+second was a plausible lexical overlap with token coverage 0.702, trigram
+coverage 0.683, and numeric coverage 0.4.
+
+| Case | Qwen non-thinking | Luna | Terra escalation |
+| --- | --- | --- | --- |
+| likely complete | `covered`, high; 31 output tokens | `covered`, high; 56 output tokens | not needed |
+| plausible partial | `additional-mechanics`, high; 27 output tokens | `covered`, high; 25 output tokens | `additional-mechanics`, high; 99 output tokens |
+
+Terra independently agreed with Qwen on the disputed partial candidate. Luna
+would therefore have created a false duplicate exclusion on this example. One
+case cannot rank the models generally, but it proves that Luna is a comparator,
+not ground truth, and that confidence does not make single-model exclusion safe.
+
+The workflow must fail open when Qwen and Luna disagree: the section stays in
+ordinary work as `ADD` or is deferred; it is never terminally rejected as a
+Foundry duplicate. The 0.4 numeric coverage also suggests a cheap deterministic
+guard: incomplete numeric/dice coverage should prevent terminal duplicate
+rejection before a model is called. That guard remains provisional until a
+stratified sample shows whether equivalent mechanics can produce legitimately
+different normalized numeric signatures.
+
+These semantic comparisons were ephemeral and schema-constrained. They read the
+private section and clean Foundry row without images, tools, or database writes;
+no source text or model output is retained after the content-free result is
+recorded here.
+
+### Stratified coverage qualification
+
+A subsequent read-only qualification sampled 20 active Remaster sections: five
+each from Player Core, GM Core, Monster Core, and Player Core 2. The deterministic
+strata contained two exact matches, four high-completeness signatures, four
+numeric gaps, four middling lexical matches, and six low or mismatched candidates.
+Qwen received four batches totaling about 39 KiB after current-snapshot candidate
+deduplication. The peak local server allocation remained within the established
+safe Q4 envelope.
+
+| Model | Reviewed | Covered | Additional mechanics | Uncertain |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.8-27B Q4, non-thinking | 20 | 13 | 7 | 0 |
+| Luna | 20 | 10 | 9 | 1 |
+| Terra escalation | 16 | 11 | 4 | 1 |
+
+Qwen and Luna disagreed on five of 20 sections. Terra reviewed every Qwen
+`covered` proposal, every disagreement, and a deterministic sample of Qwen
+`additional-mechanics` results. Terra rejected two of Qwen's 13 proposed
+coverage exclusions. Manual adjudication found both rejections substantive:
+one Foundry row omitted a mechanically significant rank even though the naive
+numeric coverage score was 1.0, and one private section contained text from an
+adjacent rule.
+
+A second manual check examined the three cases where Qwen and Terra agreed on
+coverage but Luna did not. It found a dangling incomplete section, a heading/body
+mismatch, and a heading-plus-page-number stub. The first two are unsafe inputs to
+coverage review; the last is non-rule material whose correct resolution is an
+intentional structural exclusion, not a Foundry duplicate proof. Agreement
+between Qwen and Terra is therefore insufficient until deterministic structural
+gates run first.
+
+The temporary evaluator initially joined retained candidates from both the
+active and an older Foundry snapshot, duplicating identical candidate IDs in its
+packets. Filtering to the active snapshot produced the same 20 private sections
+and the same unique candidate IDs, reducing 50 candidate rows to 25. No semantic
+call needs repetition, but this confirms that every evaluation path must reuse
+the production current-snapshot serializer rather than issuing an ad hoc join.
+
+The qualification does not justify draining the semantic queues yet. The next
+implementation should be deterministic and model-cheap:
+
+- Reject stale snapshots and collapse candidates by Foundry ID before packing.
+- Route dangling endings, heading/body incoherence, adjacent-rule contamination,
+  and page-number stubs through structural repair or intentional quarantine.
+- Replace set-like numeric coverage with an occurrence-aware signature that
+  retains the mechanic attached to each number, including condition ranks.
+- Let Qwen retain obvious additional mechanics cheaply. A `covered` judgment may
+  advance only after all deterministic gates pass and Terra independently agrees.
+- Treat Luna as a useful comparator during qualification, not as a production
+  authority or a mandatory third vote.
+
+Additional model sampling before those gates would mostly measure reactions to
+known-bad inputs. Repair and re-serialize first, then repeat a smaller stratified
+qualification against the exact production evidence path.
+
+### Gate-first prompt and evidence ablation
+
+A follow-up 16-case ablation separated prompt effects from evidence effects. It
+used four initially known structural defects, four exact Foundry identities, one
+known missing-mechanic case, three numeric-risk cases, and four ambiguous cases.
+After inspecting native blocks and bounded neighbors, five of the risk/ambiguous
+records were also demonstrably malformed. The adjudicated set therefore contained
+nine structural defects, four exact matches, one real missing condition rank, and
+two valid covered sections whose unmatched numbers were publication metadata or
+a page citation rather than mechanics.
+
+Every model received the same revised gate-first schema. It first had to classify
+the input as `valid`, `needs-layout`, or `insufficient-context`; coverage was
+permitted only for valid inputs. The prompt explicitly stated that a fragment is
+not covered merely because Foundry contains its complete version and that repeated
+numbers must be compared by mechanical role. Baseline packets contained the
+isolated native section and current-snapshot Foundry candidates. Enriched packets
+also contained bounded neighbors, native block boundaries, layout flags, numeric
+contexts, and a redacted structural crop for each of the four initially known
+layout cases.
+
+| Model | Evidence | Needs layout | Covered | Additional | Adjudicated errors |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Qwen3.8-27B Q4, non-thinking | baseline | 9 | 6 | 1 | 0 |
+| Qwen3.8-27B Q4, non-thinking | enriched | 7 | 7 | 2 | 3 |
+| Luna | baseline | 9 | 7 | 0 | 1 |
+| Luna | enriched | 8 | 6 | 2 | 1, fail-open |
+| Terra | baseline | 9 | 6 | 1 | 0 |
+| Terra | enriched | 9 | 6 | 1 | 0 |
+
+All three baseline runs caught all nine structural defects, including five that
+were not in the initial structural stratum, and accepted all four exact matches.
+The revised prompt and output space therefore explain much of the earlier failure:
+the previous coverage-only schema forced models to answer the wrong question.
+
+Terra was stable across evidence conditions and correctly handled the known
+condition-rank difference. Luna missed that difference in the baseline but fixed
+it with enrichment; one malformed input then moved to a valid fail-open addition.
+Qwen's baseline matched the adjudicated set, but enrichment made it mark two
+malformed inputs as valid additions and changed the known missing-mechanic case
+to an unsafe covered result. More evidence was not monotonically better.
+
+The enriched lane also cost roughly three times the input of the baseline in
+this deliberately unoptimized manual setup: Qwen used about 7.7k versus 23.7k
+prompt tokens, Luna 39.4k versus 125.8k input tokens, and Terra 43.4k versus
+136.2k input tokens. Per-image isolation repeats prompt scaffolding, so these
+are not production cost estimates, but the additional evidence produced no
+Terra decision change. A single Sol escalation over the three enriched model
+disagreements returned the adjudicated result for all three.
+
+The resulting workflow should keep repair and coverage separate:
+
+- Use deterministic checks plus a compact gate-first packet for initial routing.
+- Exact normalized identities remain deterministic and need no model.
+- Qwen may cheaply route obvious malformed or additional sections, but it must
+  not authorize coverage suppression.
+- Qwen routes structurally valid non-exact candidates with a compact baseline
+  packet. `additional-mechanics` remains included without another coverage call;
+  `covered` and `uncertain` advance to independent Sol confirmation.
+- Only Qwen and Sol agreement may suppress a non-exact PDF occurrence as covered
+  by Foundry. Sol disagreement fails open to ordinary retained work. Terra stays
+  reserved for mechanics-only extraction from genuinely mixed retained sections
+  and later rework, not routine coverage confirmation.
+- Neighbors, images, and specialist OCR belong to the layout-repair lane. After
+  repair, rebuild the section and return to the compact semantic packet instead
+  of carrying all repair evidence into coverage review.
+
+This ablation is small and intentionally difficult. It supports the routing and
+prompt design above; it does not establish a general model error rate.
 
 ### Cases
 
@@ -181,7 +419,8 @@ the comparison is complete.
    metrics, then stop the server and return VRAM to baseline.
 4. Run GLM on the same crop only when the case is a table, Paddle disagrees with
    native geometry, or an independent witness is needed. Stop it afterward.
-5. Run Qwen only when two or more deterministic candidates remain. Ask it to
+5. When two or more deterministic candidates remain, run Qwen as the local
+   generalist and compare it with Luna on the same bounded packet. Ask each to
    select one candidate ID or `none`; do not send a coordinate-generation task.
 6. Reconstruct text exclusively from native anchors under the selected
    structure. Verify every anchor occurs exactly once.
@@ -190,8 +429,9 @@ the comparison is complete.
 Paddle and GLM are deterministic single runs unless the output is malformed.
 Malformed output is a failure, not a reason to sample repeatedly. For Qwen,
 run two thinking and two non-thinking selections with each mode's documented
-sampling profile. Treat disagreement as unresolved; do not majority-vote it
-into a repair.
+sampling profile. Compare those results with one Luna judgment using identical
+evidence. Treat instability or Qwen/Luna disagreement as unresolved; do not
+majority-vote it into a repair.
 
 ### Content-free result record
 
