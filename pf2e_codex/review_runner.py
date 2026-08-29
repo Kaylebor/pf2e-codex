@@ -395,6 +395,19 @@ class _CodexProcessError(RuntimeError):
         self.retryable = retryable
 
 
+def _hosted_output_schema(value: object) -> object:
+    """Strip hosted-unsupported keywords while retaining local validation."""
+    if isinstance(value, dict):
+        return {
+            str(key): _hosted_output_schema(item)
+            for key, item in value.items()
+            if key != "uniqueItems"
+        }
+    if isinstance(value, list):
+        return [_hosted_output_schema(item) for item in value]
+    return value
+
+
 class CodexExecutor:
     """Schema-constrained noninteractive Codex process adapter."""
 
@@ -423,7 +436,7 @@ class CodexExecutor:
     ) -> CodexResult:
         schema_path = workdir / "output-schema.json"
         output_path = workdir / "last-message.json"
-        schema_path.write_text(_canonical(schema), encoding="utf-8")
+        schema_path.write_text(_canonical(_hosted_output_schema(schema)), encoding="utf-8")
         common = [
             "--model", model,
             "--ignore-user-config",
@@ -454,6 +467,8 @@ class CodexExecutor:
                 raise _CodexProcessError("model-usage-limit", retryable=False)
             if "authentication" in diagnostic or "not logged in" in diagnostic:
                 raise _CodexProcessError("authentication-required", retryable=False)
+            if "invalid_json_schema" in diagnostic:
+                raise _CodexProcessError("invalid-json-schema", retryable=False)
             raise _CodexProcessError(
                 f"codex-exit-{completed.returncode}", retryable=True
             )

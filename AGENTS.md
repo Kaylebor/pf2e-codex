@@ -285,6 +285,10 @@ schema-constrained noninteractive `codex exec` in an isolated read-only sandbox
 with user configuration ignored. The supervisor validates the exact submitted
 ID set before any mutation, retains content-free attempt/session audit rows,
 and retries transport/schema failures no more than three times.
+Hosted Codex structured outputs do not accept JSON Schema `uniqueItems`.
+Strip that keyword only from the hosted API schema and enforce it against the
+unchanged authoritative schema after the response; llama.cpp may continue to
+receive the full schema.
 The supervisor classifies a Codex model usage-limit response as a sanitized,
 non-retryable `model-usage-limit` transport failure. Never burn the remaining
 attempt budget on an unchanged quota block or silently substitute a more

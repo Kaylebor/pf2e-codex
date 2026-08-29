@@ -294,7 +294,16 @@ def test_codex_process_is_read_only_config_ignored_and_schema_constrained(
 
     monkeypatch.setattr("pf2e_codex.review_runner.subprocess.run", fake_run)
     executor = CodexExecutor()
-    schema = {"type": "object"}
+    schema = {
+        "type": "object",
+        "properties": {
+            "values": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": True,
+            }
+        },
+    }
     executor.execute(
         model="gpt-5.6-luna", prompt="bounded", schema=schema,
         workdir=tmp_path, thread_id=None,
@@ -310,6 +319,11 @@ def test_codex_process_is_read_only_config_ignored_and_schema_constrained(
         assert "--output-schema" in command
         assert "--json" in command
         assert "-o" in command
+        written_schema = json.loads(
+            Path(command[command.index("--output-schema") + 1]).read_text(encoding="utf-8")
+        )
+        assert "uniqueItems" not in written_schema["properties"]["values"]
+    assert schema["properties"]["values"]["uniqueItems"] is True
     assert commands[1][3:5] == ["exec", "resume"]
 
 
@@ -367,6 +381,29 @@ def test_codex_executor_classifies_usage_limit_without_exposing_output(
         )
 
     assert str(failure.value) == "model-usage-limit"
+    assert failure.value.retryable is False
+
+
+def test_codex_executor_classifies_invalid_hosted_schema_as_nonretryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "pf2e_codex.review_runner.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout='{"error":{"code":"invalid_json_schema"}}',
+            stderr="private diagnostic must not escape",
+        ),
+    )
+    executor = CodexExecutor()
+
+    with pytest.raises(_CodexProcessError) as failure:
+        executor.execute(
+            model="gpt-5.6-sol", prompt="bounded",
+            schema={"type": "object"}, workdir=tmp_path, thread_id=None,
+        )
+
+    assert str(failure.value) == "invalid-json-schema"
     assert failure.value.retryable is False
 
 
