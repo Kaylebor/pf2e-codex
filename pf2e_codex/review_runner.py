@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .corpus import (
     PAIZO_NATIVE_PARSER_V4,
@@ -48,8 +48,10 @@ from .licensed_corpus import (
     REVIEW_SCOPE_VERSION,
     _ensure_workspace_migrated,
     _foundry_coverage_evidence_for_snapshot,
+    _release_shard_if_complete,
     _review_scope_rows,
     _semantic_scope_sql,
+    _unauthorized_foundry_confirmation_count,
     activate_parser_run,
     build_public_corpus,
     claim_draft_screening_batch,
@@ -76,15 +78,15 @@ from .licensed_corpus import (
 from .licensed_coverage import NORMALIZER_VERSION, load_clean_foundry
 from .licensed_policy import LICENSED_CORE_POLICY_VERSION, licensed_policy_digest
 
-RUNNER_VERSION = "licensed-corpus-runner-v3"
-PROMPT_VERSION = "licensed-review-v2"
+RUNNER_VERSION = "licensed-corpus-runner-v4"
+PROMPT_VERSION = "licensed-review-v3"
+LOCAL_QWEN_QUEUE_MODEL = "local-qwen-gate"
 EXPECTED_PRODUCTS = ("PZO2101", "PZO12001", "PZO12002", "PZO12003", "PZO12004")
 MODEL_BY_QUEUE = {
     "stitch-select": "gpt-5.6-luna",
     "stitch-confirm": "gpt-5.6-terra",
-    "screen": "gpt-5.3-codex-spark",
-    "screen-deferred": "gpt-5.6-luna",
-    "screen-terra": "gpt-5.6-terra",
+    "screen": LOCAL_QWEN_QUEUE_MODEL,
+    "coverage-confirm": "gpt-5.6-sol",
     "classify": "gpt-5.6-luna",
     "extract": "gpt-5.6-terra",
     "review": "gpt-5.6-luna",
@@ -93,13 +95,14 @@ MODEL_BY_QUEUE = {
     "rework-sol": "gpt-5.6-sol",
 }
 MODEL_CAPS = {
-    "gpt-5.3-codex-spark": 4,
+    LOCAL_QWEN_QUEUE_MODEL: 1,
     "gpt-5.6-luna": 2,
     "gpt-5.6-terra": 2,
     "gpt-5.6-sol": 1,
 }
 MAX_BATCH_RECORDS = 32
 MAX_BATCH_BYTES = 64 * 1024
+MAX_LOCAL_RESPONSE_BYTES = 1024 * 1024
 MAX_RETRIES = 3
 SESSION_BATCH_LIMIT = 4
 SESSION_EVIDENCE_LIMIT = 256 * 1024
@@ -172,20 +175,43 @@ def _object_schema(item_properties: dict[str, object], required: Sequence[str]) 
 
 
 SCHEMAS: dict[str, dict[str, object]] = {
-    "screen": _object_schema(
+    "coverage-gate": _object_schema(
         {
             "id": {"type": "string"},
-            "decision": {"type": "string", "enum": ["add", "reject", "defer"]},
-            "reason": {
-                "type": ["string", "null"],
-                "enum": [None, "no-mechanics", "duplicate", "setting-prose", "layout", "scope", "complex-rule", "insufficient-context"],
+            "input_status": {
+                "type": "string",
+                "enum": ["valid", "needs-layout", "insufficient-context"],
+            },
+            "coverage": {
+                "type": "string",
+                "enum": ["covered", "additional-mechanics", "uncertain", "not-applicable"],
+            },
+            "issue_tags": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "heading-body-mismatch",
+                        "adjacent-contamination",
+                        "dangling-fragment",
+                        "page-number-stub",
+                        "table-order",
+                        "missing-context",
+                        "numeric-role-mismatch",
+                        "condition-rank-mismatch",
+                        "partial-mechanics",
+                        "other-structural",
+                    ],
+                },
+                "maxItems": 6,
+                "uniqueItems": True,
             },
             "foundry_ids": {
                 "type": "array", "items": {"type": "string"},
                 "maxItems": 3, "uniqueItems": True,
             },
         },
-        ("id", "decision", "reason", "foundry_ids"),
+        ("id", "input_status", "coverage", "issue_tags", "foundry_ids"),
     ),
     "classify": _object_schema(
         {
@@ -283,6 +309,9 @@ def validate_result_schema(results: Sequence[Mapping[str, Any]], schema: Mapping
                 item_type = rule.get("items", {}).get("type")
                 if item_type and any(not _matches_type(item, item_type) for item in value):
                     raise ResultSchemaError(f"worker result {name} has invalid items")
+                item_enum = rule.get("items", {}).get("enum")
+                if item_enum and any(item not in item_enum for item in value):
+                    raise ResultSchemaError(f"worker result {name} contains an unbounded item")
                 if rule.get("uniqueItems") and len(value) != len(set(value)):
                     raise ResultSchemaError(f"worker result {name} contains duplicate items")
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -449,6 +478,121 @@ class CodexExecutor:
         return CodexResult(payload, found_thread, usage, hashlib.sha256(encoded.encode()).hexdigest())
 
 
+class LocalQwenExecutor:
+    """Bounded llama.cpp OpenAI-compatible adapter for local coverage triage."""
+
+    def __init__(
+        self,
+        endpoint: str = "http://127.0.0.1:8081/v1/chat/completions",
+        *,
+        model: str = "qwen3.8-27b-q4-xl",
+        timeout: int = 600,
+        _opener: object | None = None,
+    ) -> None:
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Qwen endpoint must be an HTTP(S) chat-completions URL")
+        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Qwen endpoint must be loopback-local to protect private corpus text")
+        self.endpoint = endpoint
+        self.model = model
+        self.timeout = timeout
+        # Never let environment HTTP_PROXY settings relay purchased text.
+        self._opener = _opener or build_opener(ProxyHandler({}))
+
+    @property
+    def version(self) -> str:
+        # The endpoint is intentionally omitted from persisted audit metadata.
+        return f"llama.cpp-openai:{self.model}"
+
+    def execute(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        schema: Mapping[str, object],
+        workdir: Path,
+        thread_id: str | None,
+    ) -> CodexResult:
+        del workdir, thread_id
+        if model != LOCAL_QWEN_QUEUE_MODEL:
+            raise ValueError("local Qwen executor received a non-local queue model")
+        request = Request(
+            self.endpoint,
+            data=_canonical(
+                {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "min_p": 0,
+                    "presence_penalty": 1.5,
+                    "repeat_penalty": 1.0,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "max_tokens": 4096,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "licensed_corpus_results",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:  # type: ignore[attr-defined]
+                body = response.read(MAX_LOCAL_RESPONSE_BYTES + 1)
+                if len(body) > MAX_LOCAL_RESPONSE_BYTES:
+                    raise ResultSchemaError("local Qwen response exceeds the bounded limit")
+                envelope = json.loads(body.decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise _CodexProcessError("local-qwen-unavailable", retryable=True) from exc
+        try:
+            content = envelope["choices"][0]["message"]["content"]
+            payload = content if isinstance(content, dict) else json.loads(content)
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise ResultSchemaError("local Qwen returned a malformed response envelope") from exc
+        if not isinstance(payload, dict):
+            raise ResultSchemaError("local Qwen result must be a JSON object")
+        encoded = _canonical(payload)
+        usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+        return CodexResult(
+            payload=payload,
+            thread_id=None,
+            usage=usage,
+            result_hash=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        )
+
+
+class RoutedExecutor:
+    """Route local Qwen work locally and hosted review work through Codex CLI."""
+
+    def __init__(self, local: LocalQwenExecutor, hosted: CodexExecutor | None = None) -> None:
+        self.local = local
+        self.hosted = hosted or CodexExecutor()
+
+    def version_for(self, model: str) -> str:
+        return self.local.version if model == LOCAL_QWEN_QUEUE_MODEL else self.hosted.version
+
+    @property
+    def version(self) -> str:
+        return self.hosted.version
+
+    def execute(self, *, model: str, **kwargs: object) -> CodexResult:
+        target = self.local if model == LOCAL_QWEN_QUEUE_MODEL else self.hosted
+        return target.execute(model=model, **kwargs)
+
+
+def _executor_version(executor: object, model: str) -> str:
+    resolver = getattr(executor, "version_for", None)
+    return str(resolver(model)) if callable(resolver) else str(executor.version)  # type: ignore[attr-defined]
+
+
 def _schema_digest(schema: Mapping[str, object]) -> str:
     return _digest(_canonical(schema))
 
@@ -592,9 +736,8 @@ def _evidence_context(workspace: Path, workdir: Path, ids: Sequence[str], foundr
 
 def _worker_prompt(queue: str, records: Sequence[dict[str, Any]]) -> str:
     policies = {
-        "screen": "Return add for potentially redistributable mechanics, reject only clear non-mechanics/duplicates, and defer when the bounded reason applies. For a Foundry duplicate, reject only when the supplied Foundry rows jointly cover every mechanic and return only their supplied IDs; otherwise return an empty foundry_ids array. False negatives are worse than adds.",
-        "screen-deferred": "Resolve each deferred screen. Use supplied Foundry evidence when useful. A duplicate requires complete mechanical coverage and only supplied IDs. If still uncertain, return add with an empty foundry_ids array.",
-        "screen-terra": "Final complex-rule screen escalation. Use bounded evidence when useful. A duplicate requires complete mechanical coverage and only supplied IDs. If still uncertain, return defer with an empty foundry_ids array; the supervisor will conservatively retain it.",
+        "screen": "First validate the isolated PDF section. A fragment, heading/body mismatch, adjacent-rule contamination, or page-number stub is needs-layout, never covered merely because Foundry has a complete rule. For valid input, compare every mechanic, including repeated numbers by their mechanical role. Return covered only with the supplied Foundry IDs whose union is complete; return additional-mechanics when the PDF adds anything; use uncertain when the compact packet cannot decide. This triage never authorizes suppression.",
+        "coverage-confirm": "Independently judge the structurally valid PDF section against the supplied Foundry candidates. Do not rely on or infer any prior model vote. A fragment or structural defect is needs-layout. Return covered only when the selected supplied Foundry rows jointly preserve every mechanic, including condition ranks and repeated numbers by role. Otherwise return additional-mechanics or uncertain.",
         "classify": "Classify under mechanics-v1. PUBLIC_AS_IS means the whole supplied section is functional public mechanics; MIXED_NEEDS_EXTRACTION means mechanics must be reconstructed; exclusions and uncertainty produce no prose.",
         "extract": "Write concise mechanics-only text under mechanics-v1. Do not copy narrative, setting prose, examples, art captions, trademarks, or attribution. Preserve complete functional conditions and outcomes.",
         "review": "Independently review the candidate against the source and mechanics-v1. APPROVE only public text; REJECT only confirms EXCLUDE/UNCERTAIN; otherwise REVISE.",
@@ -626,7 +769,7 @@ def run_codex_batch(
     schema_name = schema_key or ("stitch" if queue.startswith("stitch") else "review" if queue.startswith("review") else queue)
     schema = SCHEMAS[schema_name]
     model = MODEL_BY_QUEUE[queue]
-    cli_version = executor.version
+    cli_version = _executor_version(executor, model)
     expected_ids = [str(record["id"]) for record in records]
     prompt = _worker_prompt(queue, records)
     input_digest = _digest(prompt)
@@ -758,12 +901,22 @@ def verify_workspace(
         ).fetchone()[0])
         unsafe_runner_metadata = 0
         for table in (
-            "runner_sessions", "runner_attempts", "runner_maintenance",
-            "runner_screen_escalations", "runner_screen_rejections",
-            "stitch_candidates", "stitch_votes", "stitch_claims", "aon_cache",
-            "duplicate_groups", "duplicate_group_members", "foundry_snapshots",
-            "foundry_snapshot_rows", "foundry_coverage_candidates",
-            "foundry_coverage_confirmations", "review_product_scope",
+            "runner_sessions",
+            "runner_attempts",
+            "runner_maintenance",
+            "runner_screen_rejections",
+            "stitch_candidates",
+            "stitch_votes",
+            "stitch_claims",
+            "aon_cache",
+            "duplicate_groups",
+            "duplicate_group_members",
+            "foundry_snapshots",
+            "foundry_snapshot_rows",
+            "foundry_coverage_candidates",
+            "foundry_coverage_confirmations",
+            "foundry_coverage_votes",
+            "review_product_scope",
         ):
             for row in conn.execute(f"SELECT * FROM {table}"):
                 encoded = _canonical(dict(row)).casefold()
@@ -818,6 +971,7 @@ def verify_workspace(
         active_snapshot = conn.execute(
             "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
         ).fetchone()
+        unauthorized_coverage = _unauthorized_foundry_confirmation_count(conn)
     scope = review_product_scope(path)
     errors: list[str] = []
     if integrity != "ok":
@@ -834,6 +988,8 @@ def verify_workspace(
         errors.append("product-scope-catalog")
     if unsafe_runner_metadata:
         errors.append("runner-metadata-privacy")
+    if unauthorized_coverage:
+        errors.append("unauthorized-foundry-coverage")
     for row in products:
         expected = PRODUCT_CATALOG[str(row["product_code"])]
         if row["era"] != expected.rules_era or row["license"] != expected.license:
@@ -1586,26 +1742,58 @@ def runner_status(workspace: Path | str) -> dict[str, Any]:
         coverage = {
             "normalizer_version": NORMALIZER_VERSION,
             "snapshot_digest": snapshot_digest,
-            "canonical_sections": int(conn.execute(
-                "SELECT COUNT(*) FROM duplicate_groups"
-            ).fetchone()[0]),
-            "shadow_duplicates": int(conn.execute(
-                "SELECT COUNT(*) FROM duplicate_group_members WHERE source_ordinal>0"
-            ).fetchone()[0]),
-            "foundry_candidates": int(conn.execute(
-                "SELECT COUNT(*) FROM foundry_coverage_candidates WHERE snapshot_digest=?",
-                (snapshot_digest,),
-            ).fetchone()[0]) if snapshot_digest else 0,
-            "confirmed_foundry": int(conn.execute(
-                "SELECT COUNT(*) FROM foundry_coverage_confirmations WHERE snapshot_digest=?",
-                (snapshot_digest,),
-            ).fetchone()[0]) if snapshot_digest else 0,
-            "stale_foundry": int(conn.execute(
-                "SELECT COUNT(*) FROM foundry_coverage_confirmations WHERE snapshot_digest<>?",
-                (snapshot_digest,),
-            ).fetchone()[0]) if snapshot_digest else int(conn.execute(
-                "SELECT COUNT(*) FROM foundry_coverage_confirmations"
-            ).fetchone()[0]),
+            "canonical_sections": int(
+                conn.execute("SELECT COUNT(*) FROM duplicate_groups").fetchone()[0]
+            ),
+            "shadow_duplicates": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM duplicate_group_members WHERE source_ordinal>0"
+                ).fetchone()[0]
+            ),
+            "foundry_candidates": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM foundry_coverage_candidates WHERE snapshot_digest=?",
+                    (snapshot_digest,),
+                ).fetchone()[0]
+            )
+            if snapshot_digest
+            else 0,
+            "confirmed_foundry": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM foundry_coverage_confirmations WHERE snapshot_digest=?",
+                    (snapshot_digest,),
+                ).fetchone()[0]
+            )
+            if snapshot_digest
+            else 0,
+            "qwen_triage": int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM foundry_coverage_votes
+                    WHERE snapshot_digest=? AND role='qwen-triage'""",
+                    (snapshot_digest,),
+                ).fetchone()[0]
+            )
+            if snapshot_digest
+            else 0,
+            "sol_confirmations": int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM foundry_coverage_votes
+                    WHERE snapshot_digest=? AND role='sol-confirm'""",
+                    (snapshot_digest,),
+                ).fetchone()[0]
+            )
+            if snapshot_digest
+            else 0,
+            "stale_foundry": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM foundry_coverage_confirmations WHERE snapshot_digest<>?",
+                    (snapshot_digest,),
+                ).fetchone()[0]
+            )
+            if snapshot_digest
+            else int(
+                conn.execute("SELECT COUNT(*) FROM foundry_coverage_confirmations").fetchone()[0]
+            ),
         }
         coverage["semantic_scope"] = {
             "canonical_sections": int(conn.execute(
@@ -1752,18 +1940,17 @@ def _screen_records_for_shard(
     shard_id: int,
     foundry_db: Path,
     *,
-    deferred: bool = False,
-    terra: bool = False,
+    mode: str = "ordinary",
     prepared_coverage: Mapping[str, list[dict[str, object]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Serialize exactly the eligible records from one screening shard."""
+    if mode not in {"ordinary", "coverage-confirm"}:
+        raise ValueError("unknown screening serialization mode")
     with _connect(workspace, readonly=True) as conn:
         all_rows = conn.execute(
             """SELECT s.section_key AS id, s.heading, s.source_text AS text,
                       s.page_start, s.page_end, s.layout_flags, r.era AS rules_era,
-                      d.decision AS current_decision, d.defer_reason,
-                      EXISTS(SELECT 1 FROM runner_screen_escalations e
-                             WHERE e.section_key=s.section_key) AS luna_attempted
+                      d.decision AS current_decision, d.defer_reason
                FROM source_sections AS s
                JOIN source_revisions AS r USING(product_code, content_fingerprint)
                LEFT JOIN draft_screening_current AS d
@@ -1781,12 +1968,8 @@ def _screen_records_for_shard(
         for index, row in enumerate(all_rows)
         if (
             row["current_decision"] is None
-            if not deferred
-            else (
-                row["current_decision"] == "DEFER"
-                and (bool(row["luna_attempted"]) if terra else not bool(row["luna_attempted"]))
-                and (not terra or row["defer_reason"] == "complex-rule")
-            )
+            if mode == "ordinary"
+            else row["current_decision"] == "DEFER" and row["defer_reason"] == "complex-rule"
         )
     ]
     coverage = prepared_coverage
@@ -1797,6 +1980,25 @@ def _screen_records_for_shard(
     for record in records:
         record["foundry_candidates"] = coverage.get(str(record["id"]), [])
     return records
+
+
+def _validate_coverage_gate_result(result: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    status = str(result["input_status"])
+    coverage = str(result["coverage"])
+    foundry_ids = [str(value) for value in result["foundry_ids"]]
+    supplied = {str(item["id"]) for item in record.get("foundry_candidates", [])}
+    if not set(foundry_ids).issubset(supplied):
+        raise ValueError("coverage result selected an unsupplied Foundry candidate")
+    if status != "valid":
+        if coverage != "not-applicable" or foundry_ids:
+            raise ValueError("invalid input must use not-applicable coverage without IDs")
+        return
+    if coverage == "not-applicable":
+        raise ValueError("valid input requires a coverage judgment")
+    if coverage == "covered" and not foundry_ids:
+        raise ValueError("covered input requires at least one supplied Foundry ID")
+    if coverage != "covered" and foundry_ids:
+        raise ValueError("only covered input may select Foundry IDs")
 
 
 def prepare_review_data(
@@ -1813,7 +2015,7 @@ def preview_screen_batches(
     workspace: Path | str,
     foundry_database: Path | str,
 ) -> dict[str, object]:
-    """Read-only preview of the exact ordinary Spark screening envelopes."""
+    """Read-only preview of the exact compact local-Qwen gate envelopes."""
     path = Path(workspace).expanduser().resolve()
     foundry = Path(foundry_database).expanduser().resolve()
     snapshot = load_clean_foundry(foundry)
@@ -2027,38 +2229,20 @@ def preview_screen_batches(
 
 
 def _process_screen(
-    workspace: Path, slot: int, foundry_db: Path | None, executor: CodexExecutor,
-    *, deferred: bool = False, terra: bool = False, product_code: str | None = None,
+    workspace: Path,
+    slot: int,
+    foundry_db: Path | None,
+    executor: CodexExecutor,
+    *,
+    product_code: str | None = None,
     pilot: bool = False,
 ) -> bool:
-    queue = "screen-terra" if terra else "screen-deferred" if deferred else "screen"
+    queue = "screen"
     worker = f"{queue}:{slot}" + (f":{product_code}" if product_code else "")
-    preferred_shard: int | None = None
-    if deferred:
-        with _connect(workspace, readonly=True) as conn:
-            eligibility = (
-                "d.defer_reason='complex-rule' AND EXISTS (SELECT 1 FROM runner_screen_escalations e WHERE e.section_key=s.section_key)"
-                if terra else
-                "NOT EXISTS (SELECT 1 FROM runner_screen_escalations e WHERE e.section_key=s.section_key)"
-            )
-            row = conn.execute(
-                f"""SELECT s.shard_id FROM source_sections AS s
-                    JOIN draft_screening_current AS d
-                      ON d.parser_run_id=s.parser_run_id AND d.section_key=s.section_key
-                    JOIN parser_runs AS p ON p.parser_run_id=s.parser_run_id
-                    WHERE p.state='active' AND p.review_enabled=1 AND d.decision='DEFER'
-                      AND {_semantic_scope_sql('p.product_code')}
-                      AND {eligibility}
-                    ORDER BY p.product_code, s.shard_id LIMIT 1"""
-            ).fetchone()
-            if row is None:
-                return False
-            preferred_shard = int(row[0])
     claim = claim_draft_screening_batch(
         workspace, worker, lease_seconds=LEASE_SECONDS,
         product_code=product_code,
-        preferred_shard_id=preferred_shard,
-        queue="deferred" if deferred else "unprocessed",
+        queue="unprocessed",
     )
     if claim is None:
         return False
@@ -2066,7 +2250,9 @@ def _process_screen(
     if foundry_db is None:
         raise ValueError("screening requires --foundry-database")
     records = _screen_records_for_shard(
-        workspace, shard_id, foundry_db, deferred=deferred, terra=terra,
+        workspace,
+        shard_id,
+        foundry_db,
     )
     try:
         if not records:
@@ -2086,50 +2272,188 @@ def _process_screen(
                 for record in records
             ]
         results = _run_packed(
-            workspace, queue=queue, slot=slot, records=prompt_records,
-            foundry_db=foundry_db, executor=executor, schema_key="screen",
+            workspace,
+            queue=queue,
+            slot=slot,
+            records=prompt_records,
+            foundry_db=foundry_db,
+            executor=executor,
+            schema_key="coverage-gate",
         )
-        defer_reasons = {"layout", "scope", "complex-rule", "insufficient-context"}
-        reject_reasons = {"no-mechanics", "duplicate", "setting-prose"}
+        valid_result_ids: set[str] = set()
         for result in results:
-            if result["decision"] == "defer" and result["reason"] not in defer_reasons:
-                raise ValueError("deferred screen result requires a bounded defer reason")
-            if result["decision"] == "reject" and result["reason"] not in reject_reasons:
-                raise ValueError("rejected screen result requires a bounded reject reason")
-            if result["decision"] == "add" and result["reason"] is not None:
-                raise ValueError("added screen result must not carry a reason")
-            foundry_ids = result["foundry_ids"]
-            if foundry_ids and not (
-                result["decision"] == "reject" and result["reason"] == "duplicate"
+            source_record = next(row for row in records if row["id"] == result["id"])
+            try:
+                _validate_coverage_gate_result(result, source_record)
+            except ValueError:
+                continue
+            valid_result_ids.add(str(result["id"]))
+        for result in results:
+            source_record = next(row for row in records if row["id"] == result["id"])
+            valid_result = str(result["id"]) in valid_result_ids
+            if (
+                valid_result
+                and result["input_status"] == "valid"
+                and result["coverage"] == "covered"
             ):
-                raise ValueError("Foundry IDs require a duplicate rejection")
-            source_record = next(row for row in records if row["id"] == result["id"])
-            supplied = {
-                str(item["id"]) for item in source_record.get("foundry_candidates", [])
-            }
-            if not set(foundry_ids).issubset(supplied):
-                raise ValueError("screen result selected an unsupplied Foundry candidate")
-        for result in results:
-            decision = str(result["decision"])
-            reason = result.get("reason")
-            source_record = next(row for row in records if row["id"] == result["id"])
-            if deferred and decision == "defer":
-                if not terra and source_record["defer_reason"] == "complex-rule":
-                    with _connect(workspace) as conn:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO runner_screen_escalations VALUES (?, ?, ?)",
-                            (result["id"], worker, int(time.time())),
-                        )
-                        conn.commit()
-                    continue
-                decision, reason = "add", None
-            defer_reason = reason if decision == "defer" else None
+                decision, defer_reason = "defer", "complex-rule"
+            else:
+                decision, defer_reason = "add", None
             submit_draft_screening_decision(
                 workspace, shard_id, worker,
                 next(int(row["_index"]) for row in records if row["id"] == result["id"]),
-                decision, defer_reason=defer_reason,
-                reject_reason=str(reason) if decision == "reject" else None,
-                foundry_ids=tuple(str(value) for value in result["foundry_ids"]),
+                decision,
+                defer_reason=defer_reason,
+                coverage_vote=(
+                    {
+                        "role": "qwen-triage",
+                        "input_status": result["input_status"],
+                        "coverage": result["coverage"],
+                        "issue_tags": result["issue_tags"],
+                        "foundry_ids": result["foundry_ids"],
+                        "prompt_version": PROMPT_VERSION,
+                    }
+                    if valid_result
+                    else None
+                ),
+            )
+        release_draft_screening_batch(workspace, shard_id, worker)
+        return True
+    except BaseException:
+        release_draft_screening_batch(workspace, shard_id, worker)
+        raise
+
+
+def _process_coverage_confirm(
+    workspace: Path,
+    slot: int,
+    foundry_db: Path | None,
+    executor: CodexExecutor,
+) -> bool:
+    if foundry_db is None:
+        raise ValueError("coverage confirmation requires --foundry-database")
+    queue = "coverage-confirm"
+    worker = f"{queue}:{slot}"
+    with _connect(workspace, readonly=True) as conn:
+        row = conn.execute(
+            f"""SELECT section.shard_id
+                  FROM source_sections AS section
+                  JOIN parser_runs AS run ON run.parser_run_id=section.parser_run_id
+                  JOIN draft_screening_current AS screen
+                    ON screen.parser_run_id=section.parser_run_id
+                   AND screen.section_key=section.section_key
+                  JOIN metadata AS active ON active.key='active_foundry_snapshot'
+                  JOIN foundry_coverage_votes AS vote
+                    ON vote.section_key=section.section_key
+                   AND vote.snapshot_digest=active.value
+                   AND vote.role='qwen-triage'
+                   AND vote.input_status='valid' AND vote.coverage='covered'
+                 WHERE run.state='active' AND run.review_enabled=1
+                   AND {_semantic_scope_sql("run.product_code")}
+                   AND screen.decision='DEFER' AND screen.defer_reason='complex-rule'
+                 ORDER BY run.product_code, section.shard_id LIMIT 1"""
+        ).fetchone()
+    if row is None:
+        return False
+    shard_id = int(row[0])
+    claim = claim_draft_screening_batch(
+        workspace,
+        worker,
+        lease_seconds=LEASE_SECONDS,
+        preferred_shard_id=shard_id,
+        queue="deferred",
+    )
+    if claim is None:
+        return False
+    try:
+        all_records = _screen_records_for_shard(
+            workspace,
+            shard_id,
+            foundry_db,
+            mode="coverage-confirm",
+        )
+        with _connect(workspace, readonly=True) as conn:
+            snapshot = conn.execute(
+                "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+            ).fetchone()
+            eligible = {
+                str(item[0]): dict(item)
+                for item in conn.execute(
+                    """SELECT vote.section_key, vote.coverage AS qwen_coverage,
+                              vote.foundry_ids_json AS qwen_foundry_ids
+                         FROM foundry_coverage_votes AS vote
+                         JOIN draft_screening_current AS screen
+                           ON screen.section_key=vote.section_key
+                        WHERE vote.snapshot_digest=? AND vote.role='qwen-triage'
+                          AND vote.input_status='valid' AND vote.coverage='covered'
+                          AND screen.decision='DEFER'
+                          AND screen.defer_reason='complex-rule'""",
+                    (snapshot[0],),
+                )
+            }
+        records = [record for record in all_records if str(record["id"]) in eligible]
+        if not records:
+            release_draft_screening_batch(workspace, shard_id, worker)
+            return False
+        prompt_records = [
+            {key: value for key, value in record.items() if key not in {"_index", "defer_reason"}}
+            for record in records
+        ]
+        results = _run_packed(
+            workspace,
+            queue=queue,
+            slot=slot,
+            records=prompt_records,
+            foundry_db=foundry_db,
+            executor=executor,
+            schema_key="coverage-gate",
+        )
+        valid_result_ids: set[str] = set()
+        for result in results:
+            source_record = next(record for record in records if record["id"] == result["id"])
+            try:
+                _validate_coverage_gate_result(result, source_record)
+            except ValueError:
+                continue
+            valid_result_ids.add(str(result["id"]))
+        for result in results:
+            section_key = str(result["id"])
+            source_record = next(record for record in records if record["id"] == section_key)
+            qwen_coverage = str(eligible[section_key]["qwen_coverage"])
+            qwen_foundry_ids = sorted(
+                str(value)
+                for value in json.loads(str(eligible[section_key]["qwen_foundry_ids"]))
+            )
+            suppress = (
+                section_key in valid_result_ids
+                and qwen_coverage == "covered"
+                and result["input_status"] == "valid"
+                and result["coverage"] == "covered"
+                and sorted(str(value) for value in result["foundry_ids"])
+                == qwen_foundry_ids
+            )
+            submit_draft_screening_decision(
+                workspace,
+                shard_id,
+                worker,
+                int(source_record["_index"]),
+                "reject" if suppress else "add",
+                reject_reason="duplicate" if suppress else None,
+                foundry_ids=tuple(str(value) for value in result["foundry_ids"])
+                if suppress
+                else (),
+                coverage_vote=(
+                    {
+                        "role": "sol-confirm",
+                        "input_status": result["input_status"],
+                        "coverage": result["coverage"],
+                        "issue_tags": result["issue_tags"],
+                        "foundry_ids": result["foundry_ids"],
+                        "prompt_version": PROMPT_VERSION,
+                    }
+                    if section_key in valid_result_ids
+                    else None
+                ),
             )
         release_draft_screening_batch(workspace, shard_id, worker)
         return True
@@ -2185,6 +2509,13 @@ def _process_candidates(workspace: Path, slot: int, foundry_db: Path | None, exe
     if unresolved_screen is not None:
         return False
     worker = f"producer:{slot}"
+    with _connect(workspace) as conn:
+        for row in conn.execute(
+            "SELECT shard_id FROM review_shards WHERE claimant=?",
+            (worker,),
+        ):
+            _release_shard_if_complete(conn, int(row["shard_id"]))
+        conn.commit()
     claim = claim_shard(workspace, worker, lease_seconds=LEASE_SECONDS)
     if claim is None:
         with _connect(workspace, readonly=True) as conn:
@@ -2205,6 +2536,9 @@ def _process_candidates(workspace: Path, slot: int, foundry_db: Path | None, exe
     shard_id = int(claim["shard_id"])
     records = _candidate_records(workspace, shard_id, worker)
     if not records:
+        with _connect(workspace) as conn:
+            _release_shard_if_complete(conn, shard_id)
+            conn.commit()
         return False
     if claim["claim_mode"] == "rework":
         with _connect(workspace, readonly=True) as conn:
@@ -2481,10 +2815,14 @@ def _drain(
     def loop(slot: int) -> None:
         nonlocal processed
         while True:
-            if queue in {"screen", "screen-deferred", "screen-terra"}:
-                did_work = _process_screen(
-                    workspace, slot, foundry_db, executor,
-                    deferred=queue != "screen", terra=queue == "screen-terra",
+            if queue == "screen":
+                did_work = _process_screen(workspace, slot, foundry_db, executor)
+            elif queue == "coverage-confirm":
+                did_work = _process_coverage_confirm(
+                    workspace,
+                    slot,
+                    foundry_db,
+                    executor,
                 )
             elif queue == "classify":
                 did_work = _process_candidates(workspace, slot, foundry_db, executor)
@@ -2511,7 +2849,7 @@ def _screening_pilot(
     foundry_db: Path | None,
     executor: CodexExecutor,
 ) -> dict[str, Any]:
-    """Run exactly one ordinary Spark batch for every enabled product."""
+    """Run exactly one compact local-Qwen gate batch for every enabled product."""
     workers = max(1, min(concurrency, MODEL_CAPS[MODEL_BY_QUEUE["screen"]]))
     pending = list(review_product_scope(workspace)["enabled_products"])
     pending_lock = threading.Lock()
@@ -2866,15 +3204,19 @@ def run_queues(
     sources_root: Path | str | None = None,
     executor: CodexExecutor | None = None,
     pilot: bool = False,
+    qwen_endpoint: str = "http://127.0.0.1:8081/v1/chat/completions",
+    qwen_model: str = "qwen3.8-27b-q4-xl",
 ) -> dict[str, Any]:
     path = Path(workspace).expanduser().resolve()
     _ensure_workspace_migrated(path)
     if not 1 <= concurrency <= 4:
         raise ValueError("global concurrency must be between one and four")
     foundry = Path(foundry_database).expanduser().resolve() if foundry_database else None
-    process = executor or CodexExecutor()
+    process = executor or RoutedExecutor(
+        LocalQwenExecutor(qwen_endpoint, model=qwen_model), CodexExecutor()
+    )
     completed: dict[str, int] = {}
-    screen_queues = {"screen", "screen-deferred", "screen-terra"}
+    screen_queues = {"screen", "coverage-confirm"}
     if (queue == "all" or queue in screen_queues) and foundry is None:
         raise ValueError(f"{queue} requires --foundry-database")
     if pilot:
@@ -2945,8 +3287,10 @@ def run_queues(
         assert foundry is not None
         prepare_deterministic_review(path, foundry)
         completed["screen"] = _drain(path, "screen", concurrency, foundry, process)
-        completed["aon"] = sum(refresh_aon_cache(path).get(key, 0) for key in ("match", "no-match", "inconclusive"))
-        for name in ("screen-deferred", "screen-terra", "classify", "review"):
+        completed["aon"] = sum(
+            refresh_aon_cache(path).get(key, 0) for key in ("match", "no-match", "inconclusive")
+        )
+        for name in ("coverage-confirm", "classify", "review"):
             completed[name] = _drain(path, name, concurrency, foundry, process)
         # Reviews can create rework shards; iterate producer/reviewer queues to a fixed point.
         while True:
@@ -2962,7 +3306,14 @@ def run_queues(
     aliases = {"extract", "review-mixed", "rework-terra", "rework-sol"}
     if queue in aliases:
         raise ValueError(f"{queue} is routed internally; run classify or review")
-    if queue not in {"stitch-select", "stitch-confirm", "screen", "screen-deferred", "screen-terra", "classify", "review"}:
+    if queue not in {
+        "stitch-select",
+        "stitch-confirm",
+        "screen",
+        "coverage-confirm",
+        "classify",
+        "review",
+    }:
         raise ValueError("unknown runner queue")
     if queue in screen_queues:
         assert foundry is not None

@@ -44,23 +44,25 @@ Ordered by impact. Check items off as completed.
     regions, keeps exact anchor/text coverage, and exposes the fallback to
     classification/review rather than quarantining a third of Monster Core or
     forcing every partly recovered section through expensive extraction.
-  - Implemented: a parser-run-scoped quad-state screening queue. Parallel cheap
-    workers emit only `add`, `reject`, or `defer` with a bounded reason; deferred
-    records move to a separate senior-model queue. Exact duplicates collapse
-    deterministically, retries are idempotent, escalation provenance is
-    retained, and the private draft remains separate from publication
-    candidates and independent approval.
+  - Implemented: a parser-run-scoped screening queue with one local-Qwen gate.
+    Exact duplicates collapse deterministically; non-exact `covered` votes alone
+    advance to independent Sol confirmation, while additions, uncertainty,
+    malformed selections, and structural flags fail open into retained work.
+    Transactions bind votes to decisions, retries are idempotent, and the private
+    draft remains separate from publication candidates and approval.
   - Implemented: append-only screening decisions and explicit maintainer reopen.
     Rejections and their bounded reasons remain available for audit and later
     reconsideration; reopen adds history rather than deleting prior work.
   - Implemented: versioned exact PDF duplicate groups and deterministic clean
     Foundry coverage candidates. Canonical/shadow provenance is normalized,
-    Spark may confirm only supplied same-era/same-license rows, stale proofs
-    reopen fail-open, and no private normalized text is persisted.
+    Exact identities resolve deterministically; local Qwen may select only
+    supplied same-era/same-license rows, and only matching Qwen/Sol coverage
+    votes may suppress non-exact copies. Stale proofs reopen fail-open, and no
+    private normalized text is persisted.
   - Implemented: deterministic `licensed-corpus-runner` and claimed-ID-only
     evidence executable. The supervisor owns fresh five-PDF staging, bounded
     queue leases, 32-record/64-KiB packing, exact output schemas and ID sets,
-    retries, Spark/Luna/Terra/Sol routing, disjoint producer/reviewer sessions,
+    retries, local-Qwen/Luna/Terra/Sol routing, disjoint producer/reviewer sessions,
     session rotation, AON title/URL caching, and content-free audit metadata.
     A bounded pilot mode runs at most one selected-queue batch per enabled
     product and refuses to screen until the active layout queue is terminal.
@@ -69,7 +71,7 @@ Ordered by impact. Check items off as completed.
     pilots, completion, and schema-v3 public projection can target the four
     Remaster products and hold legacy without deleting work. `prepare-review`
     refreshes deterministic data without workers, and read-only `preview`
-    serializes and sizes the exact future Spark batches without claims.
+    serializes and sizes the exact future local-Qwen batches without claims.
   - Implemented: evidence-driven adjacent layout repair. Only consecutive full
     groups of two or three may merge; Luna selection requires independent Terra
     confirmation, the PDF is re-read, native anchors are revalidated exactly,

@@ -2,7 +2,7 @@
 
 The functions in this module never decide whether private text is publishable.
 They canonicalize exact duplicates and prepare bounded public Foundry candidates
-for the Spark screening judgment owned by :mod:`pf2e_codex.review_runner`.
+for the single local-Qwen coverage gate owned by :mod:`pf2e_codex.review_runner`.
 """
 
 from __future__ import annotations
@@ -24,12 +24,13 @@ from .distribution import audit_database_slot
 from .fetcher import extract_all_packs
 from .foundry_scope import REDISTRIBUTABLE_FOUNDRY_PUBLICATIONS, is_redistributable_foundry_entry
 
-NORMALIZER_VERSION = "licensed-coverage-v2"
+NORMALIZER_VERSION = "licensed-coverage-v4"
 MAX_FOUNDRY_CANDIDATES = 3
 _SNAPSHOT_CACHE: dict[tuple[str, int, int], FoundrySnapshot] = {}
 _SNAPSHOT_CACHE_LOCK = threading.Lock()
 
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_IDENTITY_TOKEN_RE = re.compile(r"[^\W_]+|[+\-*/×÷=<>≤≥%()\[\]{}]", re.UNICODE)
 _NUMBER_RE = re.compile(
     r"(?<!\w)(?:\d+d\d+(?:\s*[+-]\s*\d+)?|\d+(?:\.\d+)?(?:st|nd|rd|th)?)(?!\w)",
     re.IGNORECASE,
@@ -66,7 +67,9 @@ def normalize_rule_text(value: object) -> str:
         cleaned = _BOILERPLATE_RE.sub("", raw.strip())
         if cleaned:
             lines.append(cleaned)
-    return " ".join(_WORD_RE.findall(" ".join(lines).casefold()))
+    # Exact identity must retain mechanical operators. Dropping punctuation
+    # would make signed modifiers or grouped arithmetic indistinguishable.
+    return " ".join(_IDENTITY_TOKEN_RE.findall(" ".join(lines).casefold()))
 
 
 def normalized_hash(value: object, *, heading: bool = False) -> str:

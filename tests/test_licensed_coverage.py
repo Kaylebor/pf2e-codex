@@ -46,6 +46,15 @@ def test_normalization_preserves_mechanical_action_and_number_differences():
     assert normalize_rule_text("Deal 2d6 damage.") != normalize_rule_text(
         "Deal 3d6 damage."
     )
+    assert normalize_rule_text("Deal 1d6+2 damage.") != normalize_rule_text(
+        "Deal 1d6-2 damage."
+    )
+    assert normalize_rule_text("Gain a +2 bonus.") != normalize_rule_text(
+        "Take a -2 penalty."
+    )
+    assert normalize_rule_text("Deal 2 × (1d6 + 1) damage.") != normalize_rule_text(
+        "Deal 2 × 1d6 + 1 damage."
+    )
 
 
 def test_duplicate_identity_is_strict_about_heading_license_and_era():

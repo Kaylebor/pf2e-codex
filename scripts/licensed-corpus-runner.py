@@ -101,7 +101,18 @@ def main() -> None:
     run.add_argument("--foundry-database", type=Path)
     run.add_argument("--sources", type=Path)
     run.add_argument(
-        "--pilot", action="store_true",
+        "--qwen-endpoint",
+        default="http://127.0.0.1:8081/v1/chat/completions",
+        help="local llama.cpp OpenAI-compatible chat-completions endpoint",
+    )
+    run.add_argument(
+        "--qwen-model",
+        default="qwen3.8-27b-q4-xl",
+        help="model identifier sent only to the local llama.cpp endpoint",
+    )
+    run.add_argument(
+        "--pilot",
+        action="store_true",
         help="run at most one selected-queue batch per product; screening waits for layout",
     )
 
@@ -192,6 +203,8 @@ def main() -> None:
             args.workspace, queue=args.queue, concurrency=args.concurrency,
             foundry_database=args.foundry_database, sources_root=args.sources,
             pilot=args.pilot,
+            qwen_endpoint=args.qwen_endpoint,
+            qwen_model=args.qwen_model,
         )
     elif args.command == "verify":
         result = verify_workspace(

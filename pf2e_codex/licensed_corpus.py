@@ -35,7 +35,7 @@ from .licensed_coverage import (
 )
 from .licensed_policy import LICENSED_CORE_POLICY_VERSION, licensed_policy_digest
 
-REVIEW_SCHEMA_VERSION = 20
+REVIEW_SCHEMA_VERSION = 21
 PUBLIC_SCHEMA_VERSION = 3
 REVIEW_SCOPE_VERSION = "semantic-products-v1"
 POLICY_DECISIONS = {
@@ -164,11 +164,6 @@ CREATE TABLE IF NOT EXISTS runner_classifications (
 );
 CREATE INDEX IF NOT EXISTS runner_classifications_by_decision
     ON runner_classifications(parser_run_id, decision);
-CREATE TABLE IF NOT EXISTS runner_screen_escalations (
-    section_key TEXT PRIMARY KEY REFERENCES source_sections(section_key),
-    luna_worker TEXT NOT NULL,
-    attempted_at INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS runner_screen_rejections (
     section_key TEXT PRIMARY KEY REFERENCES source_sections(section_key),
     reason TEXT NOT NULL CHECK(reason IN ('no-mechanics', 'duplicate', 'setting-prose')),
@@ -271,6 +266,24 @@ CREATE TABLE IF NOT EXISTS foundry_coverage_confirmations (
 );
 CREATE INDEX IF NOT EXISTS foundry_confirmations_by_snapshot
     ON foundry_coverage_confirmations(snapshot_digest, section_key);
+CREATE TABLE IF NOT EXISTS foundry_coverage_votes (
+    section_key TEXT NOT NULL REFERENCES source_sections(section_key),
+    snapshot_digest TEXT NOT NULL REFERENCES foundry_snapshots(snapshot_digest),
+    role TEXT NOT NULL CHECK(role IN ('deterministic', 'qwen-triage', 'sol-confirm')),
+    input_status TEXT NOT NULL CHECK(input_status IN
+        ('valid', 'needs-layout', 'insufficient-context')),
+    coverage TEXT NOT NULL CHECK(coverage IN
+        ('covered', 'additional-mechanics', 'uncertain', 'not-applicable')),
+    issue_tags_json TEXT NOT NULL,
+    foundry_ids_json TEXT NOT NULL,
+    result_digest TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    decided_at INTEGER NOT NULL,
+    PRIMARY KEY(section_key, snapshot_digest, role)
+);
+CREATE INDEX IF NOT EXISTS foundry_coverage_votes_by_state
+    ON foundry_coverage_votes(snapshot_digest, role, input_status, coverage, section_key);
 """
 
 
@@ -809,11 +822,15 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
     candidate tables only. Version 12 binds every session and attempt to the
     exact Codex CLI version used by the supervisor. Version 13 records the
     Luna-to-Terra semantic escalation boundary for complex screening records.
-    Version 14 retains the bounded Spark rejection reason used by each
+    Version 14 retains the bounded screening rejection reason used by each
     deterministic EXCLUDE candidate. Version 15 adds database-backed stitch
     leases so concurrent selector/confirmer workers cannot claim one proposal.
     Version 16 replaces mutable screening rows with an append-only event log;
     legacy rows are copied once and a read-only latest-state view is derived.
+    Versions 17 through 20 add trusted V5 repair, product scope, deterministic
+    duplicate groups, and Foundry snapshots. Version 21 replaces the earlier
+    screening model ladder with one local-Qwen gate plus independent Sol
+    confirmation for non-exact suppression; legacy suppression proofs reopen.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1396,6 +1413,70 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
                 WHERE state='active' AND review_enabled=1""",
             (now,),
         )
+        if schema_row is not None and schema_row["value"] != str(REVIEW_SCHEMA_VERSION):
+            # Pre-v21 coverage proofs did not carry the deterministic-exact or
+            # independent local-Qwen/Sol contract. Keep their screening events,
+            # explicitly reopen affected sections, and discard only the derived
+            # suppression proof so it must be established on the new path.
+            legacy = conn.execute(
+                """SELECT current.parser_run_id, current.section_key
+                     FROM draft_screening_current AS current
+                     JOIN foundry_coverage_confirmations AS confirmation
+                       ON confirmation.section_key=current.section_key
+                    WHERE current.decision='REJECT'
+                      AND current.reject_reason='duplicate'
+                    ORDER BY current.parser_run_id, current.section_key"""
+            ).fetchall()
+            for row in legacy:
+                latest = _screening_latest_event(
+                    conn, str(row["parser_run_id"]), str(row["section_key"])
+                )
+                if latest is None:
+                    raise ValueError("legacy Foundry proof has no screening audit event")
+                conn.execute(
+                    """INSERT INTO draft_screening_events
+                       (parser_run_id, section_key, event_type, worker, decided_at,
+                        reopen_reason, supersedes_event_id)
+                       VALUES (?, ?, 'REOPEN', 'schema-v21-coverage-reset', ?,
+                               'scope-correction', ?)""",
+                    (
+                        row["parser_run_id"],
+                        row["section_key"],
+                        now,
+                        latest["event_id"],
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM runner_screen_rejections WHERE section_key=?",
+                    (row["section_key"],),
+                )
+            legacy_deferrals = conn.execute(
+                """SELECT parser_run_id, section_key
+                     FROM draft_screening_current
+                    WHERE decision='DEFER'
+                    ORDER BY parser_run_id, section_key"""
+            ).fetchall()
+            for row in legacy_deferrals:
+                latest = _screening_latest_event(
+                    conn, str(row["parser_run_id"]), str(row["section_key"])
+                )
+                if latest is None:
+                    raise ValueError("legacy deferred screen has no audit event")
+                conn.execute(
+                    """INSERT INTO draft_screening_events
+                       (parser_run_id, section_key, event_type, worker, decided_at,
+                        reopen_reason, supersedes_event_id)
+                       VALUES (?, ?, 'REOPEN', 'schema-v21-screen-reset', ?,
+                               'scope-correction', ?)""",
+                    (
+                        row["parser_run_id"],
+                        row["section_key"],
+                        now,
+                        latest["event_id"],
+                    ),
+                )
+            conn.execute("DELETE FROM foundry_coverage_confirmations")
+            conn.execute("DROP TABLE IF EXISTS runner_screen_escalations")
         if schema_row is None or schema_row["value"] != str(REVIEW_SCHEMA_VERSION):
             _repair_staged_native_coverage_digests(conn)
         if schema_row is None or schema_row["value"] != str(REVIEW_SCHEMA_VERSION):
@@ -1746,6 +1827,98 @@ def prepare_deterministic_review(
                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
             (snapshot.digest,),
         )
+        exact_confirmed = 0
+        for section_key, parser_run_id in conn.execute(
+            """SELECT candidate.section_key, section.parser_run_id
+                 FROM foundry_coverage_candidates AS candidate
+                 JOIN source_sections AS section ON section.section_key=candidate.section_key
+                 JOIN parser_runs AS run ON run.parser_run_id=section.parser_run_id
+                WHERE candidate.snapshot_digest=?
+                  AND run.state='active' AND run.review_enabled=1
+                  AND json_extract(candidate.metrics_json, '$.exact_identity')=1
+                GROUP BY candidate.section_key, section.parser_run_id
+                ORDER BY candidate.section_key""",
+            (snapshot.digest,),
+        ).fetchall():
+            existing = conn.execute(
+                """SELECT decision, reject_reason FROM draft_screening_current
+                    WHERE parser_run_id=? AND section_key=?""",
+                (parser_run_id, section_key),
+            ).fetchone()
+            already_exact = existing is not None and (
+                str(existing["decision"]) == "REJECT"
+                and str(existing["reject_reason"] or "") == "duplicate"
+            )
+            foundry_ids = [
+                str(item[0])
+                for item in conn.execute(
+                    """SELECT foundry_id FROM foundry_coverage_candidates
+                        WHERE section_key=? AND snapshot_digest=?
+                          AND json_extract(metrics_json, '$.exact_identity')=1
+                        ORDER BY candidate_rank, foundry_id""",
+                    (section_key, snapshot.digest),
+                )
+            ]
+            _store_foundry_coverage_vote(
+                conn,
+                section_key=str(section_key),
+                vote={
+                    "role": "deterministic",
+                    "input_status": "valid",
+                    "coverage": "covered",
+                    "issue_tags": [],
+                    "foundry_ids": foundry_ids,
+                    "prompt_version": "deterministic-exact-v1",
+                },
+                worker="deterministic-exact",
+                decided_at=now,
+                allow_deterministic=True,
+            )
+            _store_foundry_confirmation(
+                conn,
+                section_key=str(section_key),
+                foundry_ids=foundry_ids,
+                worker="deterministic-exact",
+                decided_at=now,
+            )
+            if existing is not None and not already_exact:
+                latest = _screening_latest_event(conn, str(parser_run_id), str(section_key))
+                if latest is None:
+                    raise ValueError("existing screening decision has no audit event")
+                cursor = conn.execute(
+                    """INSERT INTO draft_screening_events
+                       (parser_run_id, section_key, event_type, worker, decided_at,
+                        reopen_reason, supersedes_event_id)
+                       VALUES (?, ?, 'REOPEN', 'deterministic-exact', ?,
+                               'scope-correction', ?)""",
+                    (parser_run_id, section_key, now, latest["event_id"]),
+                )
+                supersedes = int(cursor.lastrowid)
+            else:
+                supersedes = None
+            if existing is None or not already_exact:
+                conn.execute(
+                    """INSERT INTO draft_screening_events
+                       (parser_run_id, section_key, event_type, requested_decision,
+                        decision, reject_reason, worker, decided_at, supersedes_event_id)
+                       VALUES (?, ?, 'DECISION', 'REJECT', 'REJECT', 'duplicate',
+                               'deterministic-exact', ?, ?)""",
+                    (parser_run_id, section_key, now, supersedes),
+                )
+            conn.execute(
+                """INSERT INTO runner_screen_rejections(section_key, reason, worker, decided_at)
+                   VALUES (?, 'duplicate', 'deterministic-exact', ?)
+                   ON CONFLICT(section_key) DO UPDATE SET
+                     reason=excluded.reason, worker=excluded.worker,
+                     decided_at=excluded.decided_at""",
+                (section_key, now),
+            )
+            exact_confirmed += 1
+        conn.execute(
+            """INSERT INTO metadata(key, value) VALUES ('active_foundry_snapshot', ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (snapshot.digest,),
+        )
         product_counts = []
         for product in sorted({str(row["product_code"]) for row in rows}):
             product_counts.append({
@@ -1813,6 +1986,7 @@ def prepare_deterministic_review(
             "shadow_duplicates": shadow_count,
             "canonical_sections": len(canonical_keys),
             "coverage_candidates": candidate_count,
+            "exact_foundry_confirmed": exact_confirmed,
             "stale_coverage_reopened": stale_reopened,
             "products": [
                 {
@@ -2154,7 +2328,19 @@ def initialize_trusted_workspace(workspace: Path | str) -> dict[str, int]:
 
 
 _PENDING_SECTION_SQL = f"""
-    NOT EXISTS (SELECT 1 FROM candidates AS c WHERE c.section_key = s.section_key)
+    (
+      NOT EXISTS (SELECT 1 FROM candidates AS c WHERE c.section_key = s.section_key)
+      AND NOT EXISTS (
+          SELECT 1 FROM duplicate_group_members AS member
+          WHERE member.section_key=s.section_key AND member.source_ordinal>0
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM foundry_coverage_confirmations AS coverage
+          JOIN metadata AS active ON active.key='active_foundry_snapshot'
+                                 AND active.value=coverage.snapshot_digest
+          WHERE coverage.section_key=s.section_key
+      )
+    )
     OR EXISTS (
         SELECT 1
         FROM candidates AS latest
@@ -2935,6 +3121,46 @@ def _store_foundry_confirmation(
     if len(candidates) != len(foundry_ids):
         raise ValueError("Foundry duplicate result selected an unsupplied or stale candidate")
     ordered_ids = sorted(foundry_ids)
+    exact_candidate_count = int(
+        conn.execute(
+            f"""SELECT COUNT(*) FROM foundry_coverage_candidates
+                 WHERE section_key=? AND snapshot_digest=?
+                   AND foundry_id IN ({placeholders})
+                   AND json_extract(metrics_json, '$.exact_identity')=1""",
+            (section_key, snapshot, *ordered_ids),
+        ).fetchone()[0]
+    )
+    votes = {
+        str(row["role"]): row
+        for row in conn.execute(
+            """SELECT role, input_status, coverage, foundry_ids_json
+                 FROM foundry_coverage_votes
+                WHERE section_key=? AND snapshot_digest=?""",
+            (section_key, snapshot),
+        )
+    }
+    deterministic = votes.get("deterministic")
+    deterministic_ok = (
+        deterministic is not None
+        and str(deterministic["input_status"]) == "valid"
+        and str(deterministic["coverage"]) == "covered"
+        and sorted(json.loads(str(deterministic["foundry_ids_json"]))) == ordered_ids
+        and exact_candidate_count == len(ordered_ids)
+    )
+    qwen = votes.get("qwen-triage")
+    sol = votes.get("sol-confirm")
+    independent_ok = all(
+        vote is not None
+        and str(vote["input_status"]) == "valid"
+        and str(vote["coverage"]) == "covered"
+        and sorted(json.loads(str(vote["foundry_ids_json"]))) == ordered_ids
+        for vote in (qwen, sol)
+    )
+    if not (deterministic_ok or independent_ok):
+        raise ValueError(
+            "Foundry duplicate confirmation requires deterministic exact identity "
+            "or matching local-Qwen and Sol coverage votes"
+        )
     proof_digest = _digest(
         "foundry-coverage-confirmation-v1", section_key, snapshot,
         _canonical_json(ordered_ids),
@@ -2953,6 +3179,155 @@ def _store_foundry_confirmation(
     return proof_digest
 
 
+def _unauthorized_foundry_confirmation_count(conn: sqlite3.Connection) -> int:
+    """Count suppression proofs that do not satisfy the current vote contract."""
+    return int(
+        conn.execute(
+            """SELECT COUNT(*) FROM foundry_coverage_confirmations AS confirmation
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM foundry_coverage_votes AS deterministic
+                    WHERE deterministic.section_key=confirmation.section_key
+                      AND deterministic.snapshot_digest=confirmation.snapshot_digest
+                      AND deterministic.role='deterministic'
+                      AND deterministic.input_status='valid'
+                      AND deterministic.coverage='covered'
+                      AND deterministic.foundry_ids_json=confirmation.foundry_ids_json
+                      AND NOT EXISTS (
+                          SELECT 1 FROM json_each(deterministic.foundry_ids_json) AS selected
+                          LEFT JOIN foundry_coverage_candidates AS candidate
+                            ON candidate.section_key=deterministic.section_key
+                           AND candidate.snapshot_digest=deterministic.snapshot_digest
+                           AND candidate.foundry_id=selected.value
+                         WHERE candidate.foundry_id IS NULL
+                            OR json_extract(candidate.metrics_json, '$.exact_identity')<>1
+                      )
+               ) AND NOT (
+                   EXISTS (
+                       SELECT 1 FROM foundry_coverage_votes AS qwen
+                        WHERE qwen.section_key=confirmation.section_key
+                          AND qwen.snapshot_digest=confirmation.snapshot_digest
+                          AND qwen.role='qwen-triage'
+                          AND qwen.input_status='valid' AND qwen.coverage='covered'
+                          AND qwen.foundry_ids_json=confirmation.foundry_ids_json
+                   ) AND EXISTS (
+                       SELECT 1 FROM foundry_coverage_votes AS sol
+                        WHERE sol.section_key=confirmation.section_key
+                          AND sol.snapshot_digest=confirmation.snapshot_digest
+                          AND sol.role='sol-confirm'
+                          AND sol.input_status='valid' AND sol.coverage='covered'
+                          AND sol.foundry_ids_json=confirmation.foundry_ids_json
+                   )
+               )"""
+        ).fetchone()[0]
+    )
+
+
+def _store_foundry_coverage_vote(
+    conn: sqlite3.Connection,
+    *,
+    section_key: str,
+    vote: Mapping[str, object],
+    worker: str,
+    decided_at: int,
+    allow_deterministic: bool = False,
+) -> str:
+    """Persist one bounded coverage vote inside its screening transaction."""
+    role = str(vote.get("role", ""))
+    input_status = str(vote.get("input_status", ""))
+    coverage = str(vote.get("coverage", ""))
+    issue_tags = vote.get("issue_tags")
+    raw_foundry_ids = vote.get("foundry_ids")
+    prompt_version = str(vote.get("prompt_version", ""))
+    if (
+        role not in {"deterministic", "qwen-triage", "sol-confirm"}
+        or input_status not in {"valid", "needs-layout", "insufficient-context"}
+        or coverage not in {"covered", "additional-mechanics", "uncertain", "not-applicable"}
+        or not isinstance(issue_tags, list)
+        or len(issue_tags) > 6
+        or any(not isinstance(value, str) or not value for value in issue_tags)
+        or not isinstance(raw_foundry_ids, list)
+        or len(raw_foundry_ids) > 3
+        or any(not isinstance(value, str) or not value for value in raw_foundry_ids)
+        or len(set(raw_foundry_ids)) != len(raw_foundry_ids)
+        or not prompt_version
+    ):
+        raise ValueError("coverage vote is malformed")
+    if role == "deterministic" and not allow_deterministic:
+        raise ValueError("deterministic coverage votes are supervisor-internal")
+    foundry_ids = sorted(raw_foundry_ids)
+    active = conn.execute(
+        "SELECT value FROM metadata WHERE key='active_foundry_snapshot'"
+    ).fetchone()
+    if active is None:
+        raise ValueError("coverage vote requires an active Foundry snapshot")
+    snapshot = str(active[0])
+    if foundry_ids:
+        placeholders = ",".join("?" for _ in foundry_ids)
+        supplied = int(
+            conn.execute(
+                f"""SELECT COUNT(*) FROM foundry_coverage_candidates
+                      WHERE section_key=? AND snapshot_digest=?
+                        AND foundry_id IN ({placeholders})""",
+                (section_key, snapshot, *foundry_ids),
+            ).fetchone()[0]
+        )
+        if supplied != len(foundry_ids):
+            raise ValueError("coverage vote selected an unsupplied or stale Foundry candidate")
+        if role == "deterministic":
+            exact = int(
+                conn.execute(
+                    f"""SELECT COUNT(*) FROM foundry_coverage_candidates
+                          WHERE section_key=? AND snapshot_digest=?
+                            AND foundry_id IN ({placeholders})
+                            AND json_extract(metrics_json, '$.exact_identity')=1""",
+                    (section_key, snapshot, *foundry_ids),
+                ).fetchone()[0]
+            )
+            if exact != len(foundry_ids):
+                raise ValueError("deterministic coverage requires exact-identity candidates")
+    result_digest = _digest(
+        "coverage-gate-v1",
+        _canonical_json(
+            {
+                "id": section_key,
+                "input_status": input_status,
+                "coverage": coverage,
+                "issue_tags": issue_tags,
+                "foundry_ids": foundry_ids,
+            }
+        ),
+    )
+    existing = conn.execute(
+        """SELECT result_digest FROM foundry_coverage_votes
+            WHERE section_key=? AND snapshot_digest=? AND role=?""",
+        (section_key, snapshot, role),
+    ).fetchone()
+    if existing is not None and str(existing[0]) != result_digest:
+        raise ValueError("coverage role already submitted a conflicting result")
+    conn.execute(
+        """INSERT INTO foundry_coverage_votes
+           (section_key, snapshot_digest, role, input_status, coverage,
+            issue_tags_json, foundry_ids_json, result_digest, worker,
+            prompt_version, decided_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(section_key, snapshot_digest, role) DO NOTHING""",
+        (
+            section_key,
+            snapshot,
+            role,
+            input_status,
+            coverage,
+            _canonical_json(issue_tags),
+            _canonical_json(foundry_ids),
+            result_digest,
+            worker,
+            prompt_version,
+            decided_at,
+        ),
+    )
+    return result_digest
+
+
 def submit_draft_screening_decision(
     workspace: Path | str,
     shard_id: int,
@@ -2963,6 +3338,7 @@ def submit_draft_screening_decision(
     defer_reason: str | None = None,
     reject_reason: str | None = None,
     foundry_ids: Sequence[str] = (),
+    coverage_vote: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Persist one quad-state decision or resolve one deferred decision."""
     requested = decision.upper()
@@ -3007,6 +3383,14 @@ def submit_draft_screening_decision(
         if index >= len(rows):
             raise ValueError(f"screening record index {index} is outside the batch")
         section = rows[index]
+        if coverage_vote is not None:
+            _store_foundry_coverage_vote(
+                conn,
+                section_key=str(section["section_key"]),
+                vote=coverage_vote,
+                worker=claimant,
+                decided_at=now,
+            )
         existing = conn.execute(
             """SELECT requested_decision, decision, duplicate_of_section_key,
                       defer_reason, deferred_by, deferred_at, worker, decided_at
@@ -5423,6 +5807,11 @@ def build_public_corpus(
         foundry_release = "none"
         snapshot_digest = "none"
         if active_snapshot is not None:
+            unauthorized = _unauthorized_foundry_confirmation_count(review)
+            if unauthorized:
+                raise ValueError(
+                    f"{unauthorized} Foundry suppression proofs lack current vote provenance"
+                )
             snapshot_digest = str(active_snapshot[0])
             snapshot_row = review.execute(
                 "SELECT pf2e_release FROM foundry_snapshots WHERE snapshot_digest=?",

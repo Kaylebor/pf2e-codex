@@ -248,7 +248,7 @@ scripts/licensed-corpus-runner.py set-scope .local-corpus/licensed-review.sqlite
 scripts/licensed-corpus-runner.py prepare-review \
   .local-corpus/licensed-review.sqlite3 \
   --foundry-database /path/to/validated-clean.db
-# Serialize and size the exact future Spark envelopes without claims or writes.
+# Serialize and size the exact future local-Qwen gate envelopes without claims or writes.
 scripts/licensed-corpus-runner.py preview \
   .local-corpus/licensed-review.sqlite3 --queue screen \
   --foundry-database /path/to/validated-clean.db
@@ -266,7 +266,9 @@ scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
 # Drain layout review/repairs to a fixed point, then stop before screening.
 scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
   --queue layout --sources .local-corpus/sources
-# After layout review is terminal, screen one batch from each enabled book.
+# After layout review is terminal, gate one compact batch from each enabled book.
+# The endpoint is a local llama.cpp OpenAI-compatible server; override its URL
+# or model identifier with --qwen-endpoint/--qwen-model when needed.
 scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
   --queue screen --pilot --foundry-database /path/to/validated-clean.db
 scripts/licensed-corpus-runner.py run .local-corpus/licensed-review.sqlite3 \
@@ -280,9 +282,15 @@ scripts/licensed-corpus-runner.py build-base \
   --foundry-database /path/to/validated-clean.db
 ```
 
-Bulk screening uses Spark; Luna handles ordinary classification and review;
-Terra handles mixed mechanics extraction, difficult review, and first rework;
-Sol is reserved for one final rework. Sessions are disjoint between producers
+Deterministic exact Foundry identities need no model. Local Qwen performs the
+compact gate-first structural and non-exact coverage triage through a
+loopback-only llama.cpp endpoint with its documented non-thinking profile, but cannot suppress
+a PDF rule. Additions, uncertainty, and residual layout/context flags fail open
+into retained ordinary work; only an independent Sol confirmation may
+turn a non-exact Qwen `covered` vote into a Foundry suppression proof. Luna
+handles ordinary classification and review; Terra handles mixed mechanics
+extraction, difficult review, and first rework; Sol also remains the final
+rework tier. Sessions are disjoint between producers
 and reviewers and rotate after four batches, 256 KiB of evidence, or any
 model/prompt/schema/policy/CLI change. AON searches run outside Codex through a
 rate-limited cache and retain only status, title, and URL; no match or failure
@@ -296,9 +304,11 @@ Before screening, exact normalized PDF duplicates are grouped within one
 license and rules era; only the canonical occurrence enters semantic queues and
 all shadow occurrences remain as source provenance. A vector-free snapshot of
 the validated clean Foundry database supplies up to three deterministic
-same-era/same-license matches to Spark. Confirmed complete coverage is retained
-as a revalidated proof and required Foundry-row contract; uncertainty and stale
-rows fail open into ordinary review.
+same-era/same-license matches to the compact local-Qwen gate. Exact identities
+are confirmed deterministically. Non-exact coverage requires matching Qwen and
+Sol `covered` judgments; disagreement, uncertainty, residual structural flags,
+and stale rows fail open into ordinary review. Images, neighbors, and OCR-derived structure stay in the
+separate local layout-repair lane and never replace authoritative native text.
 Rejected screening records remain in the private workspace with their source
 section, decision, and provenance. They are excluded from the public projection,
 not deleted. Decisions are append-only, so an explicit maintainer reopen records

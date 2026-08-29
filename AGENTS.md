@@ -259,9 +259,15 @@ heading/body pairs only within one license and rules era. The canonical
 occurrence is chosen by catalog order, page, stable identity, and section key;
 all shadow occurrences remain auditable provenance and reopen through the
 canonical group. A validated vector-free clean Foundry snapshot supplies at
-most three deterministic exact/lexical candidates to Spark. Only supplied,
-same-era, same-license rows may confirm complete coverage; stale or malformed
-proofs fail open into ordinary screening. The public builder repeats duplicate
+most three deterministic exact/lexical candidates. Exact normalized identities
+are suppressed deterministically. Local Qwen then performs a compact gate-first
+triage for non-exact candidates through a loopback-only llama.cpp endpoint using
+the model's documented non-thinking sampling profile. It cannot authorize suppression: only matching
+Qwen and independent Sol `covered` judgments may create the final Foundry proof.
+Qwen additions, model disagreement, uncertainty, stale evidence, malformed IDs,
+and residual layout/context flags fail open into retained ordinary work. Images,
+neighbors, and OCR-derived structure never enter the compact coverage packet or
+replace authoritative native text. The public builder repeats duplicate
 normalization over approved public text and emits one rule with all source
 occurrences.
 
@@ -303,9 +309,11 @@ status/title/URL, and treat no-match/failure as inconclusive.
 
 Keep candidate-producer and reviewer session pools disjoint. Rotate a session
 after four completed batches, 256 KiB of submitted evidence, or any CLI,
-model, prompt, schema, or policy change. Spark screens; Luna classifies and
-reviews ordinary work; Terra extracts mixed mechanics and performs first
-rework; Sol is the one final rework tier. Exhaustion, stitch disagreement, or
+model, prompt, schema, or policy change. Local Qwen performs compact gate-first
+triage, Sol independently confirms non-exact suppression proposals, Luna
+classifies and reviews ordinary work, and Terra extracts mixed mechanics and
+performs first rework. Sol is also the one final rework tier. Exhaustion,
+stitch disagreement, or
 overlapping approved stitch groups must create `needs-maintainer` and block the
 base build. Use `inspect-maintainer` for the bounded private evidence and
 `resolve-maintainer` for the explicit decision; do not put private source text
