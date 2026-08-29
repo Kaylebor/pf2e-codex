@@ -7,6 +7,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1577,6 +1578,25 @@ def test_v21_migration_reopens_legacy_foundry_proof(tmp_path: Path):
     )
     with sqlite3.connect(workspace) as conn:
         conn.execute("DELETE FROM foundry_coverage_votes")
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO runner_sessions
+               (queue_name, slot, role, model, cli_version, thread_id,
+                prompt_digest, schema_digest, policy_digest, completed_batches,
+                submitted_evidence_bytes, created_at, updated_at)
+               VALUES ('screen', 0, 'producer', 'obsolete-screen-model', 'test', NULL,
+                       'prompt', 'schema', 'policy', 0, 0, ?, ?)""",
+            (now, now),
+        )
+        conn.execute(
+            """INSERT INTO runner_attempts
+               (attempt_id, queue_name, batch_key, slot, model, cli_version,
+                thread_id, attempt, input_digest, status, started_at)
+               VALUES ('obsolete-screen-attempt', 'screen', 'batch', 0,
+                       'obsolete-screen-model', 'test', NULL, 1, 'input',
+                       'transport-failure', ?)""",
+            (now,),
+        )
         conn.execute(
             "UPDATE metadata SET value='20' WHERE key='review_schema_version'"
         )
@@ -1587,6 +1607,12 @@ def test_v21_migration_reopens_legacy_foundry_proof(tmp_path: Path):
         assert conn.execute("SELECT COUNT(*) FROM foundry_coverage_confirmations").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM foundry_coverage_votes").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM draft_screening_current").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM runner_sessions WHERE queue_name='screen'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM runner_attempts WHERE queue_name='screen'"
+        ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT value FROM metadata WHERE key='review_schema_version'"
         ).fetchone()[0] == str(REVIEW_SCHEMA_VERSION)

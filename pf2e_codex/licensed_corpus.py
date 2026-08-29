@@ -1475,6 +1475,13 @@ def _migrate_review_workspace(conn: sqlite3.Connection) -> None:
                         latest["event_id"],
                     ),
                 )
+            # The v21 screen contract uses a different executor, prompt,
+            # schema, and session lifecycle.  Its decisions are preserved (or
+            # explicitly reopened above), but pre-v21 transport/session audit
+            # rows cannot be resumed or meaningfully compared with the new
+            # path.
+            conn.execute("DELETE FROM runner_attempts WHERE queue_name='screen'")
+            conn.execute("DELETE FROM runner_sessions WHERE queue_name='screen'")
             conn.execute("DELETE FROM foundry_coverage_confirmations")
             conn.execute("DROP TABLE IF EXISTS runner_screen_escalations")
         if schema_row is None or schema_row["value"] != str(REVIEW_SCHEMA_VERSION):
